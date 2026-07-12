@@ -131,13 +131,13 @@ func eventID(id string, line int) string {
 	}
 	return fmt.Sprintf("line-%d", line)
 }
-func indexedID(id string, index int) string {
-	if index == 0 {
-		return id
-	}
-	return fmt.Sprintf("%s-%d", id, index+1)
+func blockFallbackID(line, index int) string {
+	return fmt.Sprintf("line-%d-block-%d", line, index+1)
 }
 func rawEvent(id, parent, typ string, when time.Time, raw json.RawMessage) session.Event {
+	if typ == "" {
+		typ = "unknown"
+	}
 	return session.Event{ID: id, ParentID: parent, Kind: session.EventRaw, Time: when, RawType: typ, Raw: append(json.RawMessage(nil), raw...)}
 }
 func jsonValue(raw json.RawMessage) json.RawMessage {

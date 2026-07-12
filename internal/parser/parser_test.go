@@ -66,6 +66,37 @@ func TestParserDoesNotTreatEOFAsTerminal(t *testing.T) {
 	}
 }
 
+func TestCodexParserDoesNotTreatEOFAsTerminal(t *testing.T) {
+	input := `{"type":"session_meta","payload":{"id":"incomplete-codex"}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Completion.Terminal {
+		t.Fatal("EOF incorrectly treated as completion")
+	}
+}
+
+func TestParsersPreserveUnknownRecordWithoutType(t *testing.T) {
+	for _, tt := range []struct {
+		name, input string
+	}{
+		{"claude", `{"type":"user","sessionId":"unknown-claude","message":{"content":"hello"}}` + "\n" + `{"future":true}`},
+		{"codex", `{"type":"session_meta","payload":{"id":"unknown-codex"}}` + "\n" + `{"payload":{"future":true}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(tt.input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Events) == 0 || got.Events[len(got.Events)-1].Kind != session.EventRaw || got.Events[len(got.Events)-1].RawType != "unknown" {
+				t.Fatalf("events = %+v", got.Events)
+			}
+		})
+	}
+}
+
 func TestRegistryRejectsMalformedAndUnknownInput(t *testing.T) {
 	for _, tt := range []struct{ name, input string }{
 		{"malformed", `{"type":`},
@@ -93,6 +124,33 @@ func TestRegistryUsesProviderAndLineFallbackIDs(t *testing.T) {
 	}
 	if got.Events[1].ID != "line-3" {
 		t.Fatalf("fallback ID = %q", got.Events[1].ID)
+	}
+}
+
+func TestClaudeBlockFallbackIDsAreUniqueAndDeterministic(t *testing.T) {
+	input := `{"type":"assistant","sessionId":"claude-blocks","message":{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"tool_use","name":"Read","input":{}},{"type":"tool_use","name":"Write","input":{}}]}}`
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"line-1-block-1", "line-1-block-2", "line-1-block-3"}
+	for i, id := range want {
+		if got.Events[i].ID != id {
+			t.Fatalf("event %d ID = %q, want %q", i, got.Events[i].ID, id)
+		}
+	}
+}
+
+func TestCodexUsesProviderAndLineFallbackIDs(t *testing.T) {
+	input := `{"type":"session_meta","payload":{"id":"codex-ids"}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"provider-id","type":"message","role":"user","content":[{"type":"input_text","text":"one"}]}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}]}}`
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Events[0].ID != "provider-id" || got.Events[1].ID != "line-3" {
+		t.Fatalf("IDs = %q, %q", got.Events[0].ID, got.Events[1].ID)
 	}
 }
 
@@ -129,6 +187,45 @@ func TestRegistryRejectsOversizeSourceWithoutContent(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatal("error leaked source content")
+	}
+}
+
+func TestRegistryAcceptsExactRecordLimit(t *testing.T) {
+	prefix := `{"type":"user","sessionId":"record-limit","message":{"content":"`
+	suffix := `"}}`
+	input := prefix + strings.Repeat("x", session.MaxRecordBytes-len(prefix)-len(suffix)) + suffix
+	if len(input) != session.MaxRecordBytes {
+		t.Fatalf("test record size = %d", len(input))
+	}
+	if _, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegistryAcceptsExactSourceLimit(t *testing.T) {
+	first := `{"type":"user","sessionId":"source-limit","message":{"content":"ok"}}` + "\n"
+	var input strings.Builder
+	input.Grow(session.MaxSourceBytes)
+	input.WriteString(first)
+	remaining := session.MaxSourceBytes - len(first)
+	for remaining > 0 {
+		n := 1 << 20
+		if n > remaining {
+			n = remaining
+		}
+		if n == remaining {
+			input.WriteString(strings.Repeat(" ", n))
+		} else {
+			input.WriteString(strings.Repeat(" ", n-1))
+			input.WriteByte('\n')
+		}
+		remaining -= n
+	}
+	if input.Len() != session.MaxSourceBytes {
+		t.Fatalf("test source size = %d", input.Len())
+	}
+	if _, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input.String())); err != nil {
+		t.Fatal(err)
 	}
 }
 
