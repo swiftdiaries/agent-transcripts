@@ -21,6 +21,24 @@
 - Store normalized free-form tags in v1 but do not implement tag filtering.
 - Do not add a database, SPA, search index, queue, background sync, project ACLs, comments, or Kubernetes packaging.
 - Never log transcript bodies, tool output, credentials, or authentication tokens.
+- Treat a local file's quiet-period eligibility as local evidence only. A raw
+  browser upload without a provider terminal marker is rejected because the
+  hosted server cannot verify the source file's age or whether it is active.
+- Derive a content ID from `provider + source checksum`; derive each managed
+  package ID from `content ID + destination`. This makes retries to one
+  destination idempotent while allowing the same source in different
+  destinations, as required by the design.
+- Cap raw sources at 64 MiB, individual JSONL records at 16 MiB, titles at 200
+  UTF-8 bytes, descriptions at 4 KiB, 20 tags per transcript, and each tag at
+  64 ASCII characters. Reject oversize input before parsing or allocation.
+- Accept state-changing browser requests only with same-origin `Origin` (or
+  `Referer` when `Origin` is absent) and a per-session CSRF token. API clients
+  authenticate with a 15-minute audience-bound bearer token minted from an
+  authenticated, CSRF-protected browser page; proxy identity headers alone are
+  not accepted on API mutation routes exposed to browsers. Keep the signing
+  key in an environment variable and never persist minted tokens.
+- Normalize and validate user keys, directory kinds/slugs, package IDs, and
+  route parameters before constructing filesystem paths or S3 keys.
 
 ## Planned File Structure
 
@@ -30,6 +48,7 @@ internal/cli/commands.go               serve/import/upload/version commands
 internal/config/config.go              YAML, environment, and flags
 internal/session/model.go              canonical session and package types
 internal/session/validate.go           canonical and metadata validation
+internal/session/identity.go           content and destination package IDs
 internal/parser/{parser,claude,codex}.go
 internal/parser/testdata/              sanitized provider fixtures
 internal/discovery/discovery.go        merged local catalog
@@ -37,6 +56,7 @@ internal/store/{store,filesystem,s3}.go
 internal/library/service.go            import, checksum, and idempotency
 internal/publish/client.go              hosted multipart client
 internal/auth/{identity,proxy,oidc}.go
+internal/auth/csrf.go                  browser mutation protection
 internal/web/{server,handlers}.go
 internal/web/templates/                embedded HTML templates
 internal/web/static/                   embedded CSS and JavaScript
@@ -77,6 +97,10 @@ func TestHostedRejectsLocalIdentity(t *testing.T) {
     _, err := Load(writeTempConfig(t, "mode: hosted\nauth:\n  type: local\n"), Overrides{})
     if err == nil || !strings.Contains(err.Error(), "hosted mode requires proxy or oidc auth") { t.Fatalf("error = %v", err) }
 }
+func TestHostedRequiresExternalOriginAndSessionKey(t *testing.T) {
+    _, err := Load(writeTempConfig(t, "mode: hosted\nauth:\n  type: proxy\n"), Overrides{})
+    if err == nil || !strings.Contains(err.Error(), "external_origin") { t.Fatalf("error = %v", err) }
+}
 ```
 
 - [ ] **Step 2: Run `go test ./internal/config -v`**
@@ -85,7 +109,7 @@ Expected: FAIL because configuration types and `Load` do not exist.
 
 - [ ] **Step 3: Implement configuration and command dispatch**
 
-Define `Config` with mode, listen, quiet period, storage, auth, and source roots. Apply defaults, strict YAML decoding, environment secrets, and explicit overrides in that order. Validate mode/storage/auth combinations. Make `cli.Run` recognize only `serve`, `import`, `upload`, `version`, and `help`; unknown commands return 2.
+Define `Config` with mode, listen, external origin, upload limits, storage, auth, trusted proxy CIDRs, source roots, and names of environment variables containing cookie/token keys. Apply defaults, strict YAML decoding, environment secrets, and explicit overrides in that order; reject secret values embedded in YAML. Hosted mode requires an HTTPS external origin outside tests, at least one current 32-byte key, and proxy CIDRs when proxy auth is selected. Validate mode/storage/auth combinations. Make `cli.Run` recognize only `serve`, `import`, `upload`, `version`, and `help`; unknown commands return 2.
 
 - [ ] **Step 4: Run `go test ./internal/config ./internal/cli ./cmd/agent-transcripts`**
 
@@ -103,12 +127,16 @@ git commit -m "feat: bootstrap binary and configuration"
 **Files:**
 - Create: `internal/session/model.go`
 - Create: `internal/session/validate.go`
+- Create: `internal/session/identity.go`
 - Test: `internal/session/model_test.go`
 
 **Interfaces:**
 - Produces: `session.Event`, `session.Session`, `session.Metadata`, and `session.Package`
+- Produces: `session.Directory` and `session.SourceFacts{ObservedModTime, ObservedSize, QuietPeriodVerified}`
 - Produces: `session.NormalizeTags([]string) ([]string, error)`
 - Produces: `session.Validate(session.Session) error`
+- Produces: `session.ContentID(provider, sourceChecksum string) string`
+- Produces: `session.PackageID(contentID string, destination session.Directory) string`
 
 - [ ] **Step 1: Write failing model tests**
 
@@ -123,6 +151,13 @@ func TestValidateRawEvent(t *testing.T) {
         ID: "e_1", Kind: EventRaw, RawType: "future_event", Raw: json.RawMessage(`{"x":1}`),
     }}}
     if err := Validate(s); err != nil { t.Fatal(err) }
+}
+func TestPackageIDSeparatesDestinationsAndIsStable(t *testing.T) {
+    content := ContentID("claude", strings.Repeat("a", 64))
+    users := PackageID(content, Directory{Kind: "users", Slug: "ada"})
+    project := PackageID(content, Directory{Kind: "projects", Slug: "platform"})
+    if users == project { t.Fatal("destinations collided") }
+    if users != PackageID(content, Directory{Kind: "users", Slug: "ada"}) { t.Fatal("ID is unstable") }
 }
 ```
 
@@ -155,7 +190,7 @@ type Event struct {
 }
 ```
 
-Add session identity/timestamps/project/events, all approved metadata fields, and raw/normalized/source package bytes. Validate required IDs and kinds. Raw events require a type and valid JSON. Normalize tags by trimming, lowercasing, stable deduplication, and `[a-z0-9_-]+` validation.
+Add session identity/timestamps/project/events, all approved metadata fields, and raw/normalized/source package bytes. Define `Directory` in this package so identity and storage share one validated type. Validate required IDs, kinds, metadata lengths, directory kinds/slugs, and timestamps. Raw events require a type and valid JSON. Normalize tags by trimming, lowercasing, stable deduplication, and `[a-z0-9_-]+` validation. Use length-delimited hash inputs rather than string concatenation; IDs are `c_`/`s_` plus lowercase SHA-256 hex.
 
 - [ ] **Step 4: Run `go test ./internal/session -v`**
 
@@ -181,6 +216,9 @@ git commit -m "feat: define canonical transcript model"
 **Interfaces:**
 - Consumes: canonical session types
 - Produces: `parser.Registry.DetectAndParse(ctx context.Context, source io.Reader) (session.Session, error)`
+- Produces: `session.Session.Completion` with `Terminal`, `TerminalReason`, and
+  `LastEventAt`; parsers set terminal evidence only from documented provider
+  records, never from EOF.
 
 - [ ] **Step 1: Add sanitized fixtures and failing parser tests**
 
@@ -197,6 +235,11 @@ func TestRegistryParsesFixtures(t *testing.T) {
             if countKind(got.Events, session.EventRaw) != 1 { t.Fatal("unknown event not preserved") }
         })
     }
+}
+func TestParserDoesNotTreatEOFAsTerminal(t *testing.T) {
+    got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(incompleteClaudeJSONL))
+    if err != nil { t.Fatal(err) }
+    if got.Completion.Terminal { t.Fatal("EOF incorrectly treated as completion") }
 }
 ```
 
@@ -215,7 +258,7 @@ type Parser interface {
 type Registry struct { parsers []Parser }
 ```
 
-Use a scanner with a 16 MiB token limit. Reject malformed JSON. Detect from the first meaningful line, map common events, and copy every unmapped line into `EventRaw`. Use provider event IDs when present and line-number IDs otherwise.
+Wrap the input in a 64 MiB limiting reader and use a scanner with a 16 MiB token limit. Return typed `ErrSourceTooLarge` and `ErrRecordTooLarge` errors without including record content. Reject malformed JSON. Detect from the first meaningful line, map common events, and copy every unmapped line into `EventRaw`. Use provider event IDs when present and line-number IDs otherwise. Record provider-specific terminal evidence separately from event mapping and cover both terminal and non-terminal fixtures.
 
 - [ ] **Step 4: Run `go test ./internal/parser ./internal/session -v`**
 
@@ -238,6 +281,9 @@ git commit -m "feat: parse Claude and Codex sessions"
 **Interfaces:**
 - Produces: `discovery.Discover(ctx context.Context, roots Roots, now time.Time, quiet time.Duration) ([]Candidate, error)`
 - Produces: `Candidate{Path, Provider, SessionID, Project, Title, StartedAt, Status}`
+- Produces: `discovery.OpenEligible(candidate Candidate) (io.ReadCloser, session.SourceFacts, error)`,
+  which opens once, stats the opened descriptor, and rechecks completion before
+  import to avoid a discovery/import time-of-check-to-time-of-use race.
 
 - [ ] **Step 1: Write failing merge and quiet-period tests**
 
@@ -252,6 +298,11 @@ func TestDiscoverHidesFileInsideQuietPeriod(t *testing.T) {
     if err != nil { t.Fatal(err) }
     if len(got) != 0 { t.Fatalf("active candidates = %d", len(got)) }
 }
+func TestOpenEligibleRejectsFileChangedAfterDiscovery(t *testing.T) {
+    candidate := discoverOne(t, rootsWithAge(t, 10*time.Minute))
+    appendToFile(t, candidate.Path, []byte("\n{}"))
+    if _, _, err := OpenEligible(candidate); !errors.Is(err, ErrSourceChanged) { t.Fatalf("error = %v", err) }
+}
 ```
 
 - [ ] **Step 2: Run `go test ./internal/discovery -v`**
@@ -260,7 +311,7 @@ Expected: FAIL because discovery is undefined.
 
 - [ ] **Step 3: Implement discovery and CLI selection**
 
-Walk configured roots, accept provider filename patterns, extract cheap metadata, hide setup-only/malformed/active sessions, and sort by start time then path. A terminal picker prints numbered merged choices and accepts comma-separated selections. Non-interactive use requires a path or `--latest`. Add `--provider` and `--limit`.
+Walk configured roots without following symlinks, accept provider filename patterns, extract cheap metadata, hide setup-only/malformed/active sessions, and sort by start time then path. Eligibility is terminal evidence or unchanged `mtime+size` beyond the quiet period; capture those facts in `Candidate` and recheck them on the same descriptor used for import. A terminal picker prints numbered merged choices and accepts comma-separated selections. Non-interactive use requires a path or `--latest`. Add `--provider` and `--limit`. Explicit paths go through the same eligibility check and cannot bypass completion filtering.
 
 - [ ] **Step 4: Run `go test ./internal/discovery ./internal/cli -v`**
 
@@ -285,7 +336,7 @@ git commit -m "feat: discover completed local sessions"
 
 **Interfaces:**
 - Produces: `store.Store`
-- Produces: `library.Service.Import(ctx context.Context, source io.Reader, attrs ImportAttrs) (session.Metadata, error)`
+- Produces: `library.Service.Import(ctx context.Context, source io.Reader, facts session.SourceFacts, attrs ImportAttrs) (session.Metadata, error)`
 
 - [ ] **Step 1: Write failing visibility and idempotency tests**
 
@@ -293,15 +344,20 @@ git commit -m "feat: discover completed local sessions"
 func TestFilesystemListsOnlyFinalizedPackages(t *testing.T) {
     s := NewFilesystem(t.TempDir())
     writeIncompletePackage(t, s.root, "s_incomplete")
-    got, err := s.ListSessions(context.Background(), Directory{Kind: "users", Slug: "ada"})
+    got, err := s.ListSessions(context.Background(), session.Directory{Kind: "users", Slug: "ada"})
     if err != nil { t.Fatal(err) }
     if len(got) != 0 { t.Fatalf("listed incomplete package: %v", got) }
 }
 func TestImportIsIdempotent(t *testing.T) {
     svc := newTestService(t)
-    first, _ := svc.Import(ctx, fixture("claude-session.jsonl"), attrs)
-    second, _ := svc.Import(ctx, fixture("claude-session.jsonl"), attrs)
+    facts := session.SourceFacts{QuietPeriodVerified: true}
+    first, _ := svc.Import(ctx, fixture("claude-session.jsonl"), facts, attrs)
+    second, _ := svc.Import(ctx, fixture("claude-session.jsonl"), facts, attrs)
     if first.ID != second.ID { t.Fatalf("ids differ: %s %s", first.ID, second.ID) }
+}
+func TestImportRejectsUnprovenCompletion(t *testing.T) {
+    _, err := newTestService(t).Import(ctx, fixture("incomplete-claude.jsonl"), session.SourceFacts{}, attrs)
+    if !errors.Is(err, library.ErrIncomplete) { t.Fatalf("error = %v", err) }
 }
 ```
 
@@ -313,18 +369,18 @@ Expected: FAIL because store and service do not exist.
 
 ```go
 type Store interface {
-    ListDirectories(context.Context, string) ([]Directory, error)
+    ListDirectories(context.Context, string) ([]session.Directory, error)
     CreateProject(context.Context, string) error
-    ListSessions(context.Context, Directory) ([]session.Metadata, error)
+    ListSessions(context.Context, session.Directory) ([]session.Metadata, error)
     GetSession(context.Context, string) (session.Package, error)
-    PutSession(context.Context, session.Package) error
-    UpdateMetadata(context.Context, string, session.Metadata) error
-    MoveSession(context.Context, string, Directory) error
-    DeleteSession(context.Context, string) error
+    PutSession(context.Context, session.Package) (created bool, err error)
+    UpdateMetadata(context.Context, string, expectedRevision string, session.Metadata) (newRevision string, err error)
+    MoveSession(context.Context, string, string, session.Directory) (session.Metadata, error)
+    DeleteSession(context.Context, string, string) error
 }
 ```
 
-Write package files into a temporary directory, rename it, and write `manifest.json` last. Derive IDs from SHA-256 of provider plus source. Import detects, parses, validates, marshals normalized JSON, builds metadata, checks idempotency, and calls `PutSession`. Wire CLI import.
+Write package files into a same-filesystem temporary directory, `fsync` files and directory, rename it, then atomically create `manifest.json` last. The manifest contains package ID, content ID, immutable-file hashes, metadata revision, and schema version. `PutSession` is create-if-absent: an existing manifest with identical content/destination returns `created=false`; mismatched content returns `ErrConflict`. Metadata writes use revision compare-and-swap so concurrent edits cannot silently overwrite each other. Validate every logical identifier before joining a path and reject symlinked package components. Import verifies terminal evidence or trusted local quiet-period `session.SourceFacts`, hashes while reading a bounded temporary snapshot, parses that exact snapshot, derives content/package IDs, validates, and calls `PutSession`. Wire CLI import through `OpenEligible`; never reopen the source path.
 
 - [ ] **Step 4: Run `go test ./internal/store ./internal/library ./internal/cli -v`**
 
@@ -358,6 +414,11 @@ func TestS3WritesManifestLast(t *testing.T) {
     keys := fake.putKeys()
     if keys[len(keys)-1] != "prod/sessions/s_123/manifest.json" { t.Fatalf("last key = %q", keys[len(keys)-1]) }
 }
+func TestStoreContractConcurrentPutConverges(t *testing.T) {
+    created := runConcurrentIdenticalPuts(t, storeFactory)
+    if created != 1 { t.Fatalf("created count = %d", created) }
+    assertOneVisibleValidPackage(t, storeFactory)
+}
 ```
 
 Run the common store contract suite against filesystem and fake S3.
@@ -368,7 +429,7 @@ Expected: FAIL because `NewS3` is undefined.
 
 - [ ] **Step 3: Implement prefix listing and manifest-last writes**
 
-Define the smallest client interface around GetObject, PutObject, DeleteObject, CopyObject, and paginated ListObjectsV2. Map logical paths beneath the configured prefix. Build the real AWS client only in composition code; tests use the fake.
+Define the smallest client interface around GetObject, conditional PutObject, DeleteObject, CopyObject, HeadObject, and paginated ListObjectsV2. Map validated logical paths beneath the configured prefix. Finalize with conditional manifest creation (`If-None-Match: *`); on precondition failure, read and compare the winner's manifest. Metadata compare-and-swap uses object ETags. Move copies immutable objects to the destination package ID, conditionally finalizes the destination, then removes the source manifest before best-effort source cleanup; retries converge on one visible destination. Listing treats manifests as the sole visibility boundary and tolerates orphaned non-manifest objects. Build the real AWS client only in composition code; tests use a concurrency-safe fake that models preconditions and pagination.
 
 - [ ] **Step 4: Run `go test ./internal/store -v`**
 
@@ -426,8 +487,11 @@ Add `/`, `/live`, `/live/{provider}/{sessionID}`, `/library`,
 completed sessions into the library, and opening a live-session route parses
 without copying. Use `<details>` for tools/raw events, escaped template
 rendering, anchored event IDs, prompt navigation, and displayed non-clickable
-tags. JavaScript only copies anchors and enhances expansion. Wire `serve
---open`.
+tags. Resolve live routes by validated provider/session ID against the current
+discovery catalog; never turn route text into a path. Send a restrictive
+content-security policy, `X-Content-Type-Options: nosniff`, and
+`Referrer-Policy: same-origin`; serve static assets with fixed content types.
+JavaScript only copies anchors and enhances expansion. Wire `serve --open`.
 
 - [ ] **Step 4: Run `go test ./...`**
 
@@ -446,6 +510,7 @@ git commit -m "feat: add server-rendered transcript viewer"
 - Create: `internal/auth/identity.go`
 - Create: `internal/auth/proxy.go`
 - Create: `internal/auth/oidc.go`
+- Create: `internal/auth/csrf.go`
 - Test: `internal/auth/auth_test.go`
 - Modify: `internal/web/server.go`
 - Modify: `internal/web/handlers.go`
@@ -459,12 +524,12 @@ git commit -m "feat: add server-rendered transcript viewer"
 
 ```go
 func TestProxyIdentity(t *testing.T) {
-    p := NewProxy("X-User", "X-Name")
+    p := NewProxy("X-User", "X-Name", mustCIDRs("192.0.2.0/24"))
     h := p.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         id, ok := FromContext(r.Context()); if !ok { t.Fatal("missing identity") }
         fmt.Fprint(w, id.Key+"|"+id.DisplayName)
     }))
-    req := httptest.NewRequest("GET", "/", nil)
+    req := httptest.NewRequest("GET", "/", nil); req.RemoteAddr = "192.0.2.10:1234"
     req.Header.Set("X-User", "ada@example.com"); req.Header.Set("X-Name", "Ada")
     rr := httptest.NewRecorder(); h.ServeHTTP(rr, req)
     if rr.Body.String() != "ada@example.com|Ada" { t.Fatalf("body = %q", rr.Body.String()) }
@@ -472,6 +537,14 @@ func TestProxyIdentity(t *testing.T) {
 func TestDifferentUserCannotDelete(t *testing.T) {
     rr := performAs(t, server, "grace@example.com", "DELETE", "/api/v1/sessions/s_123", nil)
     if rr.Code != http.StatusForbidden { t.Fatalf("status = %d", rr.Code) }
+}
+func TestBrowserMutationRejectsMissingCSRF(t *testing.T) {
+    rr := performAs(t, server, "ada@example.com", "POST", "/api/v1/sessions/s_123/move", validMoveBody)
+    if rr.Code != http.StatusForbidden { t.Fatalf("status = %d", rr.Code) }
+}
+func TestProxyModeRejectsUntrustedPeer(t *testing.T) {
+    req := requestFrom("203.0.113.9:1234"); req.Header.Set("X-User", "ada@example.com")
+    if rr := serve(proxyServer, req); rr.Code != http.StatusUnauthorized { t.Fatalf("status = %d", rr.Code) }
 }
 ```
 
@@ -481,7 +554,7 @@ Expected: FAIL because identity and mutation authorization do not exist.
 
 - [ ] **Step 3: Implement local, proxy, and OIDC providers**
 
-Proxy mode requires configured headers. OIDC uses discovery, authorization-code flow, and a signed HTTP-only SameSite cookie. Add metadata patch, move, and delete handlers. Load stored metadata and compare `UploaderKey` with context identity before mutations; ignore client-supplied uploader fields.
+Proxy mode requires configured headers and an explicit list of trusted proxy CIDRs; strip/ignore identity headers from every other peer. OIDC uses discovery, authorization-code flow with state, nonce, and PKCE, exact issuer/client-ID checks, and a rotated-key signed-and-encrypted HTTP-only Secure SameSite=Lax cookie with an absolute lifetime. Regenerate the session on login. Add origin validation plus synchronizer-token CSRF protection to HTML mutations. Add a CSRF-protected browser action that mints a signed 15-minute bearer token containing normalized user key, issued-at/expiry, unique ID, and `agent-transcripts-api` audience; verify signature, expiry, and audience on API requests. Bearer-authenticated requests do not use proxy headers or cookies, which makes CLI auth work in both proxy and OIDC deployments without storing server-side token state. Add metadata patch, move, and delete handlers with explicit JSON/form content types and revision preconditions. Load stored metadata and compare `UploaderKey` with the normalized context identity immediately before each mutation; ignore client-supplied uploader fields. Return generic authentication errors and never log callback parameters, claims, cookies, or tokens.
 
 - [ ] **Step 4: Run `go test ./internal/auth ./internal/web -v`**
 
@@ -524,6 +597,15 @@ func TestRepeatedUploadReturnsExistingURL(t *testing.T) {
     second := uploadFixtureAs(t, server, "ada@example.com", "claude-session.jsonl", fields)
     if first.Header().Get("Location") != second.Header().Get("Location") { t.Fatal("locations differ") }
 }
+func TestSameSourceCanPublishToTwoDestinations(t *testing.T) {
+    user := uploadFixtureAs(t, server, "ada@example.com", "claude-session.jsonl", userFields)
+    project := uploadFixtureAs(t, server, "ada@example.com", "claude-session.jsonl", projectFields)
+    if user.Header().Get("Location") == project.Header().Get("Location") { t.Fatal("destinations collapsed") }
+}
+func TestRawUploadWithoutTerminalEvidenceIsRejected(t *testing.T) {
+    rr := uploadFixtureAs(t, server, "ada@example.com", "incomplete-claude.jsonl", fields)
+    if rr.Code != http.StatusUnprocessableEntity { t.Fatalf("status = %d", rr.Code) }
+}
 ```
 
 - [ ] **Step 2: Run `go test ./internal/publish ./internal/web -run 'TestUpload|TestRepeated' -v`**
@@ -535,10 +617,20 @@ Expected: FAIL because hosted upload and client are missing.
 Implement `GET /api/v1/directories`, `POST /api/v1/projects`, and
 `POST /api/v1/sessions`. Accept multipart `source`, `destination`, `title`,
 `description`, and repeated `tag` on session upload. Enforce request size before
-parsing. Detect, parse, validate, and store on the server; reject normalized
-JSON and uploader identity. Return 201 for a new package and 200 with the same
-Location for a repeat. Publishing to a new valid project slug creates that
-project idempotently. Wire CLI `upload`, prompting only on a terminal.
+calling `ParseMultipartForm` and do not retain transcript parts in memory or
+temporary files after the request. Detect, parse, validate, and store on the
+server; reject normalized JSON and uploader identity. Raw hosted uploads must
+contain parser-verified terminal evidence; only local import may use filesystem
+quiet-period facts. Derive the package ID from content plus validated
+destination. Return 201 for a new package and 200 with the same Location for a
+repeat to that destination; return a distinct Location for another destination.
+Validate returned Locations as same-origin relative paths in the CLI client.
+Publishing to a new valid project slug creates that project idempotently. Wire
+CLI `upload` to upload only an already-imported library package, prompting only
+on a terminal, and read the short-lived bearer token from
+`AGENT_TRANSCRIPTS_TOKEN` or a no-echo terminal prompt rather than forwarding
+proxy headers. Never accept the token as a command-line flag, persist it, or
+include it in an error.
 
 - [ ] **Step 4: Run `go test ./internal/publish ./internal/web ./internal/cli -v`**
 
@@ -551,7 +643,65 @@ git add internal/publish internal/web internal/cli/commands.go
 git commit -m "feat: publish transcripts to hosted libraries"
 ```
 
-### Task 10: Package the Skill, Plugin, Container, and Docs
+### Task 10: Prove the End-to-End Vertical Slice
+
+**Files:**
+- Create: `internal/integration/roundtrip_test.go`
+- Modify: `internal/cli/commands.go`
+
+**Interfaces:**
+- Consumes: the real parser, filesystem store, library service, publish client,
+  auth middleware, and HTTP server composition
+- Produces: one executable acceptance test that crosses process-facing
+  boundaries without replacing application services with mocks
+
+- [ ] **Step 1: Write the failing round-trip test**
+
+```go
+func TestImportUploadBrowseAndAuthorize(t *testing.T) {
+    local, hosted := startRoundTripServers(t)
+    imported := importFixture(t, local, "claude-session.jsonl", completedFacts())
+    published := uploadAs(t, hosted, imported.ID, "ada@example.com", "projects/platform")
+    assertTranscriptContainsEscapedPrompt(t, hosted, published.Location)
+    assertRepeatUploadLocation(t, hosted, imported.ID, published.Location)
+    assertMutationForbidden(t, hosted, published.Location, "grace@example.com")
+}
+```
+
+The harness uses temporary filesystem stores and an `httptest` hosted server,
+but otherwise uses production composition. Add a Codex subtest and assert that
+unknown raw events survive both stored normalized JSON and rendered HTML.
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `go test ./internal/integration -run TestImportUploadBrowseAndAuthorize -v`
+
+Expected: FAIL until CLI/application composition exposes injectable constructors.
+
+- [ ] **Step 3: Add only the composition seams required by the test**
+
+Move constructor wiring out of flag parsing into a `cli.Dependencies` value;
+keep `main` responsible only for OS streams, signals, and exit status. Do not
+introduce another service layer or test-only production branches.
+
+- [ ] **Step 4: Run full verification, including races**
+
+```bash
+go test -race ./...
+go vet ./...
+```
+
+Expected: PASS with both provider round trips, idempotency, authorization,
+escaping, and raw-event preservation covered.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/integration internal/cli/commands.go
+git commit -m "test: prove transcript round trip"
+```
+
+### Task 11: Package the Skill, Plugin, Container, and Docs
 
 **Files:**
 - Create: `skills/publish-transcript/SKILL.md`
@@ -567,27 +717,28 @@ git commit -m "feat: publish transcripts to hosted libraries"
 
 - [ ] **Step 1: Create the plugin manifests and skill**
 
-The skill verifies the binary exists, rejects the active session, resolves/imports a completed session, collects destination and optional metadata, shows the exact publication summary, invokes `agent-transcripts upload`, and returns the URL. State that installation never authorizes background uploads. Name the plugin `agent-transcripts`; marketplace source is `./`.
+The skill verifies the binary exists, rejects the active session, resolves/imports a completed session, collects destination and optional metadata, shows the exact publication summary, invokes `agent-transcripts upload`, and returns the URL. It must not suggest bypassing eligibility with a direct path or raw browser upload. State that installation never authorizes background uploads. Name the plugin `agent-transcripts`; marketplace source is `./`. Validate both JSON manifests with `python -m json.tool` and the repository layout with the Claude plugin CLI documented in the README.
 
 - [ ] **Step 2: Add the minimal container and config examples**
 
-Use a multi-stage Dockerfile that compiles a static Linux binary, then copies it into a non-root distroless image with `ENTRYPOINT ["/agent-transcripts"]`. Include local filesystem, hosted proxy/filesystem, and hosted OIDC/S3 YAML examples. Refer to environment-variable names, never secret values.
+Use a pinned Go toolchain in a multi-stage Dockerfile with `CGO_ENABLED=0`, `-trimpath`, and an explicit target architecture, then copy the static Linux binary into a pinned-by-digest non-root distroless image with `ENTRYPOINT ["/agent-transcripts"]`. Add a writable volume path only for filesystem mode. Include local filesystem, hosted proxy/filesystem, and hosted OIDC/S3 YAML examples, including trusted proxy CIDRs, external origin, cookie-key environment variable, upload limits, and bearer-token configuration. Refer to environment-variable names, never secret values.
 
 - [ ] **Step 3: Document first-run paths**
 
-README covers binary installation, local browsing, import/upload, hosted filesystem and S3 operation, proxy/OIDC setup, Claude plugin installation, `npx skills` installation, and v1 privacy/completion limitations.
+README covers binary installation, local browsing, import/upload, hosted filesystem and S3 operation, proxy/OIDC setup, TLS-at-the-proxy requirements, trusted proxy network isolation, signing/encryption key rotation, Claude plugin installation, `npx skills` installation, and v1 privacy/completion limitations. Explicitly document that raw browser uploads without terminal evidence are rejected and that logs are metadata-only.
 
 - [ ] **Step 4: Run final verification**
 
 ```bash
 go test ./...
+go test -race ./...
 go vet ./...
 go build -o ./bin/agent-transcripts ./cmd/agent-transcripts
 ./bin/agent-transcripts version
 docker build -t agent-transcripts:test .
 ```
 
-Expected: tests and vet pass; version prints `agent-transcripts dev`; image builds.
+Expected: tests, race detector, and vet pass; version prints `agent-transcripts dev`; image builds and `docker inspect` reports a non-root user.
 
 - [ ] **Step 5: Commit**
 
@@ -605,6 +756,10 @@ git commit -m "docs: package agent transcripts for first release"
 - [ ] Upload both to a hosted filesystem-backed server and open stable URLs.
 - [ ] Confirm a second user can browse but cannot mutate them.
 - [ ] Confirm repeated upload returns the existing URL.
+- [ ] Confirm the same source uploaded to a second destination gets a distinct URL.
+- [ ] Confirm an incomplete raw browser upload is rejected and an old local file is accepted only after descriptor revalidation.
 - [ ] Confirm unknown events render in expandable raw-details blocks.
+- [ ] Run concurrent identical puts against filesystem and fake S3 and confirm exactly one finalized package is visible.
+- [ ] Confirm cross-origin and missing-CSRF browser mutations fail, and untrusted peers cannot assert proxy identity headers.
 - [ ] Confirm logs contain neither fixture content nor credentials.
 - [ ] Run `git status --short` and confirm the worktree is clean.
