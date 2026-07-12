@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
+	"golang.org/x/term"
 )
 
 const Version = "dev"
@@ -133,12 +134,7 @@ func runImport(ctx context.Context, args []string, input *os.File, stdout, stder
 }
 
 func isInteractiveInput(file *os.File) bool {
-	info, err := file.Stat()
-	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
-		return false
-	}
-	null, err := os.Stat(os.DevNull)
-	return err != nil || !os.SameFile(info, null)
+	return file != nil && term.IsTerminal(int(file.Fd()))
 }
 
 func defaultRoots() discovery.Roots {

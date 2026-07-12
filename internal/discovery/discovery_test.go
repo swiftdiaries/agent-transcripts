@@ -110,6 +110,47 @@ func TestOpenEligibleRejectsFileChangedAfterDiscovery(t *testing.T) {
 	}
 }
 
+func TestOpenEligibleRejectsPathReplacedWithMatchingMetadata(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "quiet.jsonl")
+	data := `{"type":"user","sessionId":"c1","timestamp":"2026-07-12T10:00:00Z","message":{"content":"hello"}}`
+	writeSession(t, path, data, 10*time.Minute)
+	got, err := Discover(context.Background(), Roots{Claude: []string{root}}, fixedNow, 5*time.Minute)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("discover: %#v %v", got, err)
+	}
+	original := filepath.Join(root, "original")
+	if err := os.Rename(path, original); err != nil {
+		t.Fatal(err)
+	}
+	writeSession(t, path, data, 10*time.Minute)
+	if _, _, err := OpenEligible(got[0]); !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestInspectRejectsSymlinkSwapBetweenIdentityCaptureAndOpen(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "session.jsonl")
+	data := `{"type":"user","sessionId":"c1","timestamp":"2026-07-12T10:00:00Z","message":{"content":"hello"}}`
+	writeSession(t, path, data, 10*time.Minute)
+	expected, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target.jsonl")
+	writeSession(t, target, data, 10*time.Minute)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := inspect(context.Background(), path, "claude", fixedNow, 5*time.Minute, expected); ok || !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("ok=%v error=%v", ok, err)
+	}
+}
+
 func TestDiscoverSkipsSymlinksAndMalformedAndSetupOnly(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.jsonl")

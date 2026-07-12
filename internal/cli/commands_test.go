@@ -93,6 +93,28 @@ func TestInteractiveDetectionUsesInputFile(t *testing.T) {
 	}
 }
 
+func TestNonTerminalCharacterDeviceIsNotInteractive(t *testing.T) {
+	input, err := os.Open("/dev/random")
+	if err != nil {
+		t.Skipf("non-terminal character device unavailable: %v", err)
+	}
+	defer input.Close()
+	if isInteractiveInput(input) {
+		t.Fatal("/dev/random identified as interactive")
+	}
+}
+
+func TestTerminalInputIsInteractiveWhenPTYAvailable(t *testing.T) {
+	input, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("PTY unavailable: %v", err)
+	}
+	defer input.Close()
+	if !isInteractiveInput(input) {
+		t.Fatal("TTY identified as non-interactive")
+	}
+}
+
 func TestRunRecognizesCommands(t *testing.T) {
 	for _, command := range []string{"serve", "upload", "version", "help"} {
 		t.Run(command, func(t *testing.T) {

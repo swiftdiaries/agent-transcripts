@@ -36,6 +36,7 @@ type Candidate struct {
 	modTime       time.Time
 	size          int64
 	quietVerified bool
+	sourceInfo    os.FileInfo
 }
 
 // Discover merges eligible transcripts from all configured provider roots.
@@ -90,6 +91,13 @@ func walk(ctx context.Context, root, provider string, now time.Time, quiet time.
 		if entry.IsDir() || !matches(provider, entry.Name()) {
 			return nil
 		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return nil
+		}
 		absolute, err := filepath.Abs(path)
 		if err != nil {
 			return nil
@@ -97,7 +105,7 @@ func walk(ctx context.Context, root, provider string, now time.Time, quiet time.
 		if _, ok := seen[absolute]; ok {
 			return nil
 		}
-		candidate, ok, _ := inspect(ctx, absolute, provider, now, quiet)
+		candidate, ok, _ := inspect(ctx, absolute, provider, now, quiet, entryInfo)
 		if ok {
 			seen[absolute] = struct{}{}
 			*out = append(*out, candidate)
@@ -113,15 +121,18 @@ func matches(provider, name string) bool {
 	return provider == "claude" || strings.HasPrefix(name, "rollout-")
 }
 
-func inspect(ctx context.Context, path, provider string, now time.Time, quiet time.Duration) (Candidate, bool, error) {
+func inspect(ctx context.Context, path, provider string, now time.Time, quiet time.Duration, expected os.FileInfo) (Candidate, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Candidate{}, false, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
+	if err != nil {
 		return Candidate{}, false, err
+	}
+	if expected == nil || !expected.Mode().IsRegular() || !info.Mode().IsRegular() || !os.SameFile(expected, info) {
+		return Candidate{}, false, ErrSourceChanged
 	}
 	if info.Size() > session.MaxSourceBytes {
 		return Candidate{}, false, &parser.ErrSourceTooLarge{}
@@ -143,7 +154,7 @@ func inspect(ctx context.Context, path, provider string, now time.Time, quiet ti
 	}
 	return Candidate{Path: path, Provider: provider, SessionID: parsed.ProviderSessionID,
 		Project: project(parsed), Title: title(parsed), StartedAt: parsed.StartedAt, Status: status,
-		modTime: info.ModTime(), size: info.Size(), quietVerified: !parsed.Completion.Terminal && quietOK}, true, nil
+		modTime: info.ModTime(), size: info.Size(), quietVerified: !parsed.Completion.Terminal && quietOK, sourceInfo: info}, true, nil
 }
 
 func hasConversation(s session.Session) bool {
@@ -184,6 +195,10 @@ func title(s session.Session) string {
 // OpenEligible opens exactly once and validates the opened descriptor against
 // discovery facts. The caller must parse/import the returned reader directly.
 func OpenEligible(candidate Candidate) (io.ReadCloser, session.SourceFacts, error) {
+	pathInfo, err := os.Lstat(candidate.Path)
+	if err != nil || candidate.sourceInfo == nil || !pathInfo.Mode().IsRegular() || !os.SameFile(candidate.sourceInfo, pathInfo) {
+		return nil, session.SourceFacts{}, ErrSourceChanged
+	}
 	f, err := os.Open(candidate.Path)
 	if err != nil {
 		return nil, session.SourceFacts{}, err
@@ -193,11 +208,15 @@ func OpenEligible(candidate Candidate) (io.ReadCloser, session.SourceFacts, erro
 		f.Close()
 		return nil, session.SourceFacts{}, err
 	}
+	if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) || !os.SameFile(candidate.sourceInfo, info) {
+		f.Close()
+		return nil, session.SourceFacts{}, ErrSourceChanged
+	}
 	if info.Size() > session.MaxSourceBytes {
 		f.Close()
 		return nil, session.SourceFacts{}, &parser.ErrSourceTooLarge{}
 	}
-	if !info.Mode().IsRegular() || info.Size() != candidate.size || !info.ModTime().Equal(candidate.modTime) {
+	if info.Size() != candidate.size || !info.ModTime().Equal(candidate.modTime) {
 		f.Close()
 		return nil, session.SourceFacts{}, ErrSourceChanged
 	}
@@ -230,7 +249,7 @@ func InspectPath(ctx context.Context, path string, now time.Time, quiet time.Dur
 		return Candidate{}, ErrNotEligible
 	}
 	for _, provider := range []string{"claude", "codex"} {
-		candidate, ok, inspectErr := inspect(ctx, abs, provider, now, quiet)
+		candidate, ok, inspectErr := inspect(ctx, abs, provider, now, quiet, info)
 		if ok {
 			return candidate, nil
 		}
