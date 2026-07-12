@@ -59,6 +59,40 @@ func TestFilterCandidatesHonorsProviderLimitAndLatest(t *testing.T) {
 	}
 }
 
+func TestFilterCandidatesProviderAndLimitWithoutLatest(t *testing.T) {
+	items := []discovery.Candidate{{Path: "a", Provider: "codex"}, {Path: "b", Provider: "claude"}, {Path: "c", Provider: "claude"}}
+	got := filterCandidates(items, importOptions{provider: "claude", limit: 1})
+	if len(got) != 1 || got[0].Path != "b" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestParsePickerSelections(t *testing.T) {
+	got, err := parseSelections("3, 1,3\n", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != 2 || got[1] != 0 {
+		t.Fatalf("got %v", got)
+	}
+	for _, value := range []string{"", "0", "4", "one", "1,,2"} {
+		if _, err := parseSelections(value, 3); err == nil {
+			t.Fatalf("accepted %q", value)
+		}
+	}
+}
+
+func TestInteractiveDetectionUsesInputFile(t *testing.T) {
+	input, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	if isInteractiveInput(input) {
+		t.Fatal("/dev/null identified as interactive")
+	}
+}
+
 func TestRunRecognizesCommands(t *testing.T) {
 	for _, command := range []string{"serve", "upload", "version", "help"} {
 		t.Run(command, func(t *testing.T) {
@@ -70,8 +104,14 @@ func TestRunRecognizesCommands(t *testing.T) {
 }
 
 func TestNonInteractiveImportRequiresPathOrLatest(t *testing.T) {
+	input, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = output.Close()
+	defer input.Close()
 	var stderr bytes.Buffer
-	if got := Run(context.Background(), []string{"import"}, &bytes.Buffer{}, &stderr); got != 2 {
+	if got := runImport(context.Background(), nil, input, &bytes.Buffer{}, &stderr); got != 2 {
 		t.Fatalf("exit = %d", got)
 	}
 	if !strings.Contains(stderr.String(), "requires a path or --latest") {

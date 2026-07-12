@@ -30,7 +30,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stdout, Version)
 		return 0
 	case "import":
-		return runImport(ctx, args[1:], stdout, stderr)
+		return runImport(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "serve", "upload":
 		return 0
 	default:
@@ -74,7 +74,7 @@ func parseImportArgs(args []string) (importOptions, error) {
 	return got, nil
 }
 
-func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runImport(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer) int {
 	opts, err := parseImportArgs(args)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -92,12 +92,7 @@ func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		}
 		return emitEligible(candidate, stdout, stderr)
 	}
-	interactive := false
-	if file, ok := stdout.(*os.File); ok {
-		if info, statErr := file.Stat(); statErr == nil {
-			interactive = info.Mode()&os.ModeCharDevice != 0
-		}
-	}
+	interactive := isInteractiveInput(input)
 	if !opts.latest && !interactive {
 		_, _ = fmt.Fprintln(stderr, "non-interactive import requires a path or --latest")
 		return 2
@@ -119,7 +114,7 @@ func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		_, _ = fmt.Fprintf(stdout, "%d) %s  %s  %s\n", i+1, candidate.Provider, candidate.Project, candidate.Title)
 	}
 	_, _ = fmt.Fprint(stdout, "Select sessions (comma-separated): ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := bufio.NewReader(input).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
@@ -135,6 +130,15 @@ func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		}
 	}
 	return 0
+}
+
+func isInteractiveInput(file *os.File) bool {
+	info, err := file.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	null, err := os.Stat(os.DevNull)
+	return err != nil || !os.SameFile(info, null)
 }
 
 func defaultRoots() discovery.Roots {

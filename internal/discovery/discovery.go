@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/parser"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
@@ -96,7 +97,7 @@ func walk(ctx context.Context, root, provider string, now time.Time, quiet time.
 		if _, ok := seen[absolute]; ok {
 			return nil
 		}
-		candidate, ok := inspect(ctx, absolute, provider, now, quiet)
+		candidate, ok, _ := inspect(ctx, absolute, provider, now, quiet)
 		if ok {
 			seen[absolute] = struct{}{}
 			*out = append(*out, candidate)
@@ -112,23 +113,29 @@ func matches(provider, name string) bool {
 	return provider == "claude" || strings.HasPrefix(name, "rollout-")
 }
 
-func inspect(ctx context.Context, path, provider string, now time.Time, quiet time.Duration) (Candidate, bool) {
+func inspect(ctx context.Context, path, provider string, now time.Time, quiet time.Duration) (Candidate, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return Candidate{}, false
+		return Candidate{}, false, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return Candidate{}, false
+		return Candidate{}, false, err
+	}
+	if info.Size() > session.MaxSourceBytes {
+		return Candidate{}, false, &parser.ErrSourceTooLarge{}
 	}
 	parsed, err := parser.DefaultRegistry().DetectAndParse(ctx, f)
-	if err != nil || parsed.Provider != provider || !hasConversation(parsed) {
-		return Candidate{}, false
+	if err != nil {
+		return Candidate{}, false, err
+	}
+	if parsed.Provider != provider || !matches(parsed.Provider, filepath.Base(path)) || !hasConversation(parsed) {
+		return Candidate{}, false, ErrNotEligible
 	}
 	quietOK := !now.Before(info.ModTime().Add(quiet))
 	if !parsed.Completion.Terminal && !quietOK {
-		return Candidate{}, false
+		return Candidate{}, false, ErrNotEligible
 	}
 	status := "quiet"
 	if parsed.Completion.Terminal {
@@ -136,7 +143,7 @@ func inspect(ctx context.Context, path, provider string, now time.Time, quiet ti
 	}
 	return Candidate{Path: path, Provider: provider, SessionID: parsed.ProviderSessionID,
 		Project: project(parsed), Title: title(parsed), StartedAt: parsed.StartedAt, Status: status,
-		modTime: info.ModTime(), size: info.Size(), quietVerified: !parsed.Completion.Terminal && quietOK}, true
+		modTime: info.ModTime(), size: info.Size(), quietVerified: !parsed.Completion.Terminal && quietOK}, true, nil
 }
 
 func hasConversation(s session.Session) bool {
@@ -161,9 +168,12 @@ func project(s session.Session) string {
 func title(s session.Session) string {
 	for _, event := range s.Events {
 		if event.Kind == session.EventUser && strings.TrimSpace(event.Text) != "" {
-			value := strings.TrimSpace(event.Text)
+			value := strings.ToValidUTF8(strings.TrimSpace(event.Text), "�")
 			if len(value) > session.MaxTitleBytes {
 				value = value[:session.MaxTitleBytes]
+				for !utf8.ValidString(value) {
+					value = value[:len(value)-1]
+				}
 			}
 			return value
 		}
@@ -182,6 +192,10 @@ func OpenEligible(candidate Candidate) (io.ReadCloser, session.SourceFacts, erro
 	if err != nil {
 		f.Close()
 		return nil, session.SourceFacts{}, err
+	}
+	if info.Size() > session.MaxSourceBytes {
+		f.Close()
+		return nil, session.SourceFacts{}, &parser.ErrSourceTooLarge{}
 	}
 	if !info.Mode().IsRegular() || info.Size() != candidate.size || !info.ModTime().Equal(candidate.modTime) {
 		f.Close()
@@ -216,8 +230,13 @@ func InspectPath(ctx context.Context, path string, now time.Time, quiet time.Dur
 		return Candidate{}, ErrNotEligible
 	}
 	for _, provider := range []string{"claude", "codex"} {
-		if candidate, ok := inspect(ctx, abs, provider, now, quiet); ok {
+		candidate, ok, inspectErr := inspect(ctx, abs, provider, now, quiet)
+		if ok {
 			return candidate, nil
+		}
+		var tooLarge *parser.ErrSourceTooLarge
+		if errors.As(inspectErr, &tooLarge) {
+			return Candidate{}, inspectErr
 		}
 	}
 	return Candidate{}, ErrNotEligible
