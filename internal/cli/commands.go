@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
+	"github.com/swiftdiaries/agent-transcripts/internal/library"
+	"github.com/swiftdiaries/agent-transcripts/internal/session"
+	"github.com/swiftdiaries/agent-transcripts/internal/store"
 	"golang.org/x/term"
 )
 
@@ -91,7 +94,7 @@ func runImport(ctx context.Context, args []string, input *os.File, stdout, stder
 			_, _ = fmt.Fprintln(stderr, "source does not match --provider")
 			return 1
 		}
-		return emitEligible(candidate, stdout, stderr)
+		return emitEligible(ctx, candidate, stdout, stderr)
 	}
 	interactive := isInteractiveInput(input)
 	if !opts.latest && !interactive {
@@ -109,7 +112,7 @@ func runImport(ctx context.Context, args []string, input *os.File, stdout, stder
 		return 1
 	}
 	if opts.latest {
-		return emitEligible(candidates[0], stdout, stderr)
+		return emitEligible(ctx, candidates[0], stdout, stderr)
 	}
 	for i, candidate := range candidates {
 		_, _ = fmt.Fprintf(stdout, "%d) %s  %s  %s\n", i+1, candidate.Provider, candidate.Project, candidate.Title)
@@ -126,7 +129,7 @@ func runImport(ctx context.Context, args []string, input *os.File, stdout, stder
 		return 2
 	}
 	for _, index := range indexes {
-		if code := emitEligible(candidates[index], stdout, stderr); code != 0 {
+		if code := emitEligible(ctx, candidates[index], stdout, stderr); code != 0 {
 			return code
 		}
 	}
@@ -177,14 +180,25 @@ func parseSelections(value string, maximum int) ([]int, error) {
 	return got, nil
 }
 
-func emitEligible(candidate discovery.Candidate, stdout, stderr io.Writer) int {
-	reader, _, err := discovery.OpenEligible(candidate)
+func emitEligible(ctx context.Context, candidate discovery.Candidate, stdout, stderr io.Writer) int {
+	reader, facts, err := discovery.OpenEligible(candidate)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	_ = reader.Close()
-	_, _ = fmt.Fprintln(stdout, candidate.Path)
+	defer reader.Close()
+	svc := library.New(store.NewFilesystem("agent-transcripts-library"))
+	metadata, err := svc.Import(ctx, reader, facts, library.ImportAttrs{
+		Destination: session.Directory{Kind: "users", Slug: "local"},
+		UploaderKey: "local",
+		Title:       candidate.Title,
+		Project:     candidate.Project,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	_, _ = fmt.Fprintln(stdout, metadata.ID)
 	return 0
 }
 
