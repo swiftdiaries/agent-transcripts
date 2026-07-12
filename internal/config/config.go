@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -66,6 +65,7 @@ type OIDCAuth struct {
 	ClientID        string `yaml:"client_id"`
 	ClientSecretEnv string `yaml:"client_secret_env"`
 	RedirectURL     string `yaml:"redirect_url"`
+	ClientSecret    string `yaml:"-"`
 }
 
 type Overrides struct {
@@ -87,10 +87,6 @@ func defaults() Config {
 }
 
 func Load(path string, overrides Overrides) (Config, error) {
-	return load(path, overrides, strings.HasSuffix(os.Args[0], ".test"))
-}
-
-func load(path string, overrides Overrides, testing bool) (Config, error) {
 	cfg := defaults()
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -108,7 +104,7 @@ func load(path string, overrides Overrides, testing bool) (Config, error) {
 	}
 	loadSecrets(&cfg)
 	applyOverrides(&cfg, overrides)
-	if err := cfg.validate(testing); err != nil {
+	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -152,6 +148,9 @@ func loadSecrets(cfg *Config) {
 	if value, ok := os.LookupEnv(cfg.TokenKeyEnv); cfg.TokenKeyEnv != "" && ok {
 		cfg.TokenKey = []byte(value)
 	}
+	if value, ok := os.LookupEnv(cfg.Auth.OIDC.ClientSecretEnv); cfg.Auth.OIDC.ClientSecretEnv != "" && ok {
+		cfg.Auth.OIDC.ClientSecret = value
+	}
 }
 
 func applyOverrides(cfg *Config, o Overrides) {
@@ -175,7 +174,7 @@ func applyOverrides(cfg *Config, o Overrides) {
 	}
 }
 
-func (cfg Config) validate(testing bool) error {
+func (cfg Config) validate() error {
 	if cfg.Mode != "local" && cfg.Mode != "hosted" {
 		return fmt.Errorf("mode must be local or hosted")
 	}
@@ -187,6 +186,9 @@ func (cfg Config) validate(testing bool) error {
 	}
 	if cfg.Storage.Type == "s3" && cfg.Storage.Bucket == "" {
 		return fmt.Errorf("storage.bucket is required for s3 storage")
+	}
+	if err := cfg.UploadLimits.validate(); err != nil {
+		return err
 	}
 	if cfg.Auth.Type != "local" && cfg.Auth.Type != "proxy" && cfg.Auth.Type != "oidc" {
 		return fmt.Errorf("auth.type must be local, proxy, or oidc")
@@ -200,16 +202,11 @@ func (cfg Config) validate(testing bool) error {
 	if cfg.Mode != "hosted" {
 		return nil
 	}
-	// Tests may use the plan's minimal structurally-valid proxy fixture to verify
-	// precedence. Runtime startup always performs the complete security checks.
-	if testing && cfg.ExternalOrigin == "" && cfg.Auth.Type == "proxy" && cfg.Auth.Proxy.UserHeader != "" {
-		return nil
-	}
 	u, err := url.Parse(cfg.ExternalOrigin)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("external_origin must be an absolute URL")
 	}
-	if !testing && u.Scheme != "https" {
+	if u.Scheme != "https" {
 		return fmt.Errorf("external_origin must use https in hosted mode")
 	}
 	if len(cfg.CookieKeys) == 0 || len(cfg.CookieKeys[0]) < minKeyBytes {
@@ -231,8 +228,34 @@ func (cfg Config) validate(testing bool) error {
 			}
 		}
 	}
-	if cfg.Auth.Type == "oidc" && (cfg.Auth.OIDC.Issuer == "" || cfg.Auth.OIDC.ClientID == "" || cfg.Auth.OIDC.ClientSecretEnv == "") {
-		return fmt.Errorf("oidc issuer, client_id, and client_secret_env are required")
+	if cfg.Auth.Type == "oidc" {
+		if cfg.Auth.OIDC.Issuer == "" || cfg.Auth.OIDC.ClientID == "" || cfg.Auth.OIDC.ClientSecretEnv == "" {
+			return fmt.Errorf("oidc issuer, client_id, and client_secret_env are required")
+		}
+		if cfg.Auth.OIDC.ClientSecret == "" {
+			return fmt.Errorf("auth.oidc.client_secret_env %q is missing or empty", cfg.Auth.OIDC.ClientSecretEnv)
+		}
+	}
+	return nil
+}
+
+func (limits UploadLimits) validate() error {
+	checks := []struct {
+		name  string
+		value int64
+		max   int64
+	}{
+		{"source_bytes", limits.SourceBytes, 64 << 20},
+		{"record_bytes", int64(limits.RecordBytes), 16 << 20},
+		{"title_bytes", int64(limits.TitleBytes), 200},
+		{"description_bytes", int64(limits.DescriptionBytes), 4 << 10},
+		{"tags", int64(limits.Tags), 20},
+		{"tag_bytes", int64(limits.TagBytes), 64},
+	}
+	for _, check := range checks {
+		if check.value <= 0 || check.value > check.max {
+			return fmt.Errorf("upload_limits.%s must be between 1 and %d", check.name, check.max)
+		}
 	}
 	return nil
 }
