@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
+
+const maxRawTagInputs = 1000
 
 var (
 	logicalIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -15,8 +18,8 @@ var (
 )
 
 func NormalizeTags(tags []string) ([]string, error) {
-	if len(tags) > MaxTags {
-		return nil, fmt.Errorf("tags: maximum is %d", MaxTags)
+	if len(tags) > maxRawTagInputs {
+		return nil, fmt.Errorf("tags: too many inputs")
 	}
 	result := make([]string, 0, len(tags))
 	seen := make(map[string]struct{}, len(tags))
@@ -30,8 +33,29 @@ func NormalizeTags(tags []string) ([]string, error) {
 		}
 		seen[tag] = struct{}{}
 		result = append(result, tag)
+		if len(result) > MaxTags {
+			return nil, fmt.Errorf("tags: maximum is %d", MaxTags)
+		}
 	}
 	return result, nil
+}
+
+// NormalizeUploaderKey returns a stable provider-neutral identity key suitable
+// for comparisons and logical ownership checks.
+func NormalizeUploaderKey(value string) (string, error) {
+	if !utf8.ValidString(value) {
+		return "", fmt.Errorf("invalid uploader key")
+	}
+	key := strings.ToLower(strings.TrimSpace(value))
+	if key == "" || len(key) > MaxUploaderKeyBytes {
+		return "", fmt.Errorf("invalid uploader key")
+	}
+	for _, r := range key {
+		if r <= 0x20 || r == 0x7f || r == '/' || r == '\\' {
+			return "", fmt.Errorf("invalid uploader key")
+		}
+	}
+	return key, nil
 }
 
 func Validate(s Session) error {
@@ -107,17 +131,23 @@ func validateEvent(event Event) error {
 }
 
 func ValidateMetadata(m Metadata) error {
-	if err := validateID("package ID", m.ID); err != nil {
-		return err
+	if !hasManagedID(m.ID, "s_") {
+		return fmt.Errorf("invalid package ID")
 	}
-	if err := validateID("content ID", m.ContentID); err != nil {
-		return err
+	if !hasManagedID(m.ContentID, "c_") {
+		return fmt.Errorf("invalid content ID")
 	}
 	if !providerPattern.MatchString(m.Provider) {
 		return fmt.Errorf("invalid provider")
 	}
+	if !utf8.ValidString(m.Title) {
+		return fmt.Errorf("title is not valid UTF-8")
+	}
 	if len(m.Title) > MaxTitleBytes {
 		return fmt.Errorf("title exceeds %d bytes", MaxTitleBytes)
+	}
+	if !utf8.ValidString(m.Description) {
+		return fmt.Errorf("description is not valid UTF-8")
 	}
 	if len(m.Description) > MaxDescriptionBytes {
 		return fmt.Errorf("description exceeds %d bytes", MaxDescriptionBytes)
@@ -136,6 +166,13 @@ func ValidateMetadata(m Metadata) error {
 	}
 	if err := ValidateDirectory(m.Destination); err != nil {
 		return err
+	}
+	normalizedUploader, err := NormalizeUploaderKey(m.UploaderKey)
+	if err != nil {
+		return err
+	}
+	if normalizedUploader != m.UploaderKey {
+		return fmt.Errorf("uploader key must be normalized")
 	}
 	if !m.StartedAt.IsZero() && !m.EndedAt.IsZero() && m.EndedAt.Before(m.StartedAt) {
 		return fmt.Errorf("end timestamp precedes start timestamp")
@@ -179,19 +216,23 @@ func ValidatePackage(p Package) error {
 	if err := ValidateSourceFacts(p.SourceFacts); err != nil {
 		return err
 	}
-	if p.ID != "" && p.ID != p.Metadata.ID {
+	if !hasManagedID(p.ID, "s_") || p.ID != p.Metadata.ID {
 		return fmt.Errorf("package ID mismatch")
 	}
-	if p.ContentID != "" && p.ContentID != p.Metadata.ContentID {
+	if !hasManagedID(p.ContentID, "c_") || p.ContentID != p.Metadata.ContentID {
 		return fmt.Errorf("content ID mismatch")
 	}
-	if p.Session.ID != p.Metadata.ID || p.Session.Provider != p.Metadata.Provider {
+	if p.Session.Provider != p.Metadata.Provider {
 		return fmt.Errorf("session metadata mismatch")
 	}
 	if len(p.Normalized) != 0 && !json.Valid(p.Normalized) {
 		return fmt.Errorf("normalized document is not valid JSON")
 	}
 	return nil
+}
+
+func hasManagedID(value, prefix string) bool {
+	return strings.HasPrefix(value, prefix) && isLowerHex(strings.TrimPrefix(value, prefix), 64)
 }
 
 func validateID(label, value string) error {

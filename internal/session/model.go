@@ -12,6 +12,7 @@ const (
 	MaxDescriptionBytes = 4 << 10
 	MaxTags             = 20
 	MaxTagBytes         = 64
+	MaxUploaderKeyBytes = 256
 )
 
 type EventKind string

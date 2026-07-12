@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestNormalizeTags(t *testing.T) {
@@ -34,6 +35,20 @@ func TestNormalizeTagsRejectsLimitsAndInvalidCharacters(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+func TestNormalizeTagsAppliesLimitAfterDeduplication(t *testing.T) {
+	tags := make([]string, 100)
+	for i := range tags {
+		tags[i] = " Rust "
+	}
+	got, err := NormalizeTags(tags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"rust"}) {
+		t.Fatalf("tags = %v", got)
 	}
 }
 
@@ -93,7 +108,8 @@ func TestValidateRejectsOversizeEventPayload(t *testing.T) {
 }
 
 func TestValidateMetadataAndPackageLimits(t *testing.T) {
-	m := Metadata{ID: "s_123", ContentID: "c_123", Provider: "claude", Destination: Directory{Kind: "users", Slug: "ada"}, Title: strings.Repeat("x", 201)}
+	m := validMetadata()
+	m.Title = strings.Repeat("x", 201)
 	if err := ValidateMetadata(m); err == nil {
 		t.Fatal("expected title limit error")
 	}
@@ -102,9 +118,88 @@ func TestValidateMetadataAndPackageLimits(t *testing.T) {
 	if err := ValidateMetadata(m); err == nil {
 		t.Fatal("expected tag limit error")
 	}
-	p := Package{Session: Session{SchemaVersion: 1, ID: "s_123", Provider: "claude"}, Metadata: Metadata{ID: "s_123", ContentID: "c_123", Provider: "claude", Destination: Directory{Kind: "users", Slug: "ada"}}, Source: make([]byte, MaxSourceBytes+1)}
+	p := validPackage()
+	p.Source = make([]byte, MaxSourceBytes+1)
 	if err := ValidatePackage(p); err == nil {
 		t.Fatal("expected source limit error")
+	}
+}
+
+func TestValidateMetadataRequiresExactManagedIDs(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*Metadata)
+	}{
+		{"missing package ID", func(m *Metadata) { m.ID = "" }},
+		{"short package ID", func(m *Metadata) { m.ID = "s_123" }},
+		{"wrong package prefix", func(m *Metadata) { m.ID = "c_" + strings.Repeat("a", 64) }},
+		{"uppercase package hash", func(m *Metadata) { m.ID = "s_" + strings.Repeat("A", 64) }},
+		{"missing content ID", func(m *Metadata) { m.ContentID = "" }},
+		{"short content ID", func(m *Metadata) { m.ContentID = "c_123" }},
+		{"wrong content prefix", func(m *Metadata) { m.ContentID = "s_" + strings.Repeat("a", 64) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := validMetadata()
+			tt.edit(&m)
+			if err := ValidateMetadata(m); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+	if err := Validate(Session{SchemaVersion: 1, ID: "s_123", Provider: "claude"}); err != nil {
+		t.Fatalf("generic canonical session ID was rejected: %v", err)
+	}
+}
+
+func TestValidatePackageRequiresMatchingManagedIDs(t *testing.T) {
+	for _, edit := range []func(*Package){
+		func(p *Package) { p.ID = "" },
+		func(p *Package) { p.ContentID = "" },
+		func(p *Package) { p.ID = "s_" + strings.Repeat("b", 64) },
+		func(p *Package) { p.ContentID = "c_" + strings.Repeat("c", 64) },
+	} {
+		p := validPackage()
+		edit(&p)
+		if err := ValidatePackage(p); err == nil {
+			t.Fatal("expected error")
+		}
+	}
+}
+
+func TestNormalizeUploaderKey(t *testing.T) {
+	got, err := NormalizeUploaderKey("  Ada@Example.COM  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "ada@example.com" {
+		t.Fatalf("key = %q", got)
+	}
+	for _, value := range []string{"", "   ", "ada smith", "ada/smith", `ada\\smith`, "ada\nsmith", strings.Repeat("a", MaxUploaderKeyBytes+1), string([]byte{0xff})} {
+		if _, err := NormalizeUploaderKey(value); err == nil {
+			t.Fatalf("accepted %q", value)
+		}
+	}
+	m := validMetadata()
+	m.UploaderKey = " Ada@Example.COM "
+	if err := ValidateMetadata(m); err == nil {
+		t.Fatal("accepted non-normalized uploader key")
+	}
+}
+
+func TestValidateMetadataRejectsMalformedUTF8(t *testing.T) {
+	if utf8.ValidString(string([]byte{0xff})) {
+		t.Fatal("test fixture is valid UTF-8")
+	}
+	for _, edit := range []func(*Metadata){
+		func(m *Metadata) { m.Title = string([]byte{0xff}) },
+		func(m *Metadata) { m.Description = string([]byte{0xff}) },
+	} {
+		m := validMetadata()
+		edit(&m)
+		if err := ValidateMetadata(m); err == nil {
+			t.Fatal("accepted malformed UTF-8")
+		}
 	}
 }
 
@@ -155,4 +250,24 @@ func makeTags(n int) []string {
 		out[i] = "tag_" + strings.Repeat("a", i+1)
 	}
 	return out
+}
+
+func validMetadata() Metadata {
+	return Metadata{
+		ID:          "s_" + strings.Repeat("a", 64),
+		ContentID:   "c_" + strings.Repeat("b", 64),
+		Provider:    "claude",
+		UploaderKey: "ada@example.com",
+		Destination: Directory{Kind: "users", Slug: "ada"},
+	}
+}
+
+func validPackage() Package {
+	m := validMetadata()
+	return Package{
+		ID:        m.ID,
+		ContentID: m.ContentID,
+		Session:   Session{SchemaVersion: 1, ID: "s_provider_123", Provider: m.Provider},
+		Metadata:  m,
+	}
 }
