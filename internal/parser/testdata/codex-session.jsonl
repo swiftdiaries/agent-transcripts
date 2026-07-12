@@ -1,0 +1,7 @@
+{"timestamp":"2026-07-12T09:00:00Z","type":"session_meta","payload":{"id":"codex-session-1","cwd":"/workspace/demo"}}
+{"timestamp":"2026-07-12T09:00:01Z","type":"response_item","payload":{"id":"codex-user-1","type":"message","role":"user","content":[{"type":"input_text","text":"Fix the parser"}]}}
+{"timestamp":"2026-07-12T09:00:02Z","type":"response_item","payload":{"id":"codex-assistant-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect it."}]}}
+{"timestamp":"2026-07-12T09:00:03Z","type":"response_item","payload":{"id":"codex-tool-1","type":"function_call","name":"read_file","arguments":"{\"path\":\"parser.go\"}"}}
+{"timestamp":"2026-07-12T09:00:04Z","type":"response_item","payload":{"id":"codex-result-1","type":"function_call_output","call_id":"codex-tool-1","output":"package parser"}}
+{"timestamp":"2026-07-12T09:00:05Z","type":"future_codex_event","payload":{"id":"codex-unknown-1","safe":true}}
+{"timestamp":"2026-07-12T09:00:06Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}}
