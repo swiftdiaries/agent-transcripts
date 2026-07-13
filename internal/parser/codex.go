@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,7 @@ type codexPayload struct {
 	CWD       string          `json:"cwd"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+	Input     json.RawMessage `json:"input"`
 	Output    json.RawMessage `json:"output"`
 	CallID    string          `json:"call_id"`
 	Content   []codexContent  `json:"content"`
@@ -68,6 +70,15 @@ func (codexParser) Parse(ctx context.Context, lines []json.RawMessage) (session.
 			got.Completion.Terminal, got.Completion.TerminalReason = true, p.Type
 			continue
 		}
+		if e.Type == "event_msg" && p.Type == "user_message" {
+			var event struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(e.Payload, &event) == nil && event.Message != "" {
+				got.Events = append(got.Events, session.Event{ID: eventID(p.ID, lineNumber), Kind: session.EventUser, Time: when, Text: event.Message})
+				continue
+			}
+		}
 		if event, ok := mapCodexResponse(p, lineNumber, when); e.Type == "response_item" && ok {
 			got.Events = append(got.Events, event)
 			continue
@@ -103,9 +114,31 @@ func mapCodexResponse(p codexPayload, line int, when time.Time) (session.Event, 
 		return session.Event{ID: id, Kind: session.EventToolCall, Time: when, ToolName: p.Name, Input: jsonValue(p.Arguments)}, true
 	case "function_call_output":
 		return session.Event{ID: id, ParentID: p.CallID, Kind: session.EventToolResult, Time: when, Output: jsonValue(p.Output)}, true
+	case "custom_tool_call":
+		return session.Event{ID: id, Kind: session.EventToolCall, Time: when, ToolName: p.Name, Input: jsonValue(p.Input)}, true
+	case "custom_tool_call_output":
+		return session.Event{ID: id, ParentID: p.CallID, Kind: session.EventToolResult, Time: when, Output: codexOutputText(p.Output)}, true
 	default:
 		return session.Event{}, false
 	}
+}
+
+func codexOutputText(raw json.RawMessage) json.RawMessage {
+	if !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
+		return jsonValue(raw)
+	}
+	var content []codexContent
+	if json.Unmarshal(raw, &content) != nil {
+		return jsonValue(raw)
+	}
+	var text string
+	for _, block := range content {
+		if block.Type == "input_text" {
+			text += block.Text
+		}
+	}
+	encoded, _ := json.Marshal(text)
+	return encoded
 }
 
 func parseTime(value string) (time.Time, error) {

@@ -154,6 +154,46 @@ func TestCodexUsesProviderAndLineFallbackIDs(t *testing.T) {
 	}
 }
 
+func TestCodexUsesEventMessageAsVisiblePrompt(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"codex-review"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<environment_context>hidden</environment_context>"}]}}`,
+		`{"type":"event_msg","payload":{"type":"user_message","message":"Review the parser"}}`,
+		`{"type":"response_item","payload":{"id":"call-1","type":"custom_tool_call","name":"exec","input":"pwd"}}`,
+		`{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"/repo"}]}}`,
+	}, "\n")
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Events[0].Kind != session.EventRaw {
+		t.Fatalf("developer event = %+v", got.Events[0])
+	}
+	if got.Events[1].Kind != session.EventUser || got.Events[1].Text != "Review the parser" {
+		t.Fatalf("prompt = %+v", got.Events[1])
+	}
+	if got.Events[2].Kind != session.EventToolCall || got.Events[2].ToolName != "exec" {
+		t.Fatalf("call = %+v", got.Events[2])
+	}
+	if got.Events[3].Kind != session.EventToolResult || string(got.Events[3].Output) != `"/repo"` {
+		t.Fatalf("result = %+v", got.Events[3])
+	}
+}
+
+func TestClaudeDetectsPastLeadingMetadataAndKeepsTextBesideThinking(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"queue-operation","sessionId":"claude-review"}`,
+		`{"type":"assistant","sessionId":"claude-review","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private"},{"type":"text","text":"I found it."}]}}`,
+	}, "\n")
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 2 || got.Events[1].Kind != session.EventAssistant || got.Events[1].Text != "I found it." {
+		t.Fatalf("events = %+v", got.Events)
+	}
+}
+
 func TestRegistryHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

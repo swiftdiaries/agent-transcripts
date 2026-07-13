@@ -76,8 +76,14 @@ func (r Registry) DetectAndParse(ctx context.Context, source io.Reader) (session
 	if first == nil {
 		return session.Session{}, errors.New("source contains no JSON records")
 	}
-	for _, parser := range r.parsers {
-		if parser.Detect(first) {
+	for _, line := range lines {
+		if line == nil {
+			continue
+		}
+		for _, parser := range r.parsers {
+			if !parser.Detect(line) {
+				continue
+			}
 			got, err := parser.Parse(ctx, lines)
 			if err != nil {
 				return session.Session{}, err

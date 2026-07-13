@@ -32,6 +32,7 @@ type claudeBlock struct {
 	ToolUseID string          `json:"tool_use_id"`
 	Input     json.RawMessage `json:"input"`
 	Content   json.RawMessage `json:"content"`
+	Thinking  string          `json:"thinking"`
 }
 
 func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session.Session, error) {
@@ -71,6 +72,9 @@ func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session
 			got.Events = append(got.Events, events...)
 			continue
 		}
+		if len(got.Events) == 0 && e.Type != "user" && e.Type != "assistant" && e.Type != "system" {
+			continue
+		}
 		got.Events = append(got.Events, rawEvent(eventID(e.UUID, lineNumber), e.ParentUUID, e.Type, when, line))
 	}
 	if got.ID == "" {
@@ -106,6 +110,12 @@ func mapClaudeMessage(e envelope, line int, when time.Time) ([]session.Event, bo
 			blockID = blockFallbackID(line, blockIndex)
 		}
 		switch block.Type {
+		case "thinking":
+			raw, err := json.Marshal(block)
+			if err != nil {
+				return nil, false, fmt.Errorf("encode Claude thinking block at line %d: %w", line, err)
+			}
+			events = append(events, rawEvent(blockID, e.ParentUUID, block.Type, when, raw))
 		case "text":
 			kind := session.EventUser
 			if e.Type == "assistant" {
