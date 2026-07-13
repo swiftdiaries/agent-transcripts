@@ -166,3 +166,19 @@ func TestOIDCRejectsCleartextIssuer(t *testing.T) {
 		t.Fatal("accepted cleartext issuer")
 	}
 }
+
+func TestCSRFCookieSecureIsModeAware(t *testing.T) {
+	hosted, _ := NewCSRF(bytes.Repeat([]byte("k"), 32), "https://app.example.com")
+	local, _ := NewLocalCSRF(bytes.Repeat([]byte("k"), 32))
+	for _, test := range []struct {
+		csrf   *CSRF
+		secure bool
+	}{{hosted, true}, {local, false}} {
+		rr := httptest.NewRecorder()
+		test.csrf.Token(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		cookies := rr.Result().Cookies()
+		if len(cookies) != 1 || cookies[0].Secure != test.secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+			t.Fatalf("cookie=%#v", cookies)
+		}
+	}
+}

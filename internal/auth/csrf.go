@@ -21,6 +21,7 @@ type CSRF struct {
 	key    []byte
 	origin *url.URL
 	now    func() time.Time
+	secure bool
 }
 
 func NewCSRF(key []byte, externalOrigin string) (*CSRF, error) {
@@ -28,13 +29,13 @@ func NewCSRF(key []byte, externalOrigin string) (*CSRF, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" || len(key) < 32 {
 		return nil, errors.New("invalid CSRF configuration")
 	}
-	return &CSRF{key: append([]byte(nil), key...), origin: u, now: time.Now}, nil
+	return &CSRF{key: append([]byte(nil), key...), origin: u, now: time.Now, secure: true}, nil
 }
 func NewLocalCSRF(key []byte) (*CSRF, error) {
 	if len(key) < 32 {
 		return nil, errors.New("invalid CSRF configuration")
 	}
-	return &CSRF{key: append([]byte(nil), key...), now: time.Now}, nil
+	return &CSRF{key: append([]byte(nil), key...), now: time.Now, secure: false}, nil
 }
 func (c *CSRF) Token(w http.ResponseWriter, r *http.Request) string {
 	if cookie, err := r.Cookie(csrfCookie); err == nil && c.validCookie(cookie.Value) {
@@ -43,7 +44,7 @@ func (c *CSRF) Token(w http.ResponseWriter, r *http.Request) string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	nonce := base64.RawURLEncoding.EncodeToString(b)
-	http.SetCookie(w, &http.Cookie{Name: csrfCookie, Value: nonce, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int((2 * time.Hour).Seconds())})
+	http.SetCookie(w, &http.Cookie{Name: csrfCookie, Value: nonce, Path: "/", Secure: c.secure, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int((2 * time.Hour).Seconds())})
 	return c.sign(nonce)
 }
 func (c *CSRF) validCookie(v string) bool {
