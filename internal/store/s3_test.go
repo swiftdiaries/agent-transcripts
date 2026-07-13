@@ -366,6 +366,48 @@ func TestS3ReclaimClaimDoesNotCorruptConcurrentManifestWinner(t *testing.T) {
 	}
 }
 
+func TestS3ReclaimClaimResponseLossRetryConverges(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+		t.Fatal(err)
+	}
+	reput := p
+	reput.Metadata.Title = "retry"
+	fake.failAfterPut("prod/users/ada/"+p.ID+"/.reclaim", errors.New("response lost"))
+	if _, err := s.PutSession(context.Background(), reput); err == nil {
+		t.Fatal("wanted response loss")
+	}
+	if created, err := s.PutSession(context.Background(), reput); err != nil || !created {
+		t.Fatalf("retry = %v,%v", created, err)
+	}
+}
+
+func TestS3ReclaimClaimDeleteResponseLossDoesNotBreakIdempotency(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+		t.Fatal(err)
+	}
+	reput := p
+	reput.Metadata.Title = "retry"
+	fake.failAfterDelete("prod/users/ada/"+p.ID+"/.reclaim", errors.New("response lost"))
+	if _, err := s.PutSession(context.Background(), reput); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := s.PutSession(context.Background(), reput); err != nil || created {
+		t.Fatalf("idempotent retry = %v,%v", created, err)
+	}
+}
+
 type fakeS3 struct {
 	mu                   sync.Mutex
 	objects              map[string]S3Object

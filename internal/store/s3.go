@@ -185,6 +185,16 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 		return false, err
 	}
 	m := makeManifest(p, files)
+	manifestKey, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
+	if _, err := s.client.HeadObject(ctx, s.bucket, manifestKey); err == nil {
+		winner, _, e := s.readManifest(ctx, p.Metadata.Destination, p.ID)
+		if e != nil {
+			return false, e
+		}
+		return s.identical(ctx, winner, p)
+	} else if !errors.Is(err, ErrS3NotFound) {
+		return false, err
+	}
 	for _, name := range immutableNames {
 		key, _ := s.key(p.Metadata.Destination, p.ID, name)
 		if _, err := s.client.PutObject(ctx, s.bucket, key, files[name], S3Condition{IfNoneMatch: true}); err != nil {
@@ -220,10 +230,10 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 				if ce != nil || checksum(claim.Body) != checksum(files["metadata.json"]) {
 					return false, ErrConflict
 				}
+				claimOwned = true
 			} else {
 				claimOwned = true
 			}
-			manifestKey, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
 			if _, e = s.client.HeadObject(ctx, s.bucket, manifestKey); e == nil {
 				if claimOwned {
 					_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
