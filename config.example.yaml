@@ -1,0 +1,82 @@
+# Local filesystem mode: bind only to loopback. The filesystem root is the only
+# container mode that needs a writable volume (mount it at /var/lib/agent-transcripts).
+mode: local
+listen: 127.0.0.1:8080
+quiet_period: 5m
+source_roots:
+  - ~/.claude/projects
+  - ~/.codex/sessions
+  - ~/.codex/archived_sessions
+storage:
+  type: filesystem
+  root: ./agent-transcripts-library
+auth:
+  type: local
+upload_limits:
+  source_bytes: 67108864
+  record_bytes: 16777216
+  title_bytes: 200
+  description_bytes: 4096
+  tags: 20
+  tag_bytes: 64
+
+# Hosted filesystem mode behind an authenticated TLS-terminating proxy. Keep the
+# application reachable only from the listed proxy network; never expose it directly.
+# Environment-variable names are examples, not secret values.
+#
+# mode: hosted
+# listen: 0.0.0.0:8080
+# external_origin: https://transcripts.example.com
+# quiet_period: 5m
+# storage:
+#   type: filesystem
+#   root: /var/lib/agent-transcripts
+# auth:
+#   type: proxy
+#   proxy:
+#     user_header: X-Forwarded-User
+#     name_header: X-Forwarded-Name
+# trusted_proxy_cidrs:
+#   - 10.42.0.0/16
+# cookie_key_envs:
+#   - AGENT_TRANSCRIPTS_COOKIE_KEY_CURRENT
+#   - AGENT_TRANSCRIPTS_COOKIE_KEY_PREVIOUS
+# token_key_env: AGENT_TRANSCRIPTS_TOKEN_KEY
+# upload_limits:
+#   source_bytes: 67108864
+#   record_bytes: 16777216
+#   title_bytes: 200
+#   description_bytes: 4096
+#   tags: 20
+#   tag_bytes: 64
+
+# Hosted OIDC + S3-compatible object storage. Supply the S3 credential chain via
+# the runtime environment or workload identity; do not put credentials in this file.
+#
+# mode: hosted
+# listen: 0.0.0.0:8080
+# external_origin: https://transcripts.example.com
+# storage:
+#   type: s3
+#   bucket: company-agent-transcripts
+#   prefix: v1
+#   region: us-east-1
+#   endpoint: https://s3.example.com
+# auth:
+#   type: oidc
+#   oidc:
+#     issuer: https://identity.example.com
+#     client_id: agent-transcripts
+#     client_secret_env: AGENT_TRANSCRIPTS_OIDC_CLIENT_SECRET
+#     redirect_url: https://transcripts.example.com/auth/callback
+# cookie_key_envs:
+#   - AGENT_TRANSCRIPTS_COOKIE_KEY_CURRENT
+#   - AGENT_TRANSCRIPTS_COOKIE_KEY_PREVIOUS
+# token_key_env: AGENT_TRANSCRIPTS_TOKEN_KEY
+# upload_limits:
+#   source_bytes: 67108864
+#   record_bytes: 16777216
+#   title_bytes: 200
+#   description_bytes: 4096
+#   tags: 20
+#   tag_bytes: 64

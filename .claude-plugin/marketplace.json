@@ -1,0 +1,14 @@
+{
+  "name": "agent-transcripts",
+  "description": "Publish completed Claude Code and Codex transcripts with terminal evidence.",
+  "owner": {
+    "name": "Swift Diaries"
+  },
+  "plugins": [
+    {
+      "name": "agent-transcripts",
+      "source": "./",
+      "description": "Publish completed Claude Code and Codex transcripts with terminal evidence."
+    }
+  ]
+}

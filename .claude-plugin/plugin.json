@@ -1,0 +1,15 @@
+{
+  "name": "agent-transcripts",
+  "version": "1.0.0",
+  "description": "Publish completed Claude Code and Codex transcripts with terminal evidence.",
+  "author": {
+    "name": "Swift Diaries"
+  },
+  "license": "MIT",
+  "keywords": [
+    "transcripts",
+    "claude-code",
+    "codex",
+    "publishing"
+  ]
+}
