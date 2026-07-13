@@ -328,7 +328,10 @@ func (s *Filesystem) UpdateMetadata(ctx context.Context, id, expected string, md
 	return md.Revision, nil
 }
 
-func (s *Filesystem) MoveSession(ctx context.Context, id, uploader string, d session.Directory, expectedRevision ...string) (session.Metadata, error) {
+func (s *Filesystem) MoveSession(ctx context.Context, id, uploader string, d session.Directory, expectedRevision string) (session.Metadata, error) {
+	if expectedRevision == "" {
+		return session.Metadata{}, ErrConflict
+	}
 	if !validManaged(id, "s_") {
 		return session.Metadata{}, fmt.Errorf("invalid package ID")
 	}
@@ -366,7 +369,7 @@ func (s *Filesystem) MoveSession(ctx context.Context, id, uploader string, d ses
 	if md.UploaderKey != normalized {
 		return md, ErrForbidden
 	}
-	if len(expectedRevision) > 0 && expectedRevision[0] != md.Revision {
+	if expectedRevision != md.Revision {
 		return md, ErrConflict
 	}
 	newID := session.PackageID(md.ContentID, d)
@@ -424,7 +427,10 @@ func (s *Filesystem) MoveSession(ctx context.Context, id, uploader string, d ses
 	return md, nil
 }
 
-func (s *Filesystem) DeleteSession(ctx context.Context, id, uploader string, expectedRevision ...string) error {
+func (s *Filesystem) DeleteSession(ctx context.Context, id, uploader string, expectedRevision string) error {
+	if expectedRevision == "" {
+		return ErrConflict
+	}
 	if !validManaged(id, "s_") {
 		return fmt.Errorf("invalid package ID")
 	}
@@ -459,7 +465,7 @@ func (s *Filesystem) DeleteSession(ctx context.Context, id, uploader string, exp
 	if md.UploaderKey != normalized {
 		return ErrForbidden
 	}
-	if len(expectedRevision) > 0 && expectedRevision[0] != md.Revision {
+	if expectedRevision != md.Revision {
 		return ErrConflict
 	}
 	_ = p

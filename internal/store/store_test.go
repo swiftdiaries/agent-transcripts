@@ -21,6 +21,14 @@ func testPackage(dest session.Directory) session.Package {
 	s := session.Session{SchemaVersion: 1, ID: "upstream", Provider: "claude", Events: []session.Event{{ID: "e1", Kind: session.EventUser}}, Completion: session.Completion{Terminal: true, TerminalReason: "done"}}
 	return session.Package{ID: id, ContentID: cid, Metadata: meta, Session: s, Source: []byte("source"), Normalized: []byte(`{"schema_version":1}`)}
 }
+func currentRevision(t *testing.T, s Store, id string) string {
+	t.Helper()
+	p, err := s.GetSession(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Metadata.Revision
+}
 
 func TestFilesystemListsOnlyFinalizedPackages(t *testing.T) {
 	s := NewFilesystem(t.TempDir())
@@ -324,7 +332,7 @@ func TestFilesystemRecoversInterruptedMove(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err == nil {
+			if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); err == nil {
 				t.Fatal("wanted injected failure")
 			}
 			reopened := NewFilesystem(root)
@@ -488,7 +496,7 @@ func TestFilesystemAncestorSymlinkCannotRedirectReadPutOrDelete(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), p); err == nil {
 		t.Fatal("put followed ancestor symlink")
 	}
-	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err == nil {
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", "revision"); err == nil {
 		t.Fatal("delete followed ancestor symlink")
 	}
 	if b, err := os.ReadFile(sentinel); err != nil || string(b) != "keep" {

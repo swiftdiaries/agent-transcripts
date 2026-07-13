@@ -237,7 +237,9 @@ func TestLiveImportImportsMultipleCatalogSelections(t *testing.T) {
 	form := "session=claude%3Aclaude-session-1&session=codex%3Acodex-session-1"
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader(form))
+	r.Host = "example.test"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	attachLocalCSRF(t, h, r)
 	h.ServeHTTP(rr, r)
 	if rr.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
@@ -265,7 +267,9 @@ func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Aclaude-session-1"))
+	r.Host = "example.test"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	attachLocalCSRF(t, h, r)
 	h.ServeHTTP(rr, r)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d", rr.Code)
@@ -274,6 +278,21 @@ func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 	if err != nil || len(items) != 0 {
 		t.Fatalf("items = %#v, err = %v", items, err)
 	}
+}
+
+func attachLocalCSRF(t *testing.T, h *server, r *http.Request) {
+	t.Helper()
+	issue := httptest.NewRequest(http.MethodGet, "/live", nil)
+	issue.Host = r.Host
+	rr := httptest.NewRecorder()
+	token := h.csrf.Token(rr, issue)
+	cookies := rr.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatal("csrf cookie missing")
+	}
+	r.AddCookie(cookies[0])
+	r.Header.Set("Origin", "http://"+r.Host)
+	r.Header.Set("X-CSRF-Token", token)
 }
 
 func TestUnknownAndMalformedRoutesAreNotFound(t *testing.T) {

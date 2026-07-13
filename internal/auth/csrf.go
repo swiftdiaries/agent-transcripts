@@ -30,6 +30,12 @@ func NewCSRF(key []byte, externalOrigin string) (*CSRF, error) {
 	}
 	return &CSRF{key: append([]byte(nil), key...), origin: u, now: time.Now}, nil
 }
+func NewLocalCSRF(key []byte) (*CSRF, error) {
+	if len(key) < 32 {
+		return nil, errors.New("invalid CSRF configuration")
+	}
+	return &CSRF{key: append([]byte(nil), key...), now: time.Now}, nil
+}
 func (c *CSRF) Token(w http.ResponseWriter, r *http.Request) string {
 	if cookie, err := r.Cookie(csrfCookie); err == nil && c.validCookie(cookie.Value) {
 		return c.sign(cookie.Value)
@@ -73,5 +79,11 @@ func sameOrigin(r *http.Request, want *url.URL) bool {
 		}
 	}
 	u, err := url.Parse(origin)
-	return err == nil && u.Scheme != "" && u.Host != "" && strings.EqualFold(u.Scheme, want.Scheme) && strings.EqualFold(u.Host, want.Host)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	if want == nil {
+		return (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, r.Host)
+	}
+	return strings.EqualFold(u.Scheme, want.Scheme) && strings.EqualFold(u.Host, want.Host)
 }

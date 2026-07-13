@@ -3,6 +3,7 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
 	"embed"
 	"html/template"
 	"net/http"
@@ -68,6 +69,13 @@ func New(cfg ServerConfig) http.Handler {
 			http.Error(w, "server configuration invalid", http.StatusInternalServerError)
 		})
 	}
+	if mode == "local" && s.csrf == nil {
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "server configuration invalid", 500) })
+		}
+		s.csrf, _ = auth.NewLocalCSRF(key)
+	}
 	if cfg.Provider == nil {
 		// Preserve the concrete server for local composition and tests; local
 		// routes never expose hosted mutation APIs.
@@ -98,6 +106,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost && r.URL.Path == "/live/import" && s.mode == "local" {
+		if !s.csrf.Check(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		s.importLive(w, r)
 		return
 	}

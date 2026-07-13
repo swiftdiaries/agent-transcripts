@@ -111,14 +111,14 @@ func TestS3MoveToCurrentDestinationIsOwnershipCheckedNoOp(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.MoveSession(context.Background(), p.ID, "ada", p.Metadata.Destination)
+	got, err := s.MoveSession(context.Background(), p.ID, "ada", p.Metadata.Destination, currentRevision(t, s, p.ID))
 	if err != nil || got.ID != p.ID {
 		t.Fatalf("move = %+v, %v", got, err)
 	}
 	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
 		t.Fatalf("source removed: %v", err)
 	}
-	if _, err := s.MoveSession(context.Background(), p.ID, "other", p.Metadata.Destination); !errors.Is(err, ErrForbidden) {
+	if _, err := s.MoveSession(context.Background(), p.ID, "other", p.Metadata.Destination, currentRevision(t, s, p.ID)); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("ownership error = %v", err)
 	}
 }
@@ -153,11 +153,12 @@ func TestS3MoveRetriesAfterCommittedSourceManifestDeleteResponseLoss(t *testing.
 		t.Fatal(err)
 	}
 	dest := session.Directory{Kind: "projects", Slug: "demo"}
+	rev := currentRevision(t, s, p.ID)
 	fake.failAfterDelete("prod/users/ada/"+p.ID+"/manifest.json", errors.New("response lost"))
-	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err == nil {
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); err == nil {
 		t.Fatal("wanted response-loss error")
 	}
-	got, err := s.MoveSession(context.Background(), p.ID, "ada", dest)
+	got, err := s.MoveSession(context.Background(), p.ID, "ada", dest, rev)
 	if err != nil {
 		t.Fatalf("retry = %v", err)
 	}
@@ -186,10 +187,10 @@ func TestS3MoveRetriesAfterPreFinalizationMetadataResponseLoss(t *testing.T) {
 	dest := session.Directory{Kind: "projects", Slug: "demo"}
 	newID := session.PackageID(p.ContentID, dest)
 	fake.failAfterPut("prod/projects/demo/"+newID+"/metadata.json", errors.New("response lost"))
-	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err == nil {
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); err == nil {
 		t.Fatal("wanted response-loss error")
 	}
-	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err != nil {
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); err != nil {
 		t.Fatalf("retry = %v", err)
 	}
 }
@@ -235,7 +236,7 @@ func TestS3MoveDoesNotHideSourceAfterManifestETagRace(t *testing.T) {
 		o.ETag = "etag-" + string(rune(fake.sequence))
 		fake.objects[sourceKey] = o
 	})
-	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); !errors.Is(err, ErrConflict) {
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("move = %v", err)
 	}
 	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
@@ -253,7 +254,7 @@ func TestS3MoveReconcilesDestinationWhenSourceDeleteWins(t *testing.T) {
 	dest := session.Directory{Kind: "projects", Slug: "demo"}
 	newID := session.PackageID(p.ContentID, dest)
 	fake.setOnPut("prod/projects/demo/"+newID+"/manifest.json", func() { delete(fake.objects, fakeKey("bucket", "prod/users/ada/"+p.ID+"/manifest.json")) })
-	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); !errors.Is(err, ErrConflict) {
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("move = %v", err)
 	}
 	if _, err := s.GetSession(context.Background(), newID); !errors.Is(err, ErrNotFound) {
@@ -299,13 +300,13 @@ func TestS3MoveRetryPreservesSourceRePutAfterAmbiguousDelete(t *testing.T) {
 	}
 	dest := session.Directory{Kind: "projects", Slug: "demo"}
 	fake.failAfterDelete("prod/users/ada/"+p.ID+"/manifest.json", errors.New("response lost"))
-	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err == nil {
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); err == nil {
 		t.Fatal("wanted response loss")
 	}
 	if created, err := s.PutSession(context.Background(), p); err != nil || !created {
 		t.Fatalf("reput = %v, %v", created, err)
 	}
-	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); !errors.Is(err, ErrConflict) {
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest, currentRevision(t, s, p.ID)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("retry = %v", err)
 	}
 	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
@@ -319,7 +320,7 @@ func TestS3RePutReclaimsInvisibleMetadataOrphan(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", currentRevision(t, s, p.ID)); err != nil {
 		t.Fatal(err)
 	}
 	reput := p
@@ -348,7 +349,7 @@ func TestS3ReclaimClaimDoesNotCorruptConcurrentManifestWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", currentRevision(t, s, p.ID)); err != nil {
 		t.Fatal(err)
 	}
 	fake.setOnPut("prod/users/ada/"+p.ID+"/.reclaim", func() {
@@ -373,7 +374,7 @@ func TestS3ReclaimClaimResponseLossRetryConverges(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", currentRevision(t, s, p.ID)); err != nil {
 		t.Fatal(err)
 	}
 	reput := p
@@ -394,7 +395,7 @@ func TestS3ReclaimClaimDeleteResponseLossDoesNotBreakIdempotency(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", currentRevision(t, s, p.ID)); err != nil {
 		t.Fatal(err)
 	}
 	reput := p
@@ -415,7 +416,7 @@ func TestS3ConcurrentIdenticalReclaimersConverge(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", currentRevision(t, s, p.ID)); err != nil {
 		t.Fatal(err)
 	}
 	reput := p

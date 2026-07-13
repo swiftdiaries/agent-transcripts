@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"regexp"
 	"strings"
@@ -89,7 +90,8 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 }
 
 func jsonRequest(r *http.Request) bool {
-	return strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
+	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && media == "application/json"
 }
 func revision(r *http.Request, body string) string {
 	if v := strings.Trim(r.Header.Get("If-Match"), `\"`); v != "" {
@@ -203,6 +205,8 @@ func (s *server) deleteSession(w http.ResponseWriter, r *http.Request, id string
 	}
 	if err := s.store.DeleteSession(r.Context(), id, who.Key, revision(r, "")); errors.Is(err, store.ErrForbidden) {
 		http.Error(w, "forbidden", http.StatusForbidden)
+	} else if errors.Is(err, store.ErrConflict) {
+		http.Error(w, "revision conflict", http.StatusConflict)
 	} else if err != nil {
 		s.internalError(w, err)
 	} else {
@@ -249,7 +253,11 @@ func (s *server) liveList(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
-	s.render(w, "directory", page{Title: "Live sessions", Heading: "Live sessions", Candidates: candidates, IsLive: true})
+	p := page{Title: "Live sessions", Heading: "Live sessions", Candidates: candidates, IsLive: true}
+	if s.csrf != nil {
+		p.CSRFToken = s.csrf.Token(w, r)
+	}
+	s.render(w, "directory", p)
 }
 
 func (s *server) liveSession(w http.ResponseWriter, r *http.Request, wantProvider, wantID string) {

@@ -20,6 +20,6 @@ type Store interface {
 	GetSession(context.Context, string) (session.Package, error)
 	PutSession(context.Context, session.Package) (bool, error)
 	UpdateMetadata(context.Context, string, string, session.Metadata) (string, error)
-	MoveSession(context.Context, string, string, session.Directory, ...string) (session.Metadata, error)
-	DeleteSession(context.Context, string, string, ...string) error
+	MoveSession(context.Context, string, string, session.Directory, string) (session.Metadata, error)
+	DeleteSession(context.Context, string, string, string) error
 }
