@@ -3,14 +3,17 @@ package publish
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 )
 
 func TestClientUploadRejectsCrossOriginLocation(t *testing.T) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := newLoopbackServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/sessions" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
@@ -32,7 +35,7 @@ func TestClientUploadRejectsCrossOriginLocation(t *testing.T) {
 
 func TestClientUploadErrorDoesNotExposeResponseBodyOrToken(t *testing.T) {
 	secret := "bearer-secret-and-source-body"
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := newLoopbackServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(secret))
 	}))
@@ -41,4 +44,18 @@ func TestClientUploadErrorDoesNotExposeResponseBodyOrToken(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func newLoopbackServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("sandbox does not permit loopback test listener: %v", err)
+		}
+		t.Fatal(err)
+	}
+	server := &httptest.Server{Listener: listener, Config: &http.Server{Handler: handler}}
+	server.Start()
+	return server
 }

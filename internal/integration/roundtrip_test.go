@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -67,9 +69,23 @@ func startRoundTripServers(t *testing.T) (cli.Dependencies, hostedServer) {
 		Provider: auth.NewProxy("X-User", "", []*net.IPNet{trusted}),
 		CSRF:     csrf, Tokens: tokens,
 	})
-	server := httptest.NewServer(handler)
+	server := newLoopbackServer(t, handler)
 	t.Cleanup(server.Close)
 	return local, hostedServer{server: server, store: hostedStore, tokens: tokens}
+}
+
+func newLoopbackServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("sandbox does not permit loopback test listener: %v", err)
+		}
+		t.Fatal(err)
+	}
+	server := &httptest.Server{Listener: listener, Config: &http.Server{Handler: handler}}
+	server.Start()
+	return server
 }
 
 func completedFacts() time.Time { return time.Now().Add(-10 * time.Minute) }
