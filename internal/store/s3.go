@@ -200,18 +200,27 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 			}
 		}
 	}
-	for _, name := range []string{"metadata.json"} {
-		key, _ := s.key(p.Metadata.Destination, p.ID, name)
-		if _, err := s.client.PutObject(ctx, s.bucket, key, files[name], S3Condition{IfNoneMatch: true}); err != nil {
-			if !errors.Is(err, ErrS3PreconditionFailed) {
-				return false, err
-			}
-			existing, e := s.get(ctx, key, name)
-			if e != nil {
+	metadataKey, _ := s.key(p.Metadata.Destination, p.ID, "metadata.json")
+	if _, err := s.client.PutObject(ctx, s.bucket, metadataKey, files["metadata.json"], S3Condition{IfNoneMatch: true}); err != nil {
+		if !errors.Is(err, ErrS3PreconditionFailed) {
+			return false, err
+		}
+		existing, e := s.get(ctx, metadataKey, "metadata.json")
+		if e != nil {
+			return false, e
+		}
+		if checksum(existing.Body) != checksum(files["metadata.json"]) {
+			manifestKey, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
+			if _, e = s.client.HeadObject(ctx, s.bucket, manifestKey); e == nil {
+				return false, ErrConflict
+			} else if !errors.Is(e, ErrS3NotFound) {
 				return false, e
 			}
-			if checksum(existing.Body) != checksum(files[name]) {
-				return false, ErrConflict
+			if _, e = s.client.PutObject(ctx, s.bucket, metadataKey, files["metadata.json"], S3Condition{IfMatch: existing.ETag}); e != nil {
+				if errors.Is(e, ErrS3PreconditionFailed) {
+					return false, ErrConflict
+				}
+				return false, e
 			}
 		}
 	}

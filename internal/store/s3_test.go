@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
@@ -309,6 +310,30 @@ func TestS3MoveRetryPreservesSourceRePutAfterAmbiguousDelete(t *testing.T) {
 	}
 	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
 		t.Fatalf("reput source = %v", err)
+	}
+}
+
+func TestS3RePutReclaimsInvisibleMetadataOrphan(t *testing.T) {
+	s := NewS3(newFakeS3(), "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+		t.Fatal(err)
+	}
+	reput := p
+	reput.Metadata.Title = "new title"
+	reput.Metadata.Tags = []string{"new"}
+	reput.Metadata.UploadedAt = time.Now().UTC()
+	reput.Metadata.Revision = ""
+	created, err := s.PutSession(context.Background(), reput)
+	if err != nil || !created {
+		t.Fatalf("reput = %v, %v", created, err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil || got.Metadata.Title != "new title" || len(got.Metadata.Tags) != 1 {
+		t.Fatalf("got = %+v, %v", got.Metadata, err)
 	}
 }
 
