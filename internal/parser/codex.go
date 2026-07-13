@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
@@ -97,6 +98,9 @@ func mapCodexResponse(p codexPayload, line int, when time.Time) (session.Event, 
 	case "message":
 		kind := session.EventAssistant
 		if p.Role == "user" {
+			if len(p.Content) > 0 && strings.HasPrefix(strings.TrimSpace(p.Content[0].Text), "<environment_context>") {
+				return session.Event{}, false
+			}
 			kind = session.EventUser
 		} else if p.Role != "assistant" {
 			return session.Event{}, false

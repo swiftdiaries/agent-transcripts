@@ -157,7 +157,7 @@ func TestCodexUsesProviderAndLineFallbackIDs(t *testing.T) {
 func TestCodexUsesEventMessageAsVisiblePrompt(t *testing.T) {
 	input := strings.Join([]string{
 		`{"type":"session_meta","payload":{"id":"codex-review"}}`,
-		`{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<environment_context>hidden</environment_context>"}]}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>hidden</environment_context>"}]}}`,
 		`{"type":"event_msg","payload":{"type":"user_message","message":"Review the parser"}}`,
 		`{"type":"response_item","payload":{"id":"call-1","type":"custom_tool_call","name":"exec","input":"pwd"}}`,
 		`{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"/repo"}]}}`,
