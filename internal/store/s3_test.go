@@ -55,7 +55,7 @@ func TestS3ConcurrentPutConverges(t *testing.T) {
 
 func TestS3ListsOnlyFinalizedPackagesAcrossPages(t *testing.T) {
 	fake := newFakeS3()
-	s := NewS3(fake, "bucket", "prod")
+	s := NewS3(fake, "bucket", "prod").(*S3)
 	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
 	orphanID := "s_" + strings.Repeat("0", 64)
 	if _, err := fake.PutObject(context.Background(), "bucket", "prod/users/ada/"+orphanID+"/metadata.json", []byte("{}"), S3Condition{}); err != nil {
@@ -172,9 +172,7 @@ func TestS3MoveRetriesAfterCommittedSourceManifestDeleteResponseLoss(t *testing.
 	if _, err := fake.GetObject(context.Background(), "bucket", "prod/.moves/"+p.ID+".json"); !errors.Is(err, ErrS3NotFound) {
 		t.Fatalf("move marker = %v", err)
 	}
-	if _, err := fake.GetObject(context.Background(), "bucket", "prod/users/ada/"+p.ID+"/source.jsonl"); !errors.Is(err, ErrS3NotFound) {
-		t.Fatalf("source orphan = %v", err)
-	}
+	// Immutable source objects intentionally remain as non-visible orphans so a concurrent re-put cannot lose data.
 }
 
 func TestS3MoveRetriesAfterPreFinalizationMetadataResponseLoss(t *testing.T) {
@@ -259,6 +257,58 @@ func TestS3MoveReconcilesDestinationWhenSourceDeleteWins(t *testing.T) {
 	}
 	if _, err := s.GetSession(context.Background(), newID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("destination visible = %v", err)
+	}
+}
+
+func TestS3UpdateMetadataConflictsWithMoveLockedManifest(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod").(*S3)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	m, etag, err := s.readManifest(context.Background(), p.Metadata.Destination, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.MoveID = p.ID
+	key, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
+	if _, err := fake.PutObject(context.Background(), "bucket", key, mustJSON(m), S3Condition{IfMatch: etag}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Metadata.Title = "blocked"
+	if _, err := s.UpdateMetadata(context.Background(), p.ID, got.Metadata.Revision, got.Metadata); !errors.Is(err, ErrConflict) {
+		t.Fatalf("update = %v", err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatalf("locked source unreadable: %v", err)
+	}
+}
+
+func TestS3MoveRetryPreservesSourceRePutAfterAmbiguousDelete(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	dest := session.Directory{Kind: "projects", Slug: "demo"}
+	fake.failAfterDelete("prod/users/ada/"+p.ID+"/manifest.json", errors.New("response lost"))
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err == nil {
+		t.Fatal("wanted response loss")
+	}
+	if created, err := s.PutSession(context.Background(), p); err != nil || !created {
+		t.Fatalf("reput = %v, %v", created, err)
+	}
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); !errors.Is(err, ErrConflict) {
+		t.Fatalf("retry = %v", err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatalf("reput source = %v", err)
 	}
 }
 

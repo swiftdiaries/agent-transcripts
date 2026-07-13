@@ -235,6 +235,9 @@ func (s *S3) UpdateMetadata(ctx context.Context, id, expected string, md session
 	if err != nil {
 		return "", err
 	}
+	if m.MoveID != "" {
+		return "", ErrConflict
+	}
 	md.Revision = ""
 	if err := session.ValidateMetadata(md); err != nil {
 		return "", err
@@ -482,10 +485,6 @@ func (s *S3) setMovePhase(ctx context.Context, intent s3MoveIntent) error {
 	return err
 }
 func (s *S3) completeMoveCleanup(ctx context.Context, intent s3MoveIntent) (session.Metadata, error) {
-	for _, name := range append(append([]string{}, immutableNames...), "metadata.json") {
-		key, _ := s.key(intent.OldDestination, intent.OldID, name)
-		_ = s.client.DeleteObject(ctx, s.bucket, key, S3Condition{})
-	}
 	_ = s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(intent.OldID), S3Condition{})
 	return intent.Metadata, nil
 }
@@ -494,10 +493,6 @@ func (s *S3) reconcileMoveConflict(ctx context.Context, intent s3MoveIntent) (se
 	if err == nil {
 		key, _ := s.key(m.Destination, m.ID, "manifest.json")
 		_ = s.client.DeleteObject(ctx, s.bucket, key, S3Condition{IfMatch: etag})
-		for _, name := range append(append([]string{}, immutableNames...), "metadata.json") {
-			key, _ := s.key(intent.NewDestination, intent.NewID, name)
-			_ = s.client.DeleteObject(ctx, s.bucket, key, S3Condition{})
-		}
 	}
 	_ = s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(intent.OldID), S3Condition{})
 	return session.Metadata{}, ErrConflict
@@ -530,10 +525,6 @@ func (s *S3) DeleteSession(ctx context.Context, id, uploader string) error {
 			return ErrNotFound
 		}
 		return err
-	}
-	for _, name := range append(append([]string{}, immutableNames...), "metadata.json") {
-		key, _ := s.key(m.Destination, m.ID, name)
-		_ = s.client.DeleteObject(ctx, s.bucket, key, S3Condition{})
 	}
 	return nil
 }
