@@ -187,7 +187,7 @@ func emitEligible(ctx context.Context, candidate discovery.Candidate, stdout, st
 		return 1
 	}
 	defer reader.Close()
-	svc := library.New(store.NewFilesystem("agent-transcripts-library"))
+	svc := library.New(store.NewFilesystem("agent-transcripts-library"), library.AllowLocalQuietEvidence())
 	metadata, err := svc.Import(ctx, reader, facts, library.ImportAttrs{
 		Destination: session.Directory{Kind: "users", Slug: "local"},
 		UploaderKey: "local",

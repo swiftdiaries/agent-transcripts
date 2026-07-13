@@ -28,13 +28,21 @@ type ImportAttrs struct {
 }
 
 type Service struct {
-	store   store.Store
-	parsers parser.Registry
-	now     func() time.Time
+	store           store.Store
+	parsers         parser.Registry
+	now             func() time.Time
+	allowLocalQuiet bool
 }
 
-func New(s store.Store) *Service {
-	return &Service{store: s, parsers: parser.DefaultRegistry(), now: time.Now}
+type Option func(*Service)
+
+func AllowLocalQuietEvidence() Option { return func(s *Service) { s.allowLocalQuiet = true } }
+func New(st store.Store, options ...Option) *Service {
+	s := &Service{store: st, parsers: parser.DefaultRegistry(), now: time.Now}
+	for _, option := range options {
+		option(s)
+	}
+	return s
 }
 
 func (s *Service) Import(ctx context.Context, source io.Reader, facts session.SourceFacts, attrs ImportAttrs) (session.Metadata, error) {
@@ -60,7 +68,7 @@ func (s *Service) Import(ctx context.Context, source io.Reader, facts session.So
 	defer os.Remove(name)
 	defer tmp.Close()
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(source, session.MaxSourceBytes+1))
+	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(&contextReader{ctx: ctx, r: source}, session.MaxSourceBytes+1))
 	if err != nil {
 		return session.Metadata{}, err
 	}
@@ -81,7 +89,7 @@ func (s *Service) Import(ctx context.Context, source io.Reader, facts session.So
 	if err != nil {
 		return session.Metadata{}, err
 	}
-	if !parsed.Completion.Terminal && !facts.QuietPeriodVerified {
+	if !parsed.Completion.Terminal && !(s.allowLocalQuiet && facts.QuietPeriodVerified) {
 		return session.Metadata{}, ErrIncomplete
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
@@ -119,4 +127,16 @@ func (s *Service) Import(ctx context.Context, source io.Reader, facts session.So
 		return session.Metadata{}, err
 	}
 	return stored.Metadata, nil
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }

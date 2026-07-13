@@ -22,7 +22,7 @@ func fixture(t *testing.T, name string) []byte {
 }
 
 func TestImportIsIdempotent(t *testing.T) {
-	svc := New(store.NewFilesystem(t.TempDir()))
+	svc := New(store.NewFilesystem(t.TempDir()), AllowLocalQuietEvidence())
 	attrs := ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "ada"}, UploaderKey: "ada"}
 	b := fixture(t, "claude-session.jsonl")
 	first, err := svc.Import(context.Background(), bytes.NewReader(b), session.SourceFacts{QuietPeriodVerified: true, ObservedSize: int64(len(b))}, attrs)
@@ -43,6 +43,24 @@ func TestImportRejectsUnprovenCompletion(t *testing.T) {
 	source := []byte(`{"type":"user","sessionId":"c1","timestamp":"2026-07-12T10:00:00Z","message":{"content":"hello"}}`)
 	_, err := svc.Import(context.Background(), bytes.NewReader(source), session.SourceFacts{ObservedSize: int64(len(source))}, ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "ada"}, UploaderKey: "ada"})
 	if !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRemoteImportRejectsCallerClaimedQuietEvidence(t *testing.T) {
+	svc := New(store.NewFilesystem(t.TempDir()))
+	source := []byte(`{"type":"user","sessionId":"c1","timestamp":"2026-07-12T10:00:00Z","message":{"content":"hello"}}`)
+	_, err := svc.Import(context.Background(), bytes.NewReader(source), session.SourceFacts{QuietPeriodVerified: true, ObservedSize: int64(len(source))}, ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "ada"}, UploaderKey: "ada"})
+	if !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestImportHonorsCancellationDuringCopy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := New(store.NewFilesystem(t.TempDir())).Import(ctx, bytes.NewReader([]byte("x")), session.SourceFacts{}, ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "ada"}, UploaderKey: "ada"})
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v", err)
 	}
 }
