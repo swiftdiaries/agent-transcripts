@@ -2,6 +2,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"html/template"
 	"net/http"
@@ -23,6 +24,7 @@ type ServerConfig struct {
 	Roots       discovery.Roots
 	QuietPeriod time.Duration
 	Now         func() time.Time
+	Mode        string
 }
 
 type server struct {
@@ -32,6 +34,8 @@ type server struct {
 	quietPeriod    time.Duration
 	now            func() time.Time
 	templates      map[string]*template.Template
+	mode           string
+	discover       func(context.Context, discovery.Roots, time.Time, time.Duration) ([]discovery.Candidate, error)
 }
 
 func New(cfg ServerConfig) http.Handler {
@@ -47,13 +51,21 @@ func New(cfg ServerConfig) http.Handler {
 	for _, name := range []string{"home", "directory", "transcript", "upload"} {
 		templates[name] = template.Must(template.ParseFS(assets, "templates/layout.html", "templates/"+name+".html"))
 	}
-	return &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates}
+	mode := cfg.Mode
+	if mode == "" {
+		mode = "local"
+	}
+	return &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates, mode: mode, discover: discovery.Discover}
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")
+	if r.Method == http.MethodPost && r.URL.Path == "/live/import" && s.mode == "local" {
+		s.importLive(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.NotFound(w, r)
 		return

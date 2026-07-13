@@ -33,6 +33,19 @@ func TestHostedRejectsLocalIdentity(t *testing.T) {
 	}
 }
 
+func TestLocalDefaultsToLoopbackAndRejectsPublicListen(t *testing.T) {
+	got, err := Load("", Overrides{})
+	if err != nil || got.Listen != "127.0.0.1:8080" {
+		t.Fatalf("listen = %q, err = %v", got.Listen, err)
+	}
+	for _, value := range []string{":8080", "0.0.0.0:8080", "192.0.2.1:8080"} {
+		_, err := Load(writeTempConfig(t, "mode: local\nlisten: "+value+"\n"), Overrides{})
+		if err == nil || !strings.Contains(err.Error(), "loopback") {
+			t.Fatalf("listen %q error = %v", value, err)
+		}
+	}
+}
+
 func TestHostedRequiresExternalOriginAndSessionKey(t *testing.T) {
 	_, err := Load(writeTempConfig(t, "mode: hosted\nauth:\n  type: proxy\n"), Overrides{})
 	if err == nil || !strings.Contains(err.Error(), "external_origin") {

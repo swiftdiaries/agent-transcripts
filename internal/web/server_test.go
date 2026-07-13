@@ -6,9 +6,13 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
@@ -64,7 +68,7 @@ func TestStaticAssetsHaveFixedContentTypeAndSecurityHeaders(t *testing.T) {
 
 func TestCorePagesWorkWithoutJavaScript(t *testing.T) {
 	h := newTestServer(t, fixturePackage(t))
-	for _, path := range []string{"/", "/live", "/library", "/users/ada", "/upload"} {
+	for _, path := range []string{"/", "/live", "/library", "/users/ada", "/projects/demo", "/upload"} {
 		t.Run(path, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
@@ -72,6 +76,90 @@ func TestCorePagesWorkWithoutJavaScript(t *testing.T) {
 				t.Fatalf("status = %d", rr.Code)
 			}
 		})
+	}
+}
+
+func TestProjectDirectoryRendersStoredSession(t *testing.T) {
+	pkg := fixturePackage(t)
+	pkg.Metadata.Destination = session.Directory{Kind: "projects", Slug: "demo"}
+	pkg.ID = session.PackageID(pkg.ContentID, pkg.Metadata.Destination)
+	pkg.Metadata.ID = pkg.ID
+	h := newTestServer(t, pkg)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/projects/demo", nil))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "example") {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLiveRoutesUseCatalogAndRenderBothProviders(t *testing.T) {
+	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
+	for _, path := range []string{"/live", "/live/claude/claude-session-1", "/live/codex/codex-session-1"} {
+		t.Run(path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d", rr.Code)
+			}
+			if path == "/live" && (!strings.Contains(rr.Body.String(), "/live/claude/claude-session-1") || !strings.Contains(rr.Body.String(), "/live/codex/codex-session-1")) {
+				t.Fatalf("catalog was not rendered: %s", rr.Body.String())
+			}
+			hasPromptAnchor := strings.Contains(rr.Body.String(), "id=\"claude-user-1\"") || strings.Contains(rr.Body.String(), "id=\"codex-user-1\"")
+			if path != "/live" && (!strings.Contains(rr.Body.String(), "future_") || !hasPromptAnchor) {
+				t.Fatalf("missing raw event or prompt anchor: %s", rr.Body.String())
+			}
+		})
+	}
+	for _, path := range []string{"/live/claude/not-in-catalog", "/live/claude/.."} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d", path, rr.Code)
+		}
+	}
+}
+
+func TestLiveImportImportsMultipleCatalogSelections(t *testing.T) {
+	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
+	form := "session=claude%3Aclaude-session-1&session=codex%3Acodex-session-1"
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader(form))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	for _, d := range []session.Directory{{Kind: "users", Slug: "local"}} {
+		items, err := h.store.ListSessions(context.Background(), d)
+		if err != nil || len(items) != 2 {
+			t.Fatalf("items = %#v, err = %v", items, err)
+		}
+	}
+}
+
+func TestLiveImportRejectsChangedCandidate(t *testing.T) {
+	h := newLiveTestServer(t, "claude-session.jsonl")
+	root := h.roots.Claude[0]
+	h.discover = func(ctx context.Context, _ discovery.Roots, now time.Time, quiet time.Duration) ([]discovery.Candidate, error) {
+		items, err := discovery.Discover(ctx, discovery.Roots{Claude: []string{root}}, now, quiet)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(items[0].Path, append(mustRead(t, items[0].Path), '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return items, nil
+	}
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Aclaude-session-1"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	items, err := h.store.ListSessions(context.Background(), session.Directory{Kind: "users", Slug: "local"})
+	if err != nil || len(items) != 0 {
+		t.Fatalf("items = %#v, err = %v", items, err)
 	}
 }
 
@@ -95,6 +183,36 @@ func newTestServer(t *testing.T, pkg session.Package) http.Handler {
 		t.Fatal(err)
 	}
 	return New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence())})
+}
+
+func newLiveTestServer(t *testing.T, names ...string) *server {
+	t.Helper()
+	root := t.TempDir()
+	roots := discovery.Roots{Claude: []string{filepath.Join(root, "claude")}, Codex: []string{filepath.Join(root, "codex")}}
+	for _, name := range names {
+		providerRoot := roots.Claude[0]
+		if strings.HasPrefix(name, "codex") {
+			providerRoot = roots.Codex[0]
+			name = "rollout-" + name
+		}
+		if err := os.MkdirAll(providerRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(providerRoot, name), mustRead(t, filepath.Join("..", "parser", "testdata", strings.TrimPrefix(name, "rollout-"))), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := store.NewFilesystem(t.TempDir())
+	return New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: roots}).(*server)
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func fixturePackage(t *testing.T) session.Package { return packageWithText(t, "hello") }

@@ -79,7 +79,7 @@ type Overrides struct {
 
 func defaults() Config {
 	return Config{
-		Mode: "local", Listen: ":8080", QuietPeriod: 5 * time.Minute,
+		Mode: "local", Listen: "127.0.0.1:8080", QuietPeriod: 5 * time.Minute,
 		UploadLimits: UploadLimits{SourceBytes: 64 << 20, RecordBytes: 16 << 20, TitleBytes: 200, DescriptionBytes: 4 << 10, Tags: 20, TagBytes: 64},
 		Storage:      Storage{Type: "filesystem", Root: "./agent-transcripts-library"},
 		Auth:         Auth{Type: "local"},
@@ -178,6 +178,9 @@ func (cfg Config) validate() error {
 	if cfg.Mode != "local" && cfg.Mode != "hosted" {
 		return fmt.Errorf("mode must be local or hosted")
 	}
+	if cfg.Mode == "local" && !isLoopbackListen(cfg.Listen) {
+		return fmt.Errorf("local mode listen must use a loopback address")
+	}
 	if cfg.Storage.Type != "filesystem" && cfg.Storage.Type != "s3" {
 		return fmt.Errorf("storage.type must be filesystem or s3")
 	}
@@ -243,6 +246,18 @@ func (cfg Config) validate() error {
 		}
 	}
 	return nil
+}
+
+func isLoopbackListen(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil || host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (limits UploadLimits) validate() error {

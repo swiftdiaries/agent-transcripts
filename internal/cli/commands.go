@@ -71,6 +71,14 @@ func parseServeArgs(args []string) (serveOptions, error) {
 }
 
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runServeWithOpener(ctx, args, stdout, stderr, openBrowser)
+}
+
+func runServeWithOpener(ctx context.Context, args []string, stdout, stderr io.Writer, opener func(string, io.Writer)) int {
+	return runServeWithDeps(ctx, args, stdout, stderr, opener, net.Listen)
+}
+
+func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writer, opener func(string, io.Writer), listen func(string, string) (net.Listener, error)) int {
 	opts, err := parseServeArgs(args)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -81,13 +89,17 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
+	if cfg.Mode != "local" {
+		_, _ = fmt.Fprintln(stderr, "serve only supports local mode until hosted authentication is configured")
+		return 1
+	}
 	if cfg.Storage.Type != "filesystem" {
 		_, _ = fmt.Fprintln(stderr, "serve currently requires filesystem storage")
 		return 1
 	}
 	st := store.NewFilesystem(cfg.Storage.Root)
-	h := web.New(web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: defaultRoots(), QuietPeriod: cfg.QuietPeriod})
-	listener, err := net.Listen("tcp", cfg.Listen)
+	h := web.New(web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: defaultRoots(), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode})
+	listener, err := listen("tcp", cfg.Listen)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
@@ -95,7 +107,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	defer listener.Close()
 	srv := &http.Server{Handler: h}
 	if opts.open {
-		openBrowser(localURL(listener.Addr().String()), stderr)
+		opener(localURL(listener.Addr().String()), stderr)
 	}
 	_, _ = fmt.Fprintf(stdout, "serving agent transcripts on %s\n", listener.Addr())
 	go func() { <-ctx.Done(); _ = srv.Close() }()

@@ -3,10 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 )
@@ -137,6 +141,54 @@ func TestParseServeArgs(t *testing.T) {
 		t.Fatal("accepted positional serve argument")
 	}
 }
+
+func TestServeRejectsHostedAndNonLoopbackLocalConfig(t *testing.T) {
+	t.Setenv("KEY", strings.Repeat("k", 32))
+	t.Setenv("TOKEN", strings.Repeat("t", 32))
+	for _, test := range []struct{ contents, want string }{{"mode: hosted\nexternal_origin: https://example.com\nauth:\n  type: proxy\n  proxy:\n    user_header: X-User\ntrusted_proxy_cidrs: [127.0.0.1/32]\ncookie_key_envs: [KEY]\ntoken_key_env: TOKEN\n", "only supports local mode"}, {"mode: local\nlisten: 0.0.0.0:8080\n", "loopback"}} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(test.contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stderr bytes.Buffer
+		if got := runServe(context.Background(), []string{"--config", path}, &bytes.Buffer{}, &stderr); got != 1 || !strings.Contains(stderr.String(), test.want) {
+			t.Fatalf("exit = %d, stderr = %q", got, stderr.String())
+		}
+	}
+}
+
+func TestServeOpenUsesInjectedOpener(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("mode: local\nlisten: 127.0.0.1:0\nstorage:\n  root: "+filepath.Join(t.TempDir(), "library")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opened := ""
+	go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+	var stderr bytes.Buffer
+	if got := runServeWithDeps(ctx, []string{"--config", path, "--open"}, &bytes.Buffer{}, &stderr, func(url string, _ io.Writer) { opened = url }, func(string, string) (net.Listener, error) { return newTestListener(), nil }); got != 0 {
+		t.Fatalf("exit = %d, stderr = %q", got, stderr.String())
+	}
+	if !strings.HasPrefix(opened, "http://127.0.0.1:") {
+		t.Fatalf("opened = %q", opened)
+	}
+}
+
+type testListener struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newTestListener() *testListener              { return &testListener{closed: make(chan struct{})} }
+func (l *testListener) Accept() (net.Conn, error) { <-l.closed; return nil, net.ErrClosed }
+func (l *testListener) Close() error              { l.once.Do(func() { close(l.closed) }); return nil }
+func (l *testListener) Addr() net.Addr            { return testAddr("127.0.0.1:12345") }
+
+type testAddr string
+
+func (a testAddr) Network() string { return "tcp" }
+func (a testAddr) String() string  { return string(a) }
 
 func TestNonInteractiveImportRequiresPathOrLatest(t *testing.T) {
 	input, output, err := os.Pipe()

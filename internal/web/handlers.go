@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
+	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/parser"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
@@ -67,7 +68,7 @@ func (s *server) static(w http.ResponseWriter, name, contentType string) {
 }
 
 func (s *server) liveList(w http.ResponseWriter, r *http.Request) {
-	candidates, err := discovery.Discover(r.Context(), s.roots, s.now(), s.quietPeriod)
+	candidates, err := s.discover(r.Context(), s.roots, s.now(), s.quietPeriod)
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -76,7 +77,7 @@ func (s *server) liveList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) liveSession(w http.ResponseWriter, r *http.Request, wantProvider, wantID string) {
-	candidates, err := discovery.Discover(r.Context(), s.roots, s.now(), s.quietPeriod)
+	candidates, err := s.discover(r.Context(), s.roots, s.now(), s.quietPeriod)
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -100,6 +101,74 @@ func (s *server) liveSession(w http.ResponseWriter, r *http.Request, wantProvide
 		return
 	}
 	http.NotFound(w, r)
+}
+
+func (s *server) importLive(w http.ResponseWriter, r *http.Request) {
+	if s.libraryService == nil {
+		s.internalError(w, errors.New("library service unavailable"))
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid import request", http.StatusBadRequest)
+		return
+	}
+	candidates, err := s.discover(r.Context(), s.roots, s.now(), s.quietPeriod)
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	bySelection := make(map[string]discovery.Candidate, len(candidates))
+	for _, candidate := range candidates {
+		bySelection[candidate.Provider+":"+candidate.SessionID] = candidate
+	}
+	selected := make([]discovery.Candidate, 0, len(r.Form["session"]))
+	seen := make(map[string]bool)
+	for _, value := range r.Form["session"] {
+		if seen[value] {
+			continue
+		}
+		candidate, ok := bySelection[value]
+		if !ok {
+			http.Error(w, "selected session is no longer available", http.StatusBadRequest)
+			return
+		}
+		selected = append(selected, candidate)
+		seen[value] = true
+	}
+	if len(selected) == 0 {
+		http.Error(w, "select at least one session", http.StatusBadRequest)
+		return
+	}
+	type opened struct {
+		candidate discovery.Candidate
+		reader    io.ReadCloser
+		facts     session.SourceFacts
+	}
+	openedCandidates := make([]opened, 0, len(selected))
+	for _, candidate := range selected {
+		reader, facts, err := discovery.OpenEligible(candidate)
+		if err != nil {
+			for _, value := range openedCandidates {
+				_ = value.reader.Close()
+			}
+			http.Error(w, "selected session is no longer eligible", http.StatusBadRequest)
+			return
+		}
+		openedCandidates = append(openedCandidates, opened{candidate, reader, facts})
+	}
+	defer func() {
+		for _, value := range openedCandidates {
+			_ = value.reader.Close()
+		}
+	}()
+	for _, value := range openedCandidates {
+		_, err := s.libraryService.Import(r.Context(), value.reader, value.facts, library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local", Title: value.candidate.Title, Project: value.candidate.Project})
+		if err != nil {
+			http.Error(w, "could not import selected session", http.StatusBadRequest)
+			return
+		}
+	}
+	http.Redirect(w, r, "/library", http.StatusSeeOther)
 }
 
 func (s *server) library(w http.ResponseWriter, r *http.Request) {
