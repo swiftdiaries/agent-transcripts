@@ -302,6 +302,28 @@ func TestServeHandlerComposesConfiguredS3Store(t *testing.T) {
 	}
 }
 
+func TestRunServeWithDepsComposesS3WithoutFilesystemRejection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("mode: local\nlisten: 127.0.0.1:0\nstorage:\n  type: s3\n  bucket: transcripts\n  prefix: prod\n  region: us-east-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	called := false
+	go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+	var stderr bytes.Buffer
+	code := runServeWithDepsAndStoreFactory(ctx, []string{"--config", path}, &bytes.Buffer{}, &stderr, func(string, io.Writer) {}, func(string, string) (net.Listener, error) { return newTestListener(), nil }, func(_ context.Context, got config.Storage) (store.Store, error) {
+		called = true
+		if got.Type != "s3" || got.Bucket != "transcripts" || got.Prefix != "prod" || got.Region != "us-east-1" {
+			t.Fatalf("storage = %+v", got)
+		}
+		return store.NewS3(newFakeS3ForCLI(), got.Bucket, got.Prefix), nil
+	})
+	if code != 0 || !called {
+		t.Fatalf("code=%d called=%v stderr=%q", code, called, stderr.String())
+	}
+}
+
 // newFakeS3ForCLI only proves composition selects S3; store behavior remains
 // covered in the store package's fake-backed tests.
 func newFakeS3ForCLI() store.S3API { return &cliS3{} }

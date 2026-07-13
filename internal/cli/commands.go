@@ -235,6 +235,10 @@ func runServeWithOpener(ctx context.Context, args []string, stdout, stderr io.Wr
 }
 
 func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writer, opener func(string, io.Writer), listen func(string, string) (net.Listener, error)) int {
+	return runServeWithDepsAndStoreFactory(ctx, args, stdout, stderr, opener, listen, productionStoreForConfig)
+}
+
+func runServeWithDepsAndStoreFactory(ctx context.Context, args []string, stdout, stderr io.Writer, opener func(string, io.Writer), listen func(string, string) (net.Listener, error), makeStore func(context.Context, config.Storage) (store.Store, error)) int {
 	opts, err := parseServeArgs(args)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -245,11 +249,7 @@ func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writ
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if cfg.Storage.Type != "filesystem" {
-		_, _ = fmt.Fprintln(stderr, "serve currently requires filesystem storage")
-		return 1
-	}
-	h, err := serveHandlerWithStoreFactory(ctx, cfg, productionStoreForConfig)
+	h, err := serveHandlerWithStoreFactory(ctx, cfg, makeStore)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, "invalid server authentication configuration")
 		return 1
