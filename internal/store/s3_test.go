@@ -171,17 +171,87 @@ func TestS3MoveRetriesAfterCommittedSourceManifestDeleteResponseLoss(t *testing.
 	}
 }
 
+func TestS3MoveRetriesAfterPreFinalizationMetadataResponseLoss(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	dest := session.Directory{Kind: "projects", Slug: "demo"}
+	newID := session.PackageID(p.ContentID, dest)
+	fake.failAfterPut("prod/projects/demo/"+newID+"/metadata.json", errors.New("response lost"))
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err == nil {
+		t.Fatal("wanted response-loss error")
+	}
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err != nil {
+		t.Fatalf("retry = %v", err)
+	}
+}
+
+func TestFakeS3ListingIsBucketIsolated(t *testing.T) {
+	fake := newFakeS3()
+	_, _ = fake.PutObject(context.Background(), "a", "prod/users/ada/x", []byte("a"), S3Condition{})
+	_, _ = fake.PutObject(context.Background(), "b", "prod/users/ada/y", []byte("b"), S3Condition{})
+	page, err := fake.ListObjectsV2(context.Background(), "a", "prod/", "")
+	if err != nil || len(page.Keys) != 1 || page.Keys[0] != "prod/users/ada/x" {
+		t.Fatalf("page = %+v, %v", page, err)
+	}
+}
+
+func TestS3ListCancelsBetweenPages(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	fake.cancelAfterFirstList = cancel
+	_, err := s.ListSessions(ctx, p.Metadata.Destination)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestS3MoveDoesNotHideSourceAfterManifestETagRace(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	dest := session.Directory{Kind: "projects", Slug: "demo"}
+	newID := session.PackageID(p.ContentID, dest)
+	sourceKey := fakeKey("bucket", "prod/users/ada/"+p.ID+"/manifest.json")
+	fake.setOnPut("prod/projects/demo/"+newID+"/manifest.json", func() {
+		o := fake.objects[sourceKey]
+		fake.sequence++
+		o.ETag = "etag-" + string(rune(fake.sequence))
+		fake.objects[sourceKey] = o
+	})
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); !errors.Is(err, ErrConflict) {
+		t.Fatalf("move = %v", err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatalf("source lost: %v", err)
+	}
+}
+
 type fakeS3 struct {
-	mu          sync.Mutex
-	objects     map[string]S3Object
-	puts        []string
-	sequence    int
-	afterPut    map[string]error
-	afterDelete map[string]error
+	mu                   sync.Mutex
+	objects              map[string]S3Object
+	puts                 []string
+	sequence             int
+	afterPut             map[string]error
+	afterDelete          map[string]error
+	cancelAfterFirstList func()
+	listCalls            int
+	onPut                map[string]func()
 }
 
 func newFakeS3() *fakeS3 {
-	return &fakeS3{objects: map[string]S3Object{}, afterPut: map[string]error{}, afterDelete: map[string]error{}}
+	return &fakeS3{objects: map[string]S3Object{}, afterPut: map[string]error{}, afterDelete: map[string]error{}, onPut: map[string]func(){}}
 }
 func fakeKey(bucket, key string) string { return bucket + "\x00" + key }
 func (f *fakeS3) GetObject(_ context.Context, bucket, key string) (S3Object, error) {
@@ -209,6 +279,10 @@ func (f *fakeS3) PutObject(_ context.Context, bucket, key string, body []byte, c
 	etag := "etag-" + string(rune(f.sequence))
 	f.objects[objectKey] = S3Object{Body: append([]byte(nil), body...), ETag: etag}
 	f.puts = append(f.puts, key)
+	if hook := f.onPut[key]; hook != nil {
+		delete(f.onPut, key)
+		hook()
+	}
 	if err := f.afterPut[key]; err != nil {
 		delete(f.afterPut, key)
 		return "", err
@@ -219,6 +293,11 @@ func (f *fakeS3) failAfterPut(key string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.afterPut[key] = err
+}
+func (f *fakeS3) setOnPut(key string, hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onPut[key] = hook
 }
 func (f *fakeS3) failAfterDelete(key string, err error) {
 	f.mu.Lock()
@@ -260,13 +339,17 @@ func (f *fakeS3) DeleteObject(_ context.Context, bucket, key string, c S3Conditi
 	}
 	return nil
 }
-func (f *fakeS3) ListObjectsV2(_ context.Context, _, prefix, token string) (S3ListPage, error) {
+func (f *fakeS3) ListObjectsV2(_ context.Context, bucket, prefix, token string) (S3ListPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.listCalls++
+	if f.listCalls == 1 && f.cancelAfterFirstList != nil {
+		f.cancelAfterFirstList()
+	}
 	var keys []string
 	for objectKey := range f.objects {
 		parts := strings.SplitN(objectKey, "\x00", 2)
-		if len(parts) == 2 && strings.HasPrefix(parts[1], prefix) {
+		if len(parts) == 2 && parts[0] == bucket && strings.HasPrefix(parts[1], prefix) {
 			keys = append(keys, parts[1])
 		}
 	}

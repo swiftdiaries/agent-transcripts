@@ -49,6 +49,7 @@ type s3MoveIntent struct {
 	OldID, NewID                   string
 	OldDestination, NewDestination session.Directory
 	Metadata                       session.Metadata
+	SourceManifestETag             string
 }
 
 func NewS3(client S3API, bucket, prefix string) Store {
@@ -297,11 +298,21 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 		if intent.Metadata.UploaderKey != uploader {
 			return session.Metadata{}, ErrForbidden
 		}
-		return s.finishMove(ctx, intent)
+		_, etag, sourceErr := s.readManifest(ctx, intent.OldDestination, intent.OldID)
+		if errors.Is(sourceErr, ErrS3NotFound) {
+			return s.finishMove(ctx, intent)
+		}
+		if sourceErr != nil || etag != intent.SourceManifestETag {
+			return session.Metadata{}, ErrConflict
+		}
+		if err := s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(id), S3Condition{}); err != nil && !errors.Is(err, ErrS3NotFound) {
+			return session.Metadata{}, err
+		}
+		return s.MoveSession(ctx, id, uploader, d)
 	} else if !errors.Is(err, ErrS3NotFound) {
 		return session.Metadata{}, err
 	}
-	m, _, err := s.findWithETag(ctx, id)
+	m, sourceManifestETag, err := s.findWithETag(ctx, id)
 	if err != nil {
 		return session.Metadata{}, err
 	}
@@ -325,7 +336,7 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 		return session.Metadata{}, err
 	}
 	target := makeManifest(p, files)
-	intent := s3MoveIntent{OldID: id, NewID: newID, OldDestination: m.Destination, NewDestination: d, Metadata: p.Metadata}
+	intent := s3MoveIntent{OldID: id, NewID: newID, OldDestination: m.Destination, NewDestination: d, Metadata: p.Metadata, SourceManifestETag: sourceManifestETag}
 	if err := s.writeMoveIntent(ctx, intent); err != nil {
 		return session.Metadata{}, err
 	}
@@ -385,7 +396,7 @@ func (s *S3) readMoveIntent(ctx context.Context, id string) (s3MoveIntent, error
 	if err != nil {
 		return intent, err
 	}
-	if intent.OldID != id || !validManaged(intent.NewID, "s_") || session.ValidateDirectory(intent.OldDestination) != nil || session.ValidateDirectory(intent.NewDestination) != nil || intent.Metadata.ID != intent.NewID {
+	if intent.OldID != id || intent.SourceManifestETag == "" || !validManaged(intent.NewID, "s_") || session.ValidateDirectory(intent.OldDestination) != nil || session.ValidateDirectory(intent.NewDestination) != nil || intent.Metadata.ID != intent.NewID {
 		return intent, ErrConflict
 	}
 	return intent, nil
@@ -402,7 +413,7 @@ func (s *S3) writeMoveIntent(ctx context.Context, intent s3MoveIntent) error {
 	if err != nil {
 		return err
 	}
-	if existing.NewID != intent.NewID || existing.NewDestination != intent.NewDestination || string(mustJSON(existing.Metadata)) != string(mustJSON(intent.Metadata)) {
+	if existing.NewID != intent.NewID || existing.NewDestination != intent.NewDestination || existing.SourceManifestETag != intent.SourceManifestETag || string(mustJSON(existing.Metadata)) != string(mustJSON(intent.Metadata)) {
 		return ErrConflict
 	}
 	return nil
@@ -412,7 +423,13 @@ func (s *S3) finishMove(ctx context.Context, intent s3MoveIntent) (session.Metad
 		return session.Metadata{}, err
 	}
 	key, _ := s.key(intent.OldDestination, intent.OldID, "manifest.json")
-	if err := s.client.DeleteObject(ctx, s.bucket, key, S3Condition{}); err != nil && !errors.Is(err, ErrS3NotFound) {
+	if err := s.client.DeleteObject(ctx, s.bucket, key, S3Condition{IfMatch: intent.SourceManifestETag}); err != nil {
+		if errors.Is(err, ErrS3PreconditionFailed) {
+			return session.Metadata{}, ErrConflict
+		}
+		if errors.Is(err, ErrS3NotFound) {
+			return intent.Metadata, nil
+		}
 		return session.Metadata{}, err
 	}
 	for _, name := range append(append([]string{}, immutableNames...), "metadata.json") {
@@ -490,6 +507,9 @@ func (s *S3) list(ctx context.Context, prefix string) ([]string, error) {
 	var all []string
 	var token string
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		page, err := s.client.ListObjectsV2(ctx, s.bucket, prefix, token)
 		if err != nil {
 			return nil, err
@@ -497,6 +517,9 @@ func (s *S3) list(ctx context.Context, prefix string) ([]string, error) {
 		all = append(all, page.Keys...)
 		if page.NextToken == "" {
 			return all, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		token = page.NextToken
 	}
