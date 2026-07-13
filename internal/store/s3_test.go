@@ -337,6 +337,35 @@ func TestS3RePutReclaimsInvisibleMetadataOrphan(t *testing.T) {
 	}
 }
 
+func TestS3ReclaimClaimDoesNotCorruptConcurrentManifestWinner(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod").(*S3)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	winner, _, err := s.readManifest(context.Background(), p.Metadata.Destination, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+		t.Fatal(err)
+	}
+	fake.setOnPut("prod/users/ada/"+p.ID+"/.reclaim", func() {
+		fake.sequence++
+		fake.objects[fakeKey("bucket", "prod/users/ada/"+p.ID+"/manifest.json")] = S3Object{Body: mustJSON(winner), ETag: "etag-" + string(rune(fake.sequence))}
+	})
+	reput := p
+	reput.Metadata.Title = "loser"
+	if _, err := s.PutSession(context.Background(), reput); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reclaim = %v", err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil || got.Metadata.Title != "" {
+		t.Fatalf("winner = %+v,%v", got.Metadata, err)
+	}
+}
+
 type fakeS3 struct {
 	mu                   sync.Mutex
 	objects              map[string]S3Object
