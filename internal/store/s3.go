@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
@@ -272,7 +273,10 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 	key, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
 	if !claimOwned {
 		if _, e := s.client.HeadObject(ctx, s.bucket, reclaimKey); e == nil {
-			return false, ErrConflict
+			settled, reconcileErr := s.reconcileReclaim(ctx, p, reclaimKey)
+			if settled || reconcileErr != nil {
+				return false, reconcileErr
+			}
 		} else if !errors.Is(e, ErrS3NotFound) {
 			return false, e
 		}
@@ -295,6 +299,57 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 		_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
 	}
 	return s.identical(ctx, winner, p)
+}
+
+const reclaimReconcileAttempts = 8
+
+// reconcileReclaim gives the winning reclaimer a bounded opportunity to
+// publish its manifest. A matching claim can only be treated as a temporary
+// lock: returning ErrConflict immediately would make two identical reclaimers
+// fail depending on whether the loser observed the lock before its manifest.
+func (s *S3) reconcileReclaim(ctx context.Context, p session.Package, reclaimKey string) (settled bool, err error) {
+	for range reclaimReconcileAttempts {
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		winner, _, manifestErr := s.readManifest(ctx, p.Metadata.Destination, p.ID)
+		if manifestErr == nil {
+			_, err := s.identical(ctx, winner, p)
+			return true, err
+		}
+		if !errors.Is(manifestErr, ErrS3NotFound) {
+			return true, manifestErr
+		}
+		claim, claimErr := s.get(ctx, reclaimKey, "metadata.json")
+		if errors.Is(claimErr, ErrS3NotFound) {
+			return false, nil
+		}
+		if claimErr != nil {
+			return true, claimErr
+		}
+		files, filesErr := packageFiles(p)
+		if filesErr != nil {
+			return true, filesErr
+		}
+		if checksum(claim.Body) != checksum(files["metadata.json"]) {
+			return true, ErrConflict
+		}
+		if err := waitForReclaim(ctx); err != nil {
+			return true, err
+		}
+	}
+	return true, ErrConflict
+}
+
+func waitForReclaim(ctx context.Context) error {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *S3) reclaimKey(d session.Directory, id string) string {

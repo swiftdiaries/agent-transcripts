@@ -421,22 +421,46 @@ func TestS3ConcurrentIdenticalReclaimersConverge(t *testing.T) {
 	}
 	reput := p
 	reput.Metadata.Title = "reclaimed"
-	start := make(chan struct{})
+	metadataKey := "prod/users/ada/" + p.ID + "/metadata.json"
+	reclaimKey := "prod/users/ada/" + p.ID + "/.reclaim"
+	manifestKey := "prod/users/ada/" + p.ID + "/manifest.json"
+	metadataReplaced := make(chan struct{})
+	reclaimObserved := make(chan struct{})
+	manifestWritten := make(chan struct{})
+	releaseWinner := make(chan struct{})
+	releaseLoser := make(chan struct{})
+	fake.setAfterPut(metadataKey, func() {
+		close(metadataReplaced)
+		<-releaseWinner
+	})
+	fake.setAfterHead(reclaimKey, func() {
+		close(reclaimObserved)
+		<-releaseLoser
+	})
+	fake.setAfterPut(manifestKey, func() { close(manifestWritten) })
 	results := make(chan struct {
 		created bool
 		err     error
 	}, 2)
-	for range 2 {
-		go func() {
-			<-start
-			created, err := s.PutSession(context.Background(), reput)
-			results <- struct {
-				created bool
-				err     error
-			}{created, err}
-		}()
-	}
-	close(start)
+	go func() {
+		created, err := s.PutSession(context.Background(), reput)
+		results <- struct {
+			created bool
+			err     error
+		}{created, err}
+	}()
+	waitForSignal(t, metadataReplaced, "winner metadata replacement")
+	go func() {
+		created, err := s.PutSession(context.Background(), reput)
+		results <- struct {
+			created bool
+			err     error
+		}{created, err}
+	}()
+	waitForSignal(t, reclaimObserved, "loser reclaim observation")
+	close(releaseWinner)
+	waitForSignal(t, manifestWritten, "winner manifest")
+	close(releaseLoser)
 	a, b := <-results, <-results
 	if a.err != nil || b.err != nil || a.created == b.created {
 		t.Fatalf("results=%+v %+v", a, b)
@@ -444,6 +468,15 @@ func TestS3ConcurrentIdenticalReclaimersConverge(t *testing.T) {
 	got, err := s.GetSession(context.Background(), p.ID)
 	if err != nil || got.Metadata.Title != "reclaimed" {
 		t.Fatalf("got=%+v,%v", got.Metadata, err)
+	}
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
 	}
 }
 
@@ -457,10 +490,12 @@ type fakeS3 struct {
 	cancelAfterFirstList func()
 	listCalls            int
 	onPut                map[string]func()
+	afterPutHook         map[string]func()
+	afterHeadHook        map[string]func()
 }
 
 func newFakeS3() *fakeS3 {
-	return &fakeS3{objects: map[string]S3Object{}, afterPut: map[string]error{}, afterDelete: map[string]error{}, onPut: map[string]func(){}}
+	return &fakeS3{objects: map[string]S3Object{}, afterPut: map[string]error{}, afterDelete: map[string]error{}, onPut: map[string]func(){}, afterPutHook: map[string]func(){}, afterHeadHook: map[string]func(){}}
 }
 func fakeKey(bucket, key string) string { return bucket + "\x00" + key }
 func (f *fakeS3) GetObject(_ context.Context, bucket, key string) (S3Object, error) {
@@ -473,15 +508,27 @@ func (f *fakeS3) GetObject(_ context.Context, bucket, key string) (S3Object, err
 	o.Body = append([]byte(nil), o.Body...)
 	return o, nil
 }
-func (f *fakeS3) HeadObject(ctx context.Context, bucket, key string) (S3Object, error) {
-	return f.GetObject(ctx, bucket, key)
+func (f *fakeS3) HeadObject(_ context.Context, bucket, key string) (S3Object, error) {
+	f.mu.Lock()
+	o, ok := f.objects[fakeKey(bucket, key)]
+	hook := f.afterHeadHook[key]
+	delete(f.afterHeadHook, key)
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if !ok {
+		return S3Object{}, ErrS3NotFound
+	}
+	o.Body = append([]byte(nil), o.Body...)
+	return o, nil
 }
 func (f *fakeS3) PutObject(_ context.Context, bucket, key string, body []byte, c S3Condition) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	objectKey := fakeKey(bucket, key)
 	old, exists := f.objects[objectKey]
 	if c.IfNoneMatch && exists || c.IfMatch != "" && (!exists || old.ETag != c.IfMatch) {
+		f.mu.Unlock()
 		return "", ErrS3PreconditionFailed
 	}
 	f.sequence++
@@ -492,9 +539,16 @@ func (f *fakeS3) PutObject(_ context.Context, bucket, key string, body []byte, c
 		delete(f.onPut, key)
 		hook()
 	}
+	afterHook := f.afterPutHook[key]
+	delete(f.afterPutHook, key)
 	if err := f.afterPut[key]; err != nil {
 		delete(f.afterPut, key)
+		f.mu.Unlock()
 		return "", err
+	}
+	f.mu.Unlock()
+	if afterHook != nil {
+		afterHook()
 	}
 	return etag, nil
 }
@@ -507,6 +561,16 @@ func (f *fakeS3) setOnPut(key string, hook func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onPut[key] = hook
+}
+func (f *fakeS3) setAfterPut(key string, hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterPutHook[key] = hook
+}
+func (f *fakeS3) setAfterHead(key string, hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterHeadHook[key] = hook
 }
 func (f *fakeS3) failAfterDelete(key string, err error) {
 	f.mu.Lock()

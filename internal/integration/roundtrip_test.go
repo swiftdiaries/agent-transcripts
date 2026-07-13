@@ -30,7 +30,7 @@ func TestImportUploadBrowseAndAuthorize(t *testing.T) {
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			local, hosted := startRoundTripServers(t)
-			imported := importFixture(t, local, fixture.name, completedFacts())
+			imported := importFixture(t, local, fixture.name, fixture.rawType, completedFacts())
 			published := uploadAs(t, hosted, local.Library, imported.ID, "ada@example.com", "projects/platform")
 			assertTranscriptContainsEscapedPrompt(t, hosted, published.Location)
 			assertRawEventSurvives(t, hosted, published.Location, fixture.rawType)
@@ -74,7 +74,7 @@ func startRoundTripServers(t *testing.T) (cli.Dependencies, hostedServer) {
 
 func completedFacts() time.Time { return time.Now().Add(-10 * time.Minute) }
 
-func importFixture(t *testing.T, local cli.Dependencies, name string, completedAt time.Time) session.Metadata {
+func importFixture(t *testing.T, local cli.Dependencies, name, rawType string, completedAt time.Time) session.Metadata {
 	t.Helper()
 	source, err := os.ReadFile(filepath.Join("..", "parser", "testdata", name))
 	if err != nil {
@@ -105,6 +105,9 @@ func importFixture(t *testing.T, local cli.Dependencies, name string, completedA
 	pkg, err := local.Library.GetSession(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Contains(pkg.Normalized, []byte(rawType)) {
+		t.Fatalf("local normalized package omitted %q: %s", rawType, pkg.Normalized)
 	}
 	return pkg.Metadata
 }
