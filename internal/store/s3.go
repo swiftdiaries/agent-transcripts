@@ -201,6 +201,8 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 		}
 	}
 	metadataKey, _ := s.key(p.Metadata.Destination, p.ID, "metadata.json")
+	reclaimKey := s.reclaimKey(p.Metadata.Destination, p.ID)
+	claimOwned := false
 	if _, err := s.client.PutObject(ctx, s.bucket, metadataKey, files["metadata.json"], S3Condition{IfNoneMatch: true}); err != nil {
 		if !errors.Is(err, ErrS3PreconditionFailed) {
 			return false, err
@@ -210,9 +212,27 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 			return false, e
 		}
 		if checksum(existing.Body) != checksum(files["metadata.json"]) {
+			if _, e = s.client.PutObject(ctx, s.bucket, reclaimKey, files["metadata.json"], S3Condition{IfNoneMatch: true}); e != nil {
+				if !errors.Is(e, ErrS3PreconditionFailed) {
+					return false, e
+				}
+				claim, ce := s.get(ctx, reclaimKey, "metadata.json")
+				if ce != nil || checksum(claim.Body) != checksum(files["metadata.json"]) {
+					return false, ErrConflict
+				}
+			} else {
+				claimOwned = true
+			}
 			manifestKey, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
 			if _, e = s.client.HeadObject(ctx, s.bucket, manifestKey); e == nil {
-				return false, ErrConflict
+				if claimOwned {
+					_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
+				}
+				winner, _, we := s.readManifest(ctx, p.Metadata.Destination, p.ID)
+				if we != nil {
+					return false, we
+				}
+				return s.identical(ctx, winner, p)
 			} else if !errors.Is(e, ErrS3NotFound) {
 				return false, e
 			}
@@ -225,8 +245,18 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 		}
 	}
 	key, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
+	if !claimOwned {
+		if _, e := s.client.HeadObject(ctx, s.bucket, reclaimKey); e == nil {
+			return false, ErrConflict
+		} else if !errors.Is(e, ErrS3NotFound) {
+			return false, e
+		}
+	}
 	_, err = s.client.PutObject(ctx, s.bucket, key, mustJSON(m), S3Condition{IfNoneMatch: true})
 	if err == nil {
+		if claimOwned {
+			_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
+		}
 		return true, nil
 	}
 	if !errors.Is(err, ErrS3PreconditionFailed) {
@@ -236,7 +266,14 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 	if e != nil {
 		return false, e
 	}
+	if claimOwned {
+		_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
+	}
 	return s.identical(ctx, winner, p)
+}
+
+func (s *S3) reclaimKey(d session.Directory, id string) string {
+	return s.prefix + d.Kind + "/" + d.Slug + "/" + id + "/.reclaim"
 }
 
 func (s *S3) UpdateMetadata(ctx context.Context, id, expected string, md session.Metadata) (string, error) {
@@ -734,6 +771,18 @@ func (s *S3) identical(ctx context.Context, m manifest, p session.Package) (bool
 		if checksum(o.Body) != checksum(files[name]) {
 			return false, ErrConflict
 		}
+	}
+	winner, err := s.readPackage(ctx, m)
+	if err != nil {
+		return false, err
+	}
+	files, err := packageFiles(p)
+	if err != nil {
+		return false, err
+	}
+	winnerMetadata, err := json.Marshal(winner.Metadata)
+	if err != nil || checksum(winnerMetadata) != checksum(files["metadata.json"]) {
+		return false, ErrConflict
 	}
 	return false, nil
 }
