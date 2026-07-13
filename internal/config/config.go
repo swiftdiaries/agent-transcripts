@@ -187,6 +187,12 @@ func (cfg Config) validate() error {
 	if cfg.Storage.Type == "s3" && cfg.Storage.Bucket == "" {
 		return fmt.Errorf("storage.bucket is required for s3 storage")
 	}
+	if cfg.Storage.Type == "s3" && cfg.Storage.Endpoint != "" {
+		u, err := url.Parse(cfg.Storage.Endpoint)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("storage.endpoint must be an absolute URL")
+		}
+	}
 	if err := cfg.UploadLimits.validate(); err != nil {
 		return err
 	}
