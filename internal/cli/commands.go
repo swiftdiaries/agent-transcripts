@@ -7,23 +7,28 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/config"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
+	"github.com/swiftdiaries/agent-transcripts/internal/web"
 	"golang.org/x/term"
 )
 
 const Version = "dev"
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	_ = ctx
 	if len(args) == 0 {
 		return usage(stdout)
 	}
@@ -35,11 +40,98 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "import":
 		return runImport(ctx, args[1:], os.Stdin, stdout, stderr)
-	case "serve", "upload":
+	case "serve":
+		return runServe(ctx, args[1:], stdout, stderr)
+	case "upload":
 		return 0
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return 2
+	}
+}
+
+type serveOptions struct {
+	configPath string
+	open       bool
+}
+
+func parseServeArgs(args []string) (serveOptions, error) {
+	var got serveOptions
+	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&got.configPath, "config", "", "configuration file")
+	flags.BoolVar(&got.open, "open", false, "open the local browser")
+	if err := flags.Parse(args); err != nil {
+		return got, err
+	}
+	if flags.NArg() != 0 {
+		return got, errors.New("serve accepts no positional arguments")
+	}
+	return got, nil
+}
+
+func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	opts, err := parseServeArgs(args)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 2
+	}
+	cfg, err := config.Load(opts.configPath, config.Overrides{})
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if cfg.Storage.Type != "filesystem" {
+		_, _ = fmt.Fprintln(stderr, "serve currently requires filesystem storage")
+		return 1
+	}
+	st := store.NewFilesystem(cfg.Storage.Root)
+	h := web.New(web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: defaultRoots(), QuietPeriod: cfg.QuietPeriod})
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer listener.Close()
+	srv := &http.Server{Handler: h}
+	if opts.open {
+		openBrowser(localURL(listener.Addr().String()), stderr)
+	}
+	_, _ = fmt.Fprintf(stdout, "serving agent transcripts on %s\n", listener.Addr())
+	go func() { <-ctx.Done(); _ = srv.Close() }()
+	err = srv.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) {
+		return 0
+	}
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func localURL(listen string) string {
+	if strings.HasPrefix(listen, ":") {
+		return "http://127.0.0.1" + listen
+	}
+	if strings.HasPrefix(listen, "[::]") {
+		return "http://127.0.0.1:" + strings.TrimPrefix(listen, "[::]:")
+	}
+	return "http://" + listen
+}
+
+func openBrowser(url string, stderr io.Writer) {
+	var command *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		command = exec.Command("open", url)
+	case "windows":
+		command = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		command = exec.Command("xdg-open", url)
+	}
+	if err := command.Start(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "open browser: %v\n", err)
 	}
 }
 

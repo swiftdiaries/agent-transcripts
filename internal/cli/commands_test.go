@@ -116,12 +116,25 @@ func TestTerminalInputIsInteractiveWhenPTYAvailable(t *testing.T) {
 }
 
 func TestRunRecognizesCommands(t *testing.T) {
-	for _, command := range []string{"serve", "upload", "version", "help"} {
+	for _, command := range []string{"upload", "version", "help"} {
 		t.Run(command, func(t *testing.T) {
 			if got := Run(context.Background(), []string{command}, &bytes.Buffer{}, &bytes.Buffer{}); got != 0 {
 				t.Fatalf("exit code = %d", got)
 			}
 		})
+	}
+}
+
+func TestParseServeArgs(t *testing.T) {
+	got, err := parseServeArgs([]string{"--config", "local.yaml", "--open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.configPath != "local.yaml" || !got.open {
+		t.Fatalf("got %+v", got)
+	}
+	if _, err := parseServeArgs([]string{"unexpected"}); err == nil {
+		t.Fatal("accepted positional serve argument")
 	}
 }
 

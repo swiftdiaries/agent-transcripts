@@ -1,0 +1,1 @@
+document.querySelectorAll('.copy-anchor').forEach(function(button){button.addEventListener('click',function(){var url=new URL(location.href);url.hash=button.dataset.anchor;navigator.clipboard&&navigator.clipboard.writeText(url.href)})})
