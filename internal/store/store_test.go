@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
@@ -190,9 +192,10 @@ func TestFilesystemRejectsManifestWithMissingOrUnknownHashes(t *testing.T) {
 				t.Fatal(err)
 			}
 			mutate(&m)
-			if err := writeManifestLast(path, m); err != nil {
+			if err := s.writePackageFile(p.Metadata.Destination, p.ID, "manifest.json", mustJSON(m)); err != nil {
 				t.Fatal(err)
 			}
+			_ = path
 			if _, err := s.GetSession(context.Background(), p.ID); err == nil {
 				t.Fatal("accepted invalid manifest file set")
 			}
@@ -306,5 +309,130 @@ func TestFilesystemListHonorsCanceledContext(t *testing.T) {
 	_, err := NewFilesystem(t.TempDir()).ListSessions(ctx, session.Directory{Kind: "users", Slug: "ada"})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestFilesystemLockWaitHonorsCancellation(t *testing.T) {
+	root := t.TempDir()
+	first := NewFilesystem(root)
+	second := NewFilesystem(root)
+	if err := first.ensureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := first.lockMutations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	_, err = second.lockMutations(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("cancellation took %v", time.Since(started))
+	}
+}
+
+func TestFilesystemRejectsCorruptRecoveryJournal(t *testing.T) {
+	root := t.TempDir()
+	s := NewFilesystem(root)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Metadata.Title = "new"
+	data, _ := json.Marshal(got.Metadata)
+	_, m, err := s.find(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.MetadataHash = strings.Repeat("0", 64)
+	j := metadataJournal{ID: p.ID, Destination: p.Metadata.Destination, Metadata: data, Manifest: m}
+	if err := s.writeJournal(".metadata-journal.json", j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFilesystem(root).GetSession(context.Background(), p.ID); err == nil {
+		t.Fatal("accepted corrupt recovery journal")
+	}
+}
+
+func TestFilesystemRejectsCorruptMoveRecoveryRouting(t *testing.T) {
+	root := t.TempDir()
+	s := NewFilesystem(root)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := session.Directory{Kind: "projects", Slug: "demo"}
+	if err := s.CreateProject(context.Background(), dest.Slug); err != nil {
+		t.Fatal(err)
+	}
+	got.Metadata.Destination = dest
+	got.Metadata.ID = session.PackageID(got.ContentID, dest)
+	got.Metadata.Revision = metadataRevision(got.Metadata)
+	data, _ := json.Marshal(got.Metadata)
+	_, m, err := s.find(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.ID = got.Metadata.ID
+	m.Destination = dest
+	m.MetadataRevision = got.Metadata.Revision
+	m.MetadataHash = checksum(data)
+	j := moveJournal{OldID: "s_" + strings.Repeat("0", 64), OldDestination: p.Metadata.Destination, NewID: got.Metadata.ID, NewDestination: dest, Metadata: data, Manifest: m}
+	if err := s.writeJournal(".move-journal.json", j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFilesystem(root).GetSession(context.Background(), p.ID); err == nil {
+		t.Fatal("accepted corrupt move routing")
+	}
+}
+
+func TestFilesystemAncestorSymlinkCannotRedirectReadPutOrDelete(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	s := NewFilesystem(root)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	users := filepath.Join(root, "users")
+	realUsers := filepath.Join(root, "users-real")
+	if err := os.Rename(users, realUsers); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, users); err != nil {
+		t.Fatal(err)
+	}
+	outsidePackage := filepath.Join(outside, "ada", p.ID)
+	if err := os.MkdirAll(outsidePackage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(outsidePackage, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err == nil {
+		t.Fatal("read followed ancestor symlink")
+	}
+	if _, err := s.PutSession(context.Background(), p); err == nil {
+		t.Fatal("put followed ancestor symlink")
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err == nil {
+		t.Fatal("delete followed ancestor symlink")
+	}
+	if b, err := os.ReadFile(sentinel); err != nil || string(b) != "keep" {
+		t.Fatalf("outside package changed: %q, %v", b, err)
 	}
 }
