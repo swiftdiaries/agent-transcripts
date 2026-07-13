@@ -414,6 +414,19 @@ func TestStaticAssetsHaveFixedContentTypeAndSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestEvidenceLedgerStylesExposeResponsiveAndAccessibleHooks(t *testing.T) {
+	rr := httptest.NewRecorder()
+	newTestServer(t, fixturePackage(t)).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/static/app.css", nil))
+	for _, token := range []string{
+		"--ink: #16324f", ".masthead", ".receipt-strip", ":focus-visible",
+		"prefers-reduced-motion", "@media (max-width: 700px)",
+	} {
+		if !strings.Contains(strings.ToLower(rr.Body.String()), token) {
+			t.Fatalf("stylesheet missing %q", token)
+		}
+	}
+}
+
 func TestCorePagesWorkWithoutJavaScript(t *testing.T) {
 	h := newTestServer(t, fixturePackage(t))
 	for _, path := range []string{"/", "/live", "/library", "/users/ada", "/projects/demo", "/upload"} {
