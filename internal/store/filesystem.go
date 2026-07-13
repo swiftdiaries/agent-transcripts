@@ -200,15 +200,15 @@ func (s *Filesystem) PutSession(ctx context.Context, p session.Package) (bool, e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureDirectory(p.Metadata.Destination); err != nil {
-		return false, err
+		return false, fmt.Errorf("ensure destination: %w", err)
 	}
 	unlock, err := s.lockMutations(ctx)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("lock store: %w", err)
 	}
 	defer unlock()
 	if err := s.recoverLocked(); err != nil {
-		return false, err
+		return false, fmt.Errorf("recover store: %w", err)
 	}
 	if m, err := s.readManifestAt(p.Metadata.Destination, p.ID); err == nil {
 		return s.identical("", m, p)
@@ -493,11 +493,24 @@ func (s *Filesystem) lockMutations(ctx context.Context) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	fd, err := unix.Openat(rootFD, ".store.lock", unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW, 0o600)
-	unix.Close(rootFD)
-	if err != nil {
-		return nil, err
+	var fd int
+	for {
+		fd, err = unix.Openat(rootFD, ".store.lock", unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.ENOENT) {
+			unix.Close(rootFD)
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			unix.Close(rootFD)
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
+	unix.Close(rootFD)
 	for {
 		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
@@ -1040,7 +1053,10 @@ func (s *Filesystem) ensureDirectory(d session.Directory) error {
 	for _, part := range []string{d.Kind, d.Slug} {
 		next, e := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 		if errors.Is(e, unix.ENOENT) {
-			if e = unix.Mkdirat(fd, part, 0o700); e == nil {
+			e = unix.Mkdirat(fd, part, 0o700)
+			if errors.Is(e, unix.EEXIST) {
+				e = nil
+			} else if e == nil {
 				e = unix.Fsync(fd)
 			}
 			if e == nil {

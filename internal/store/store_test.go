@@ -170,6 +170,44 @@ func TestFilesystemCASWorksAcrossInstances(t *testing.T) {
 	}
 }
 
+func TestFilesystemConcurrentFirstPutIntoAbsentDirectory(t *testing.T) {
+	root := t.TempDir()
+	first := NewFilesystem(root)
+	second := NewFilesystem(root)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	start := make(chan struct{})
+	type result struct {
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for _, s := range []*Filesystem{first, second} {
+		go func(s *Filesystem) {
+			<-start
+			created, err := s.PutSession(context.Background(), p)
+			results <- result{created, err}
+		}(s)
+	}
+	close(start)
+	a, b := <-results, <-results
+	if a.err != nil || b.err != nil {
+		t.Fatalf("errors = %v, %v", a.err, b.err)
+	}
+	if a.created == b.created {
+		t.Fatalf("created = %v, %v; want exactly one", a.created, b.created)
+	}
+	listed, err := first.ListSessions(context.Background(), p.Metadata.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != p.ID {
+		t.Fatalf("listed = %+v", listed)
+	}
+	if _, err := second.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFilesystemRejectsPackageIDsNotDerivedFromBytes(t *testing.T) {
 	s := NewFilesystem(t.TempDir())
 	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
