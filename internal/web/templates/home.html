@@ -1,1 +1,12 @@
-{{define "home"}}{{template "layout" .}}{{end}}{{define "content"}}<h1>Agent transcripts</h1><p>Browse completed local sessions or imported library transcripts.</p>{{end}}
+{{define "home"}}{{template "layout" .}}{{end}}
+{{define "content"}}
+<section class="page-intro home-intro">
+  <p class="eyebrow">A durable record of agent work</p>
+  <h1>Keep the work,<br>not just the result.</h1>
+  <p>Browse completed local sessions, preserve them in a shared library, and return to the decisions that made the work.</p>
+</section>
+<section class="route-grid" aria-label="Browse transcripts">
+  <a class="route-card" href="/live"><span class="receipt-strip">01 / LOCAL SESSIONS</span><strong>Review completed work</strong><span>Live sessions ready to import</span></a>
+  <a class="route-card" href="/library"><span class="receipt-strip">02 / SAVED LIBRARY</span><strong>Read the record</strong><span>Imported transcripts by person and project</span></a>
+</section>
+{{end}}

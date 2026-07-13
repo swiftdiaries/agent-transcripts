@@ -1,1 +1,23 @@
-{{define "layout"}}<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{.Title}}</title>{{if .CSRFToken}}<meta name="csrf-token" content="{{.CSRFToken}}">{{end}}<link rel="stylesheet" href="/static/app.css"></head><body><header><a href="/">Agent transcripts</a><nav><a href="/live">Live</a> <a href="/library">Library</a> <a href="/upload">Upload</a></nav></header><main>{{template "content" .}}</main><script src="/static/app.js" defer></script></body></html>{{end}}
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.Title}}</title>
+  {{if .CSRFToken}}<meta name="csrf-token" content="{{.CSRFToken}}">{{end}}
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-section="{{.Section}}">
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="masthead">
+    <a class="wordmark" href="/">Agent transcripts</a>
+    <nav class="primary-nav" aria-label="Primary navigation">
+      <a href="/live" {{if eq .Section "live"}}aria-current="page"{{end}}>Live</a>
+      <a href="/library" {{if eq .Section "library"}}aria-current="page"{{end}}>Library</a>
+      <a class="nav-action" href="/upload" {{if eq .Section "upload"}}aria-current="page"{{end}}>Upload</a>
+    </nav>
+  </header>
+  <main id="main-content" class="page-shell">{{template "content" .}}</main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>{{end}}

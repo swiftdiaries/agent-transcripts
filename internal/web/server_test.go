@@ -434,6 +434,54 @@ func TestTranscriptPageUsesTranscriptSection(t *testing.T) {
 	}
 }
 
+func TestEvidenceLedgerTemplatesKeepInteractiveContracts(t *testing.T) {
+	pkg := fixturePackage(t)
+	h := newTestServer(t, pkg)
+	checks := map[string][]string{
+		"/upload": {
+			`method="post" action="/api/v1/sessions" enctype="multipart/form-data"`,
+			`name="csrf_token"`, `name="source"`, `name="destination"`,
+			`name="title"`, `name="description"`, `name="tag"`,
+			`class="upload-form"`,
+		},
+		"/sessions/" + pkg.ID: {
+			`aria-label="Prompts"`, `class="transcript-layout"`,
+			`class="copy-anchor"`,
+		},
+	}
+	for path, tokens := range checks {
+		t.Run(path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			for _, token := range tokens {
+				if !strings.Contains(rr.Body.String(), token) {
+					t.Fatalf("%s missing from %s", token, path)
+				}
+			}
+		})
+	}
+}
+
+func TestCorePagesRenderEvidenceLedgerLandmarks(t *testing.T) {
+	h := newTestServer(t, fixturePackage(t))
+	for path, want := range map[string]string{
+		"/":        `data-section="home"`,
+		"/library": `data-section="library"`,
+		"/upload":  `data-section="upload"`,
+	} {
+		t.Run(path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			body := rr.Body.String()
+			for _, token := range []string{"<header class=\"masthead\"", "<main id=\"main-content\"", want} {
+				if !strings.Contains(body, token) {
+					t.Fatalf("%s missing from %s", token, path)
+				}
+			}
+		})
+	}
+}
+
 func TestProjectDirectoryRendersStoredSession(t *testing.T) {
 	pkg := fixturePackage(t)
 	pkg.Metadata.Destination = session.Directory{Kind: "projects", Slug: "demo"}
