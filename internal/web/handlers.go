@@ -30,7 +30,7 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	case "/":
-		s.render(w, "home", page{Title: "Agent transcripts"})
+		s.render(w, "home", page{Title: "Agent transcripts", Section: "home"})
 		return
 	case "/live":
 		s.liveList(w, r)
@@ -39,7 +39,7 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		s.library(w, r)
 		return
 	case "/upload":
-		p := page{Title: "Upload"}
+		p := page{Title: "Upload", Section: "upload"}
 		if s.csrf != nil {
 			p.CSRFToken = s.csrf.Token(w, r)
 		}
@@ -407,7 +407,7 @@ func (s *server) liveList(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
-	p := page{Title: "Live sessions", Heading: "Live sessions", Candidates: candidates, IsLive: true}
+	p := page{Title: "Live sessions", Heading: "Live sessions", Section: "live", Candidates: candidates, IsLive: true}
 	if s.csrf != nil {
 		p.CSRFToken = s.csrf.Token(w, r)
 	}
@@ -526,7 +526,7 @@ func (s *server) library(w http.ResponseWriter, r *http.Request) {
 			all = append(all, items...)
 		}
 	}
-	s.render(w, "directory", page{Title: "Library", Heading: "Library", Sessions: all})
+	s.render(w, "directory", page{Title: "Library", Heading: "Library", Section: "library", Sessions: all})
 }
 
 func (s *server) directory(w http.ResponseWriter, r *http.Request, d session.Directory) {
@@ -535,7 +535,7 @@ func (s *server) directory(w http.ResponseWriter, r *http.Request, d session.Dir
 		s.internalError(w, err)
 		return
 	}
-	s.render(w, "directory", page{Title: d.Kind + ": " + d.Slug, Heading: d.Kind + ": " + d.Slug, Sessions: items})
+	s.render(w, "directory", page{Title: d.Kind + ": " + d.Slug, Heading: d.Kind + ": " + d.Slug, Section: "library", Sessions: items})
 }
 
 func (s *server) transcript(w http.ResponseWriter, r *http.Request, id string) {
@@ -558,6 +558,7 @@ func (s *server) transcript(w http.ResponseWriter, r *http.Request, id string) {
 type page struct {
 	Title      string
 	Heading    string
+	Section    string
 	Sessions   []session.Metadata
 	Candidates []discovery.Candidate
 	IsLive     bool
@@ -583,7 +584,7 @@ func transcriptPage(value session.Session, title string) page {
 	if title == "" {
 		title = "Transcript"
 	}
-	p := page{Title: title, Transcript: transcript{Title: title}}
+	p := page{Title: title, Section: "transcript", Transcript: transcript{Title: title}}
 	for _, event := range value.Events {
 		p.Transcript.Events = append(p.Transcript.Events, eventView{ID: event.ID, Kind: event.Kind, Text: event.Text, ToolName: event.ToolName, Input: string(event.Input), Output: string(event.Output), RawType: event.RawType, Raw: string(event.Raw)})
 	}

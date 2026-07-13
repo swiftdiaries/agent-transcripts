@@ -427,6 +427,13 @@ func TestCorePagesWorkWithoutJavaScript(t *testing.T) {
 	}
 }
 
+func TestTranscriptPageUsesTranscriptSection(t *testing.T) {
+	got := transcriptPage(fixturePackage(t).Session, "Example transcript")
+	if got.Section != "transcript" {
+		t.Fatalf("section = %q, want transcript", got.Section)
+	}
+}
+
 func TestProjectDirectoryRendersStoredSession(t *testing.T) {
 	pkg := fixturePackage(t)
 	pkg.Metadata.Destination = session.Directory{Kind: "projects", Slug: "demo"}
