@@ -94,13 +94,37 @@ func parseUploadDestination(value string) (session.Directory, error) {
 }
 
 func runUpload(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer) int {
+	return runUploadWithDeps(ctx, args, input, stdout, stderr, uploadDeps{
+		library:     store.NewFilesystem("agent-transcripts-library"),
+		interactive: isInteractiveInput,
+		getenv:      os.Getenv,
+		readPassword: func(fd int) ([]byte, error) {
+			return term.ReadPassword(fd)
+		},
+		upload: func(ctx context.Context, server string, req publish.Request, token string) (publish.Result, error) {
+			return (publish.Client{BaseURL: server, Token: token}).Upload(ctx, req)
+		},
+	})
+}
+
+// uploadDeps keeps terminal and transport effects injectable for tests while
+// the command itself remains the only code that reads credentials.
+type uploadDeps struct {
+	library      store.Store
+	interactive  func(*os.File) bool
+	getenv       func(string) string
+	readPassword func(int) ([]byte, error)
+	upload       func(context.Context, string, publish.Request, string) (publish.Result, error)
+}
+
+func runUploadWithDeps(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer, deps uploadDeps) int {
 	opts, id, err := parseUploadArgs(args)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 2
 	}
 	if !opts.yes {
-		if !isInteractiveInput(input) {
+		if !deps.interactive(input) {
 			_, _ = fmt.Fprintln(stderr, "non-interactive upload requires --yes")
 			return 2
 		}
@@ -115,14 +139,14 @@ func runUpload(ctx context.Context, args []string, input *os.File, stdout, stder
 			return 1
 		}
 	}
-	token := strings.TrimSpace(os.Getenv("AGENT_TRANSCRIPTS_TOKEN"))
+	token := strings.TrimSpace(deps.getenv("AGENT_TRANSCRIPTS_TOKEN"))
 	if token == "" {
-		if !isInteractiveInput(input) {
+		if !deps.interactive(input) {
 			_, _ = fmt.Fprintln(stderr, "AGENT_TRANSCRIPTS_TOKEN is required for non-interactive upload")
 			return 2
 		}
 		_, _ = fmt.Fprint(stderr, "Bearer token: ")
-		value, err := term.ReadPassword(int(input.Fd()))
+		value, err := deps.readPassword(int(input.Fd()))
 		_, _ = fmt.Fprintln(stderr)
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, "could not read bearer token")
@@ -134,15 +158,15 @@ func runUpload(ctx context.Context, args []string, input *os.File, stdout, stder
 		_, _ = fmt.Fprintln(stderr, "bearer token is required")
 		return 2
 	}
-	pkg, err := store.NewFilesystem("agent-transcripts-library").GetSession(ctx, id)
+	pkg, err := deps.library.GetSession(ctx, id)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, "library package not found")
 		return 1
 	}
-	result, err := (publish.Client{BaseURL: opts.server, Token: token}).Upload(ctx, publish.Request{
+	result, err := deps.upload(ctx, opts.server, publish.Request{
 		SourceName: "transcript.jsonl", Source: bytes.NewReader(pkg.Source), Destination: opts.destination,
 		Title: opts.title, Description: opts.description, Tags: splitTags(opts.tags),
-	})
+	}, token)
 	if err != nil {
 		// Never include the token in diagnostics, even if a transport error does.
 		_, _ = fmt.Fprintln(stderr, "upload failed")

@@ -186,6 +186,142 @@ func TestHostedUploadRequiresTerminalEvidence(t *testing.T) {
 	}
 }
 
+func TestHostedUploadRejectsServerOwnedMultipartParts(t *testing.T) {
+	for _, field := range []string{"normalized", "normalized.json", "uploader", "uploader_key", "uploader-key"} {
+		t.Run(field, func(t *testing.T) {
+			h, _, token := hostedUploadServer(t)
+			rr := uploadFixture(t, h, token, "claude-session.jsonl", map[string]string{"destination": "projects/platform", field: "forged"}, nil)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%q", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestHostedUploadRejectsServerOwnedFilePart(t *testing.T) {
+	h, _, token := hostedUploadServer(t)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for _, name := range []string{"source", "normalized.json"} {
+		part, err := mw.CreateFormFile(name, name+".json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write(mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mw.WriteField("destination", "projects/platform"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHostedUploadRejectsOversizedRequestBeforeMultipartRead(t *testing.T) {
+	h, _, token := hostedUploadServer(t)
+	body := &countingBody{Reader: strings.NewReader("ignored")}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", body)
+	req.ContentLength = int64(session.MaxSourceBytes + (1 << 20) + 1)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge || body.reads != 0 {
+		t.Fatalf("status=%d reads=%d", rr.Code, body.reads)
+	}
+}
+
+func TestHostedUploadCleansMultipartAndParseTemporaryFiles(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	h, _, token := hostedUploadServer(t)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("source", "raw.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(bytes.Repeat([]byte("x"), 128<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.WriteField("destination", "projects/platform"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	entries, err := os.ReadDir(os.Getenv("TMPDIR"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary files retained: %v", entries)
+	}
+}
+
+func TestHostedUploadBrowserRequiresCSRFButBearerDoesNot(t *testing.T) {
+	h, _, token := hostedUploadServer(t)
+	noCSRF := uploadFixture(t, h, "", "claude-session.jsonl", map[string]string{"destination": "projects/platform"}, nil)
+	if noCSRF.Code != http.StatusForbidden {
+		t.Fatalf("browser status = %d", noCSRF.Code)
+	}
+	bearer := uploadFixture(t, h, token, "claude-session.jsonl", map[string]string{"destination": "projects/platform"}, nil)
+	if bearer.Code != http.StatusCreated {
+		t.Fatalf("bearer status = %d", bearer.Code)
+	}
+}
+
+func TestHostedDirectoriesAndProjectsAreAuthenticatedAndIdempotent(t *testing.T) {
+	h, _, token := hostedUploadServer(t)
+	unauth := httptest.NewRecorder()
+	h.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/api/v1/directories", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauth=%d", unauth.Code)
+	}
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"slug":"platform"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusCreated || rr.Header().Get("Location") != "/projects/platform" {
+			t.Fatalf("project=%d %q", rr.Code, rr.Header().Get("Location"))
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/directories?kind=projects", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"platform"`) {
+		t.Fatalf("directories=%d %q", rr.Code, rr.Body.String())
+	}
+}
+
+type countingBody struct {
+	*strings.Reader
+	reads int
+}
+
+func (b *countingBody) Read(p []byte) (int, error) { b.reads++; return b.Reader.Read(p) }
+func (b *countingBody) Close() error               { return nil }
+
 func hostedUploadServer(t *testing.T) (http.Handler, store.Store, string) {
 	t.Helper()
 	st := store.NewFilesystem(t.TempDir())
@@ -201,7 +337,8 @@ func hostedUploadServer(t *testing.T) (http.Handler, store.Store, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(ServerConfig{Store: st, Mode: "hosted", Provider: auth.NewLocal(), CSRF: csrf, Tokens: tokens}), st, token
+	_, cidr, _ := net.ParseCIDR("192.0.2.0/24")
+	return New(ServerConfig{Store: st, Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr}), CSRF: csrf, Tokens: tokens}), st, token
 }
 
 func uploadFixture(t *testing.T, h http.Handler, token, name string, fields map[string]string, tags []string) *httptest.ResponseRecorder {
@@ -233,7 +370,12 @@ func uploadFixture(t *testing.T, h http.Handler, token, name string, fields map[
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", &body)
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token == "" {
+		req.RemoteAddr = "192.0.2.10:1234"
+		req.Header.Set("X-User", "ada@example.com")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)

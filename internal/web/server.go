@@ -93,6 +93,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// This has to happen before CSRF form-token extraction, which may trigger
 		// multipart parsing for a browser upload.
 		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions" {
+			if r.ContentLength > int64(session.MaxSourceBytes+(1<<20)) {
+				http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			r.Body = http.MaxBytesReader(w, r.Body, session.MaxSourceBytes+(1<<20))
 		}
 		if s.tokens != nil {

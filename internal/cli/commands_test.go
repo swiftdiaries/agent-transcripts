@@ -14,6 +14,10 @@ import (
 
 	"github.com/swiftdiaries/agent-transcripts/internal/config"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
+	"github.com/swiftdiaries/agent-transcripts/internal/library"
+	"github.com/swiftdiaries/agent-transcripts/internal/publish"
+	"github.com/swiftdiaries/agent-transcripts/internal/session"
+	"github.com/swiftdiaries/agent-transcripts/internal/store"
 )
 
 func TestRunRejectsUnknownCommand(t *testing.T) {
@@ -128,6 +132,85 @@ func TestRunRecognizesCommands(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUploadUsesExistingLibraryPackageWithTerminalConfirmation(t *testing.T) {
+	st, id := uploadTestLibrary(t)
+	input := writeInput(t, "yes\n")
+	var stdout, stderr bytes.Buffer
+	called := false
+	code := runUploadWithDeps(context.Background(), []string{"--server", "https://publish.example", "--destination", "projects/platform", id}, input, &stdout, &stderr, uploadDeps{
+		library: st, interactive: func(*os.File) bool { return true }, getenv: func(string) string { return "secret-token" }, readPassword: func(int) ([]byte, error) { t.Fatal("unexpected token prompt"); return nil, nil },
+		upload: func(_ context.Context, _ string, request publish.Request, token string) (publish.Result, error) {
+			called = true
+			if token != "secret-token" || request.Destination != "projects/platform" {
+				t.Fatalf("token/destination mismatch")
+			}
+			return publish.Result{Location: "/sessions/s_published"}, nil
+		},
+	})
+	if code != 0 || !called || !strings.Contains(stdout.String(), "/sessions/s_published") {
+		t.Fatalf("code=%d called=%v stdout=%q stderr=%q", code, called, stdout.String(), stderr.String())
+	}
+}
+
+func TestUploadYesNonInteractiveNeedsTokenAndNeverDisclosesIt(t *testing.T) {
+	st, id := uploadTestLibrary(t)
+	input := writeInput(t, "")
+	secret := "do-not-print-this-token"
+	var stderr bytes.Buffer
+	code := runUploadWithDeps(context.Background(), []string{"--yes", "--server", "https://publish.example", "--destination", "projects/platform", id}, input, &bytes.Buffer{}, &stderr, uploadDeps{
+		library: st, interactive: func(*os.File) bool { return false }, getenv: func(string) string { return "" }, readPassword: func(int) ([]byte, error) { return []byte(secret), nil }, upload: func(context.Context, string, publish.Request, string) (publish.Result, error) {
+			t.Fatal("upload called")
+			return publish.Result{}, nil
+		},
+	})
+	if code != 2 || strings.Contains(stderr.String(), secret) {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestUploadRejectsMissingLibraryPackageBeforeTransport(t *testing.T) {
+	input := writeInput(t, "")
+	called := false
+	code := runUploadWithDeps(context.Background(), []string{"--yes", "--server", "https://publish.example", "--destination", "projects/platform", "s_missing"}, input, &bytes.Buffer{}, &bytes.Buffer{}, uploadDeps{
+		library: store.NewFilesystem(t.TempDir()), interactive: func(*os.File) bool { return false }, getenv: func(string) string { return "token" }, readPassword: func(int) ([]byte, error) { return nil, nil }, upload: func(context.Context, string, publish.Request, string) (publish.Result, error) {
+			called = true
+			return publish.Result{}, nil
+		},
+	})
+	if code != 1 || called {
+		t.Fatalf("code=%d called=%v", code, called)
+	}
+}
+
+func writeInput(t *testing.T, value string) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(value); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+func uploadTestLibrary(t *testing.T) (store.Store, string) {
+	t.Helper()
+	st := store.NewFilesystem(t.TempDir())
+	source, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	md, err := library.New(st).Import(context.Background(), bytes.NewReader(source), session.SourceFacts{}, library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, md.ID
 }
 
 func TestParseServeArgs(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"regexp"
 	"strings"
@@ -159,13 +160,27 @@ func parseDestination(value string) (session.Directory, error) {
 func (s *server) uploadSession(w http.ResponseWriter, r *http.Request, who auth.Identity) {
 	// Install the byte limit before multipart parsing. ParseMultipartForm may
 	// otherwise retain a large part in memory or a request temporary file.
+	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || media != "multipart/form-data" {
+		http.Error(w, "multipart source upload is required", http.StatusBadRequest)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, session.MaxSourceBytes+(1<<20))
 	if err := r.ParseMultipartForm(64 << 10); err != nil {
-		http.Error(w, "invalid or oversized upload", http.StatusRequestEntityTooLarge)
+		var maxBytes *http.MaxBytesError
+		if errors.As(err, &maxBytes) {
+			http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "invalid upload", http.StatusBadRequest)
+		}
 		return
 	}
 	if r.MultipartForm != nil {
 		defer r.MultipartForm.RemoveAll()
+	}
+	if !validUploadForm(r.MultipartForm) {
+		http.Error(w, "forbidden upload field", http.StatusBadRequest)
+		return
 	}
 	destination, err := parseDestination(r.FormValue("destination"))
 	if err != nil {
@@ -207,6 +222,25 @@ func (s *server) uploadSession(w http.ResponseWriter, r *http.Request, who auth.
 		w.WriteHeader(http.StatusOK)
 	}
 	_ = json.NewEncoder(w).Encode(md)
+}
+
+func validUploadForm(form *multipart.Form) bool {
+	if form == nil || len(form.File["source"]) != 1 {
+		return false
+	}
+	for name := range form.File {
+		if name != "source" {
+			return false
+		}
+	}
+	for name := range form.Value {
+		switch name {
+		case "destination", "title", "description", "tag", "csrf_token":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func jsonRequest(r *http.Request) bool {
