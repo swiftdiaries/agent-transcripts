@@ -38,7 +38,11 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		s.library(w, r)
 		return
 	case "/upload":
-		s.render(w, "upload", page{Title: "Upload"})
+		p := page{Title: "Upload"}
+		if s.csrf != nil {
+			p.CSRFToken = s.csrf.Token(w, r)
+		}
+		s.render(w, "upload", p)
 		return
 	case "/static/app.css":
 		s.static(w, "static/app.css", "text/css; charset=utf-8")
@@ -61,11 +65,6 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) api(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/"), "/")
-	if len(parts) == 0 || !managedID.MatchString(parts[0]) {
-		http.NotFound(w, r)
-		return
-	}
 	id, ok := auth.FromContext(r.Context())
 	if !ok {
 		http.Error(w, "authentication required", http.StatusUnauthorized)
@@ -73,8 +72,25 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	}
 	// A browser request is authenticated by its provider; bearer requests have
 	// been replaced above and do not use ambient cookies/proxy headers.
-	if r.Header.Get("Authorization") == "" && s.csrf != nil && !s.csrf.Check(r) {
+	if r.Method != http.MethodGet && r.Header.Get("Authorization") == "" && s.csrf != nil && !s.csrf.Check(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/api/v1/directories" {
+		s.listDirectories(w, r)
+		return
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/api/v1/projects" {
+		s.createProject(w, r)
+		return
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions" {
+		s.uploadSession(w, r, id)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/"), "/")
+	if len(parts) == 0 || !managedID.MatchString(parts[0]) {
+		http.NotFound(w, r)
 		return
 	}
 	switch {
@@ -87,6 +103,110 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *server) listDirectories(w http.ResponseWriter, r *http.Request) {
+	kind := r.URL.Query().Get("kind")
+	if kind != "" && kind != "users" && kind != "projects" {
+		http.Error(w, "invalid directory kind", http.StatusBadRequest)
+		return
+	}
+	var result []session.Directory
+	kinds := []string{"users", "projects"}
+	if kind != "" {
+		kinds = []string{kind}
+	}
+	for _, value := range kinds {
+		directories, err := s.store.ListDirectories(r.Context(), value)
+		if err != nil {
+			s.internalError(w, err)
+			return
+		}
+		result = append(result, directories...)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (s *server) createProject(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var input struct {
+		Slug string `json:"slug"`
+	}
+	if !jsonRequest(r) || json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input) != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.CreateProject(r.Context(), input.Slug); err != nil {
+		http.Error(w, "invalid project slug", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Location", "/projects/"+input.Slug)
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(session.Directory{Kind: "projects", Slug: input.Slug})
+}
+
+func parseDestination(value string) (session.Directory, error) {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 {
+		return session.Directory{}, errors.New("invalid destination")
+	}
+	d := session.Directory{Kind: parts[0], Slug: parts[1]}
+	return d, session.ValidateDirectory(d)
+}
+
+func (s *server) uploadSession(w http.ResponseWriter, r *http.Request, who auth.Identity) {
+	// Install the byte limit before multipart parsing. ParseMultipartForm may
+	// otherwise retain a large part in memory or a request temporary file.
+	r.Body = http.MaxBytesReader(w, r.Body, session.MaxSourceBytes+(1<<20))
+	if err := r.ParseMultipartForm(64 << 10); err != nil {
+		http.Error(w, "invalid or oversized upload", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	destination, err := parseDestination(r.FormValue("destination"))
+	if err != nil {
+		http.Error(w, "invalid destination", http.StatusBadRequest)
+		return
+	}
+	if destination.Kind == "projects" {
+		if err := s.store.CreateProject(r.Context(), destination.Slug); err != nil {
+			http.Error(w, "invalid destination", http.StatusBadRequest)
+			return
+		}
+	}
+	file, _, err := r.FormFile("source")
+	if err != nil {
+		http.Error(w, "source is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	// A hosted service deliberately does not trust client source facts: terminal
+	// evidence must be parser-derived, never inferred from a quiet local file.
+	svc := library.New(s.store)
+	md, created, err := svc.ImportWithStatus(r.Context(), file, session.SourceFacts{}, library.ImportAttrs{
+		Destination: destination, UploaderKey: who.Key, Title: r.FormValue("title"), Description: r.FormValue("description"), Tags: r.MultipartForm.Value["tag"],
+	})
+	if errors.Is(err, library.ErrIncomplete) {
+		http.Error(w, "terminal evidence is required", http.StatusUnprocessableEntity)
+		return
+	}
+	if err != nil {
+		http.Error(w, "invalid upload", http.StatusBadRequest)
+		return
+	}
+	location := "/sessions/" + md.ID
+	w.Header().Set("Location", location)
+	w.Header().Set("Content-Type", "application/json")
+	if created {
+		w.WriteHeader(http.StatusCreated)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	_ = json.NewEncoder(w).Encode(md)
 }
 
 func jsonRequest(r *http.Request) bool {

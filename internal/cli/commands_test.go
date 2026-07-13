@@ -121,7 +121,7 @@ func TestTerminalInputIsInteractiveWhenPTYAvailable(t *testing.T) {
 }
 
 func TestRunRecognizesCommands(t *testing.T) {
-	for _, command := range []string{"upload", "version", "help"} {
+	for _, command := range []string{"version", "help"} {
 		t.Run(command, func(t *testing.T) {
 			if got := Run(context.Background(), []string{command}, &bytes.Buffer{}, &bytes.Buffer{}); got != 0 {
 				t.Fatalf("exit code = %d", got)

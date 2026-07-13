@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -21,6 +22,7 @@ import (
 	"github.com/swiftdiaries/agent-transcripts/internal/config"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
+	"github.com/swiftdiaries/agent-transcripts/internal/publish"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
 	"github.com/swiftdiaries/agent-transcripts/internal/web"
@@ -44,11 +46,117 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "serve":
 		return runServe(ctx, args[1:], stdout, stderr)
 	case "upload":
-		return 0
+		return runUpload(ctx, args[1:], os.Stdin, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return 2
 	}
+}
+
+type uploadOptions struct {
+	server, destination, title, description string
+	tags                                    string
+	yes                                     bool
+}
+
+func parseUploadArgs(args []string) (uploadOptions, string, error) {
+	var got uploadOptions
+	flags := flag.NewFlagSet("upload", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&got.server, "server", "", "hosted server URL")
+	flags.StringVar(&got.destination, "destination", "", "users or projects destination")
+	flags.StringVar(&got.title, "title", "", "optional title")
+	flags.StringVar(&got.description, "description", "", "optional description")
+	flags.StringVar(&got.tags, "tags", "", "comma-separated tags")
+	flags.BoolVar(&got.yes, "yes", false, "confirm publishing without a prompt")
+	if err := flags.Parse(args); err != nil {
+		return got, "", err
+	}
+	if got.server == "" || got.destination == "" || flags.NArg() != 1 {
+		return got, "", errors.New("upload requires --server, --destination, and a library package ID")
+	}
+	if _, err := parseUploadDestination(got.destination); err != nil {
+		return got, "", err
+	}
+	return got, flags.Arg(0), nil
+}
+
+func parseUploadDestination(value string) (session.Directory, error) {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 {
+		return session.Directory{}, errors.New("destination must be users/<slug> or projects/<slug>")
+	}
+	d := session.Directory{Kind: parts[0], Slug: parts[1]}
+	if err := session.ValidateDirectory(d); err != nil {
+		return session.Directory{}, errors.New("destination must be users/<slug> or projects/<slug>")
+	}
+	return d, nil
+}
+
+func runUpload(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer) int {
+	opts, id, err := parseUploadArgs(args)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if !opts.yes {
+		if !isInteractiveInput(input) {
+			_, _ = fmt.Fprintln(stderr, "non-interactive upload requires --yes")
+			return 2
+		}
+		_, _ = fmt.Fprintf(stdout, "Publish %s to %s? [y/N] ", id, opts.destination)
+		answer, err := bufio.NewReader(input).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if strings.ToLower(strings.TrimSpace(answer)) != "y" && strings.ToLower(strings.TrimSpace(answer)) != "yes" {
+			_, _ = fmt.Fprintln(stderr, "upload cancelled")
+			return 1
+		}
+	}
+	token := strings.TrimSpace(os.Getenv("AGENT_TRANSCRIPTS_TOKEN"))
+	if token == "" {
+		if !isInteractiveInput(input) {
+			_, _ = fmt.Fprintln(stderr, "AGENT_TRANSCRIPTS_TOKEN is required for non-interactive upload")
+			return 2
+		}
+		_, _ = fmt.Fprint(stderr, "Bearer token: ")
+		value, err := term.ReadPassword(int(input.Fd()))
+		_, _ = fmt.Fprintln(stderr)
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, "could not read bearer token")
+			return 1
+		}
+		token = strings.TrimSpace(string(value))
+	}
+	if token == "" {
+		_, _ = fmt.Fprintln(stderr, "bearer token is required")
+		return 2
+	}
+	pkg, err := store.NewFilesystem("agent-transcripts-library").GetSession(ctx, id)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "library package not found")
+		return 1
+	}
+	result, err := (publish.Client{BaseURL: opts.server, Token: token}).Upload(ctx, publish.Request{
+		SourceName: "transcript.jsonl", Source: bytes.NewReader(pkg.Source), Destination: opts.destination,
+		Title: opts.title, Description: opts.description, Tags: splitTags(opts.tags),
+	})
+	if err != nil {
+		// Never include the token in diagnostics, even if a transport error does.
+		_, _ = fmt.Fprintln(stderr, "upload failed")
+		return 1
+	}
+	_, _ = fmt.Fprintln(stdout, result.Location)
+	return 0
+}
+
+func splitTags(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, ",")
 }
 
 type serveOptions struct {

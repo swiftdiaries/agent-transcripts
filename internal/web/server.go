@@ -13,6 +13,7 @@ import (
 	"github.com/swiftdiaries/agent-transcripts/internal/auth"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
+	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
 )
 
@@ -89,6 +90,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")
 	if strings.HasPrefix(r.URL.Path, "/api/") {
+		// This has to happen before CSRF form-token extraction, which may trigger
+		// multipart parsing for a browser upload.
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions" {
+			r.Body = http.MaxBytesReader(w, r.Body, session.MaxSourceBytes+(1<<20))
+		}
 		if s.tokens != nil {
 			if id, ok, presented := s.tokens.APIIdentity(r); presented {
 				if !ok {

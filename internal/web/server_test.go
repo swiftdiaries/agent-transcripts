@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -145,6 +146,98 @@ func TestBrowserMintsBearerThenBearerExcludesProxyIdentity(t *testing.T) {
 	if dr.Code != http.StatusNoContent {
 		t.Fatalf("delete=%d", dr.Code)
 	}
+}
+
+func TestHostedUploadReparsesAttributesAndIsIdempotent(t *testing.T) {
+	h, st, token := hostedUploadServer(t)
+	first := uploadFixture(t, h, token, "claude-session.jsonl", map[string]string{"destination": "projects/platform", "title": "Parser design", "tag": "go"}, []string{"rust", "go"})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first status = %d: %s", first.Code, first.Body.String())
+	}
+	var md session.Metadata
+	if err := json.Unmarshal(first.Body.Bytes(), &md); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetSession(context.Background(), md.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Metadata.UploaderKey != "ada@example.com" {
+		t.Fatalf("uploader = %q", stored.Metadata.UploaderKey)
+	}
+	if strings.Join(stored.Metadata.Tags, ",") != "go,rust" {
+		t.Fatalf("tags = %v", stored.Metadata.Tags)
+	}
+	second := uploadFixture(t, h, token, "claude-session.jsonl", map[string]string{"destination": "projects/platform", "title": "Parser design", "tag": "go"}, []string{"rust", "go"})
+	if second.Code != http.StatusOK || second.Header().Get("Location") != first.Header().Get("Location") {
+		t.Fatalf("repeat=%d %q first=%q", second.Code, second.Header().Get("Location"), first.Header().Get("Location"))
+	}
+	other := uploadFixture(t, h, token, "claude-session.jsonl", map[string]string{"destination": "users/ada"}, nil)
+	if other.Code != http.StatusCreated || other.Header().Get("Location") == first.Header().Get("Location") {
+		t.Fatalf("other=%d %q", other.Code, other.Header().Get("Location"))
+	}
+}
+
+func TestHostedUploadRequiresTerminalEvidence(t *testing.T) {
+	h, _, token := hostedUploadServer(t)
+	rr := uploadFixture(t, h, token, "incomplete-claude.jsonl", map[string]string{"destination": "projects/platform"}, nil)
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d", rr.Code)
+	}
+}
+
+func hostedUploadServer(t *testing.T) (http.Handler, store.Store, string) {
+	t.Helper()
+	st := store.NewFilesystem(t.TempDir())
+	csrf, err := auth.NewCSRF(bytes.Repeat([]byte("k"), 32), "https://transcripts.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := auth.NewTokenManager(bytes.Repeat([]byte("t"), 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := tokens.Mint(auth.Identity{Key: "ada@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(ServerConfig{Store: st, Mode: "hosted", Provider: auth.NewLocal(), CSRF: csrf, Tokens: tokens}), st, token
+}
+
+func uploadFixture(t *testing.T, h http.Handler, token, name string, fields map[string]string, tags []string) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("source", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := []byte(`{"type":"user","sessionId":"incomplete","timestamp":"2026-07-12T08:00:00Z","message":{"role":"user","content":"hello"}}`)
+	if name != "incomplete-claude.jsonl" {
+		source = mustRead(t, filepath.Join("..", "parser", "testdata", name))
+	}
+	if _, err := part.Write(source); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range fields {
+		if err := mw.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, value := range tags {
+		if err := mw.WriteField("tag", value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
 }
 
 func TestHealthz(t *testing.T) {
