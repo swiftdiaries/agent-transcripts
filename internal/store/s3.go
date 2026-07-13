@@ -301,14 +301,18 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 	return s.identical(ctx, winner, p)
 }
 
-const reclaimReconcileAttempts = 8
+const (
+	reclaimRetryInitialDelay = 5 * time.Millisecond
+	reclaimRetryMaxDelay     = 250 * time.Millisecond
+)
 
-// reconcileReclaim gives the winning reclaimer a bounded opportunity to
-// publish its manifest. A matching claim can only be treated as a temporary
-// lock: returning ErrConflict immediately would make two identical reclaimers
-// fail depending on whether the loser observed the lock before its manifest.
+// reconcileReclaim waits for a matching claimant to publish its manifest. A
+// matching claim is only a temporary lock: it is not a conflict until a
+// mismatched claim or winner proves otherwise. Waiting is deadline-aware and
+// uses capped backoff so remote S3 latency does not turn into a busy loop.
 func (s *S3) reconcileReclaim(ctx context.Context, p session.Package, reclaimKey string) (settled bool, err error) {
-	for range reclaimReconcileAttempts {
+	delay := reclaimRetryInitialDelay
+	for {
 		if err := ctx.Err(); err != nil {
 			return true, err
 		}
@@ -334,15 +338,20 @@ func (s *S3) reconcileReclaim(ctx context.Context, p session.Package, reclaimKey
 		if checksum(claim.Body) != checksum(files["metadata.json"]) {
 			return true, ErrConflict
 		}
-		if err := waitForReclaim(ctx); err != nil {
+		if err := waitForReclaim(ctx, delay); err != nil {
 			return true, err
 		}
+		if delay < reclaimRetryMaxDelay {
+			delay *= 2
+			if delay > reclaimRetryMaxDelay {
+				delay = reclaimRetryMaxDelay
+			}
+		}
 	}
-	return true, ErrConflict
 }
 
-func waitForReclaim(ctx context.Context) error {
-	timer := time.NewTimer(time.Millisecond)
+func waitForReclaim(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

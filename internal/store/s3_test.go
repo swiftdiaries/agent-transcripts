@@ -471,6 +471,120 @@ func TestS3ConcurrentIdenticalReclaimersConverge(t *testing.T) {
 	}
 }
 
+func TestS3IdenticalReclaimerWaitsForRemoteWinner(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", currentRevision(t, s, p.ID)); err != nil {
+		t.Fatal(err)
+	}
+	reput := p
+	reput.Metadata.Title = "reclaimed"
+	metadataKey := "prod/users/ada/" + p.ID + "/metadata.json"
+	reclaimKey := "prod/users/ada/" + p.ID + "/.reclaim"
+	metadataReplaced := make(chan struct{})
+	reclaimObserved := make(chan struct{})
+	releaseWinner := make(chan struct{})
+	fake.setAfterPut(metadataKey, func() {
+		close(metadataReplaced)
+		<-releaseWinner
+	})
+	fake.setAfterHead(reclaimKey, func() { close(reclaimObserved) })
+	winner := make(chan struct {
+		created bool
+		err     error
+	}, 1)
+	loser := make(chan struct {
+		created bool
+		err     error
+	}, 1)
+	go func() {
+		created, err := s.PutSession(context.Background(), reput)
+		winner <- struct {
+			created bool
+			err     error
+		}{created, err}
+	}()
+	waitForSignal(t, metadataReplaced, "winner metadata replacement")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		created, err := s.PutSession(ctx, reput)
+		loser <- struct {
+			created bool
+			err     error
+		}{created, err}
+	}()
+	waitForSignal(t, reclaimObserved, "loser reclaim observation")
+	select {
+	case result := <-loser:
+		t.Fatalf("loser returned before remote winner: %+v", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseWinner)
+	for _, result := range []struct {
+		created bool
+		err     error
+	}{<-winner, <-loser} {
+		if result.err != nil {
+			t.Fatalf("reclaimer result = %+v", result)
+		}
+	}
+}
+
+func TestS3IdenticalReclaimerHonorsContextCancellation(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", currentRevision(t, s, p.ID)); err != nil {
+		t.Fatal(err)
+	}
+	reput := p
+	reput.Metadata.Title = "reclaimed"
+	metadataKey := "prod/users/ada/" + p.ID + "/metadata.json"
+	reclaimKey := "prod/users/ada/" + p.ID + "/.reclaim"
+	metadataReplaced := make(chan struct{})
+	reclaimObserved := make(chan struct{})
+	releaseWinner := make(chan struct{})
+	fake.setAfterPut(metadataKey, func() {
+		close(metadataReplaced)
+		<-releaseWinner
+	})
+	fake.setAfterHead(reclaimKey, func() { close(reclaimObserved) })
+	winner := make(chan error, 1)
+	go func() {
+		_, err := s.PutSession(context.Background(), reput)
+		winner <- err
+	}()
+	waitForSignal(t, metadataReplaced, "winner metadata replacement")
+	ctx, cancel := context.WithCancel(context.Background())
+	loser := make(chan error, 1)
+	go func() {
+		_, err := s.PutSession(ctx, reput)
+		loser <- err
+	}()
+	waitForSignal(t, reclaimObserved, "loser reclaim observation")
+	cancel()
+	select {
+	case err := <-loser:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled reclaimer error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled reclaimer did not return promptly")
+	}
+	close(releaseWinner)
+	if err := <-winner; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func waitForSignal(t *testing.T, signal <-chan struct{}, name string) {
 	t.Helper()
 	select {
