@@ -3,6 +3,41 @@
 Browse and publish completed Claude Code and Codex sessions through one small Go
 binary. It retains the original JSONL plus a normalized, server-rendered view.
 
+## Usage
+
+The usual workflow is **browse → import → publish**.
+
+1. Browse completed local sessions and the library:
+
+   ```sh
+   agent-transcripts serve --open
+   ```
+
+2. Import a completed session interactively, select the newest, or provide its
+   JSONL path:
+
+   ```sh
+   agent-transcripts import
+   agent-transcripts import --latest
+   agent-transcripts import /path/to/completed-session.jsonl
+   ```
+
+   Active or incomplete sessions are rejected.
+
+3. Publish an imported package to a hosted user or project directory:
+
+   ```sh
+   agent-transcripts upload \
+     --server https://transcripts.example.com \
+     --destination projects/platform \
+     <library-package-id>
+   ```
+
+   `upload` asks for confirmation unless `--yes` is supplied and reads its
+   short-lived bearer from `AGENT_TRANSCRIPTS_TOKEN` or an interactive prompt.
+   See [Publish to a hosted library](#publish-to-a-hosted-library) for metadata,
+   token, and idempotency details.
+
 ## Install and browse locally
 
 Install a Go toolchain compatible with this repository, then build the binary:
