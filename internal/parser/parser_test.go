@@ -189,8 +189,51 @@ func TestClaudeDetectsPastLeadingMetadataAndKeepsTextBesideThinking(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Events) != 2 || got.Events[1].Kind != session.EventAssistant || got.Events[1].Text != "I found it." {
+	if len(got.Events) != 3 || got.Events[0].Kind != session.EventRaw || got.Events[1].Kind != session.EventRaw || got.Events[2].Kind != session.EventAssistant || got.Events[2].Text != "I found it." {
 		t.Fatalf("events = %+v", got.Events)
+	}
+}
+
+func TestClaudePreservesLeadingMetadataAsRawProviderRecord(t *testing.T) {
+	leading := `{"type":"queue-operation","sessionId":"claude-raw-record","operation":"compact","extra":{"sequence":1}}`
+	input := strings.Join([]string{
+		leading,
+		`{"type":"assistant","sessionId":"claude-raw-record","message":{"role":"assistant","content":"ok"}}`,
+	}, "\n")
+
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 2 {
+		t.Fatalf("events = %+v", got.Events)
+	}
+	raw := got.Events[0]
+	if raw.Kind != session.EventRaw || raw.RawType != "queue-operation" {
+		t.Fatalf("leading event = %+v", raw)
+	}
+	if string(raw.Raw) != leading {
+		t.Fatalf("leading raw = %s, want original source %s", raw.Raw, leading)
+	}
+}
+
+func TestClaudePreservesOriginalThinkingBlockAsRawProviderSource(t *testing.T) {
+	thinking := `{"type":"thinking","thinking":"private","signature":"provider-signature","metadata":{"index":1}}`
+	input := `{"type":"assistant","sessionId":"claude-raw-thinking","message":{"role":"assistant","content":[` + thinking + `,{"type":"text","text":"visible"}]}}`
+
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 2 {
+		t.Fatalf("events = %+v", got.Events)
+	}
+	raw := got.Events[0]
+	if raw.Kind != session.EventRaw || raw.RawType != "thinking" {
+		t.Fatalf("thinking event = %+v", raw)
+	}
+	if string(raw.Raw) != thinking {
+		t.Fatalf("thinking raw = %s, want original source %s", raw.Raw, thinking)
 	}
 }
 

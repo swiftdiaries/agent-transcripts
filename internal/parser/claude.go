@@ -72,9 +72,6 @@ func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session
 			got.Events = append(got.Events, events...)
 			continue
 		}
-		if len(got.Events) == 0 && e.Type != "user" && e.Type != "assistant" && e.Type != "system" {
-			continue
-		}
 		got.Events = append(got.Events, rawEvent(eventID(e.UUID, lineNumber), e.ParentUUID, e.Type, when, line))
 	}
 	if got.ID == "" {
@@ -99,23 +96,23 @@ func mapClaudeMessage(e envelope, line int, when time.Time) ([]session.Event, bo
 		}
 		return []session.Event{{ID: eventID(e.UUID, line), ParentID: e.ParentUUID, Kind: kind, Time: when, Text: text}}, true, nil
 	}
-	var blocks []claudeBlock
-	if err := json.Unmarshal(message.Content, &blocks); err != nil {
+	var rawBlocks []json.RawMessage
+	if err := json.Unmarshal(message.Content, &rawBlocks); err != nil {
 		return nil, false, fmt.Errorf("decode Claude content at line %d: %w", line, err)
 	}
 	var events []session.Event
-	for blockIndex, block := range blocks {
+	for blockIndex, rawBlock := range rawBlocks {
+		var block claudeBlock
+		if err := json.Unmarshal(rawBlock, &block); err != nil {
+			return nil, false, fmt.Errorf("decode Claude content block %d at line %d: %w", blockIndex+1, line, err)
+		}
 		blockID := block.ID
 		if blockID == "" {
 			blockID = blockFallbackID(line, blockIndex)
 		}
 		switch block.Type {
 		case "thinking":
-			raw, err := json.Marshal(block)
-			if err != nil {
-				return nil, false, fmt.Errorf("encode Claude thinking block at line %d: %w", line, err)
-			}
-			events = append(events, rawEvent(blockID, e.ParentUUID, block.Type, when, raw))
+			events = append(events, rawEvent(blockID, e.ParentUUID, block.Type, when, rawBlock))
 		case "text":
 			kind := session.EventUser
 			if e.Type == "assistant" {
