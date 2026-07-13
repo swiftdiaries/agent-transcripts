@@ -1,12 +1,14 @@
 package web
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"regexp"
 	"strings"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/auth"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/parser"
@@ -55,6 +57,180 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *server) api(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/"), "/")
+	if len(parts) == 0 || !managedID.MatchString(parts[0]) {
+		http.NotFound(w, r)
+		return
+	}
+	id, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+	// A browser request is authenticated by its provider; bearer requests have
+	// been replaced above and do not use ambient cookies/proxy headers.
+	if r.Header.Get("Authorization") == "" && s.csrf != nil && !s.csrf.Check(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	switch {
+	case r.Method == http.MethodPatch && len(parts) == 2 && parts[1] == "metadata":
+		s.patchMetadata(w, r, parts[0], id)
+	case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "move":
+		s.moveSession(w, r, parts[0], id)
+	case r.Method == http.MethodDelete && len(parts) == 1:
+		s.deleteSession(w, r, parts[0], id)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func jsonRequest(r *http.Request) bool {
+	return strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
+}
+func revision(r *http.Request, body string) string {
+	if v := strings.Trim(r.Header.Get("If-Match"), `\"`); v != "" {
+		return v
+	}
+	return body
+}
+func (s *server) owner(w http.ResponseWriter, r *http.Request, id string, who auth.Identity, expected string) (session.Package, bool) {
+	pkg, err := s.store.GetSession(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		http.NotFound(w, r)
+		return session.Package{}, false
+	}
+	if err != nil {
+		s.internalError(w, err)
+		return session.Package{}, false
+	}
+	if pkg.Metadata.UploaderKey != who.Key {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return session.Package{}, false
+	}
+	if expected == "" || expected != pkg.Metadata.Revision {
+		http.Error(w, "revision conflict", http.StatusConflict)
+		return session.Package{}, false
+	}
+	return pkg, true
+}
+
+func (s *server) patchMetadata(w http.ResponseWriter, r *http.Request, id string, who auth.Identity) {
+	if !jsonRequest(r) {
+		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	defer r.Body.Close()
+	var input struct {
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Tags        []string `json:"tags"`
+		Revision    string   `json:"revision"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&input) != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	pkg, ok := s.owner(w, r, id, who, revision(r, input.Revision))
+	if !ok {
+		return
+	}
+	// Only the mutable fields are accepted. The stored package preserves all
+	// identity, uploader, destination and parser-owned fields.
+	pkg.Metadata.Title, pkg.Metadata.Description = input.Title, input.Description
+	tags, err := session.NormalizeTags(input.Tags)
+	if err != nil {
+		http.Error(w, "invalid metadata", http.StatusBadRequest)
+		return
+	}
+	pkg.Metadata.Tags = tags
+	value, err := s.store.UpdateMetadata(r.Context(), id, pkg.Metadata.Revision, pkg.Metadata)
+	if errors.Is(err, store.ErrConflict) {
+		http.Error(w, "revision conflict", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"revision": value})
+}
+func (s *server) moveSession(w http.ResponseWriter, r *http.Request, id string, who auth.Identity) {
+	if !jsonRequest(r) {
+		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	defer r.Body.Close()
+	var input struct {
+		Kind     string `json:"kind"`
+		Slug     string `json:"slug"`
+		Revision string `json:"revision"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input) != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if _, ok := s.owner(w, r, id, who, revision(r, input.Revision)); !ok {
+		return
+	}
+	md, err := s.store.MoveSession(r.Context(), id, who.Key, session.Directory{Kind: input.Kind, Slug: input.Slug})
+	if errors.Is(err, store.ErrConflict) {
+		http.Error(w, "revision conflict", http.StatusConflict)
+		return
+	}
+	if errors.Is(err, store.ErrForbidden) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(md)
+}
+func (s *server) deleteSession(w http.ResponseWriter, r *http.Request, id string, who auth.Identity) {
+	if r.ContentLength > 0 {
+		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	if _, ok := s.owner(w, r, id, who, revision(r, "")); !ok {
+		return
+	}
+	if err := s.store.DeleteSession(r.Context(), id, who.Key); errors.Is(err, store.ErrForbidden) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	} else if err != nil {
+		s.internalError(w, err)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (s *server) mintToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || s.tokens == nil {
+		http.NotFound(w, r)
+		return
+	}
+	id, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+	if s.csrf == nil || !s.csrf.Check(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	token, err := s.tokens.Mint(id)
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"token": token})
 }
 
 func (s *server) static(w http.ResponseWriter, name, contentType string) {

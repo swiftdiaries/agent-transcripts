@@ -6,8 +6,10 @@ import (
 	"embed"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/auth"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
@@ -25,6 +27,9 @@ type ServerConfig struct {
 	QuietPeriod time.Duration
 	Now         func() time.Time
 	Mode        string
+	Provider    auth.Provider
+	CSRF        *auth.CSRF
+	Tokens      *auth.TokenManager
 }
 
 type server struct {
@@ -35,6 +40,8 @@ type server struct {
 	now            func() time.Time
 	templates      map[string]*template.Template
 	mode           string
+	csrf           *auth.CSRF
+	tokens         *auth.TokenManager
 	discover       func(context.Context, discovery.Roots, time.Time, time.Duration) ([]discovery.Candidate, error)
 }
 
@@ -55,13 +62,36 @@ func New(cfg ServerConfig) http.Handler {
 	if mode == "" {
 		mode = "local"
 	}
-	return &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates, mode: mode, discover: discovery.Discover}
+	s := &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates, mode: mode, csrf: cfg.CSRF, tokens: cfg.Tokens, discover: discovery.Discover}
+	if cfg.Provider == nil {
+		// Preserve the concrete server for local composition and tests; local
+		// routes never expose hosted mutation APIs.
+		return s
+	}
+	return cfg.Provider.Wrap(s)
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		if s.tokens != nil {
+			if id, ok, presented := s.tokens.APIIdentity(r); presented {
+				if !ok {
+					http.Error(w, "authentication required", http.StatusUnauthorized)
+					return
+				}
+				r = r.WithContext(auth.WithIdentity(r.Context(), id))
+			}
+		}
+		s.api(w, r)
+		return
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/auth/token" {
+		s.mintToken(w, r)
+		return
+	}
 	if r.Method == http.MethodPost && r.URL.Path == "/live/import" && s.mode == "local" {
 		s.importLive(w, r)
 		return

@@ -1,9 +1,11 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/auth"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
@@ -31,6 +34,48 @@ func TestTranscriptEscapesContentAndShowsRawEvent(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "future_event") {
 		t.Fatal("raw event missing")
+	}
+}
+
+func TestDifferentUserCannotDelete(t *testing.T) {
+	pkg := fixturePackage(t)
+	st := store.NewFilesystem(t.TempDir())
+	if _, err := st.PutSession(context.Background(), pkg); err != nil {
+		t.Fatal(err)
+	}
+	_, cidr, _ := net.ParseCIDR("192.0.2.0/24")
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr})})
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/"+pkg.ID, nil)
+	req.RemoteAddr = "192.0.2.10:1234"
+	req.Header.Set("X-User", "grace@example.com")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d", rr.Code)
+	}
+}
+
+func TestBrowserMutationRejectsMissingCSRF(t *testing.T) {
+	pkg := fixturePackage(t)
+	st := store.NewFilesystem(t.TempDir())
+	if _, err := st.PutSession(context.Background(), pkg); err != nil {
+		t.Fatal(err)
+	}
+	_, cidr, _ := net.ParseCIDR("192.0.2.0/24")
+	csrf, err := auth.NewCSRF(bytes.Repeat([]byte("k"), 32), "https://transcripts.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr}), CSRF: csrf})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+pkg.ID+"/move", strings.NewReader(`{"kind":"projects","slug":"demo","revision":"`+pkg.Metadata.Revision+`"}`))
+	req.RemoteAddr = "192.0.2.10:1234"
+	req.Header.Set("X-User", "ada@example.com")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://transcripts.example.com")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d", rr.Code)
 	}
 }
 
