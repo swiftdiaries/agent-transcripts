@@ -33,6 +33,7 @@ type manifest struct {
 	MetadataHash     string            `json:"metadata_hash"`
 	SessionHash      string            `json:"session_hash"`
 	SourceFactsHash  string            `json:"source_facts_hash"`
+	MoveID           string            `json:"move_id,omitempty"`
 }
 
 type Filesystem struct {
@@ -1102,7 +1103,7 @@ func (s *Filesystem) find(id string) (string, manifest, error) {
 	return "", manifest{}, ErrNotFound
 }
 func validateManifest(m manifest) error {
-	if m.SchemaVersion != manifestSchemaVersion || !validManaged(m.ID, "s_") || !validManaged(m.ContentID, "c_") || session.ValidateDirectory(m.Destination) != nil || len(m.Files) != 2 || !validHash(m.Files["source.jsonl"]) || !validHash(m.Files["normalized.json"]) || !validHash(m.MetadataHash) || !validHash(m.SessionHash) || !validHash(m.SourceFactsHash) || !validHash(m.MetadataRevision) {
+	if m.SchemaVersion != manifestSchemaVersion || !validManaged(m.ID, "s_") || !validManaged(m.ContentID, "c_") || (m.MoveID != "" && !validManaged(m.MoveID, "s_")) || session.ValidateDirectory(m.Destination) != nil || len(m.Files) != 2 || !validHash(m.Files["source.jsonl"]) || !validHash(m.Files["normalized.json"]) || !validHash(m.MetadataHash) || !validHash(m.SessionHash) || !validHash(m.SourceFactsHash) || !validHash(m.MetadataRevision) {
 		return errors.New("invalid manifest")
 	}
 	return nil

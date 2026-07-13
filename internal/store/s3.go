@@ -50,6 +50,7 @@ type s3MoveIntent struct {
 	OldDestination, NewDestination session.Directory
 	Metadata                       session.Metadata
 	SourceManifestETag             string
+	Phase                          string
 }
 
 func NewS3(client S3API, bucket, prefix string) Store {
@@ -298,11 +299,14 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 		if intent.Metadata.UploaderKey != uploader {
 			return session.Metadata{}, ErrForbidden
 		}
-		_, etag, sourceErr := s.readManifest(ctx, intent.OldDestination, intent.OldID)
+		source, etag, sourceErr := s.readManifest(ctx, intent.OldDestination, intent.OldID)
 		if errors.Is(sourceErr, ErrS3NotFound) {
-			return s.finishMove(ctx, intent)
+			if intent.Phase == "source-locked" {
+				return s.finishMove(ctx, intent)
+			}
+			return s.reconcileMoveConflict(ctx, intent)
 		}
-		if sourceErr != nil || etag != intent.SourceManifestETag {
+		if sourceErr != nil || (etag != intent.SourceManifestETag && source.MoveID != intent.OldID) {
 			return session.Metadata{}, ErrConflict
 		}
 		if err := s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(id), S3Condition{}); err != nil && !errors.Is(err, ErrS3NotFound) {
@@ -336,7 +340,7 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 		return session.Metadata{}, err
 	}
 	target := makeManifest(p, files)
-	intent := s3MoveIntent{OldID: id, NewID: newID, OldDestination: m.Destination, NewDestination: d, Metadata: p.Metadata, SourceManifestETag: sourceManifestETag}
+	intent := s3MoveIntent{OldID: id, NewID: newID, OldDestination: m.Destination, NewDestination: d, Metadata: p.Metadata, SourceManifestETag: sourceManifestETag, Phase: "preparing"}
 	if err := s.writeMoveIntent(ctx, intent); err != nil {
 		return session.Metadata{}, err
 	}
@@ -396,7 +400,7 @@ func (s *S3) readMoveIntent(ctx context.Context, id string) (s3MoveIntent, error
 	if err != nil {
 		return intent, err
 	}
-	if intent.OldID != id || intent.SourceManifestETag == "" || !validManaged(intent.NewID, "s_") || session.ValidateDirectory(intent.OldDestination) != nil || session.ValidateDirectory(intent.NewDestination) != nil || intent.Metadata.ID != intent.NewID {
+	if intent.OldID != id || intent.SourceManifestETag == "" || (intent.Phase != "preparing" && intent.Phase != "source-locked") || !validManaged(intent.NewID, "s_") || session.ValidateDirectory(intent.OldDestination) != nil || session.ValidateDirectory(intent.NewDestination) != nil || intent.Metadata.ID != intent.NewID {
 		return intent, ErrConflict
 	}
 	return intent, nil
@@ -422,22 +426,81 @@ func (s *S3) finishMove(ctx context.Context, intent s3MoveIntent) (session.Metad
 	if _, _, err := s.readManifest(ctx, intent.NewDestination, intent.NewID); err != nil {
 		return session.Metadata{}, err
 	}
+	source, sourceETag, err := s.readManifest(ctx, intent.OldDestination, intent.OldID)
+	if errors.Is(err, ErrS3NotFound) {
+		if intent.Phase != "source-locked" {
+			return s.reconcileMoveConflict(ctx, intent)
+		}
+		return s.completeMoveCleanup(ctx, intent)
+	}
+	if err != nil || (source.MoveID != "" && source.MoveID != intent.OldID) || (source.MoveID == "" && sourceETag != intent.SourceManifestETag) {
+		return s.reconcileMoveConflict(ctx, intent)
+	}
+	if source.MoveID == "" {
+		source.MoveID = intent.OldID
+		key, _ := s.key(intent.OldDestination, intent.OldID, "manifest.json")
+		if _, err = s.client.PutObject(ctx, s.bucket, key, mustJSON(source), S3Condition{IfMatch: sourceETag}); err != nil {
+			observed, _, readErr := s.readManifest(ctx, intent.OldDestination, intent.OldID)
+			if readErr != nil || observed.MoveID != intent.OldID {
+				return s.reconcileMoveConflict(ctx, intent)
+			}
+		}
+	}
+	intent.Phase = "source-locked"
+	if err := s.setMovePhase(ctx, intent); err != nil {
+		return session.Metadata{}, err
+	}
+	_, sourceETag, err = s.readManifest(ctx, intent.OldDestination, intent.OldID)
+	if err != nil {
+		return session.Metadata{}, err
+	}
 	key, _ := s.key(intent.OldDestination, intent.OldID, "manifest.json")
-	if err := s.client.DeleteObject(ctx, s.bucket, key, S3Condition{IfMatch: intent.SourceManifestETag}); err != nil {
+	if err := s.client.DeleteObject(ctx, s.bucket, key, S3Condition{IfMatch: sourceETag}); err != nil {
 		if errors.Is(err, ErrS3PreconditionFailed) {
-			return session.Metadata{}, ErrConflict
+			return s.reconcileMoveConflict(ctx, intent)
 		}
 		if errors.Is(err, ErrS3NotFound) {
-			return intent.Metadata, nil
+			return s.completeMoveCleanup(ctx, intent)
 		}
 		return session.Metadata{}, err
 	}
+	return s.completeMoveCleanup(ctx, intent)
+}
+func (s *S3) setMovePhase(ctx context.Context, intent s3MoveIntent) error {
+	o, err := s.client.HeadObject(ctx, s.bucket, s.moveMarkerKey(intent.OldID))
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutObject(ctx, s.bucket, s.moveMarkerKey(intent.OldID), mustJSON(intent), S3Condition{IfMatch: o.ETag})
+	if err == nil {
+		return nil
+	}
+	current, readErr := s.readMoveIntent(ctx, intent.OldID)
+	if readErr == nil && current.Phase == intent.Phase {
+		return nil
+	}
+	return err
+}
+func (s *S3) completeMoveCleanup(ctx context.Context, intent s3MoveIntent) (session.Metadata, error) {
 	for _, name := range append(append([]string{}, immutableNames...), "metadata.json") {
 		key, _ := s.key(intent.OldDestination, intent.OldID, name)
 		_ = s.client.DeleteObject(ctx, s.bucket, key, S3Condition{})
 	}
 	_ = s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(intent.OldID), S3Condition{})
 	return intent.Metadata, nil
+}
+func (s *S3) reconcileMoveConflict(ctx context.Context, intent s3MoveIntent) (session.Metadata, error) {
+	m, etag, err := s.readManifest(ctx, intent.NewDestination, intent.NewID)
+	if err == nil {
+		key, _ := s.key(m.Destination, m.ID, "manifest.json")
+		_ = s.client.DeleteObject(ctx, s.bucket, key, S3Condition{IfMatch: etag})
+		for _, name := range append(append([]string{}, immutableNames...), "metadata.json") {
+			key, _ := s.key(intent.NewDestination, intent.NewID, name)
+			_ = s.client.DeleteObject(ctx, s.bucket, key, S3Condition{})
+		}
+	}
+	_ = s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(intent.OldID), S3Condition{})
+	return session.Metadata{}, ErrConflict
 }
 func (s *S3) DeleteSession(ctx context.Context, id, uploader string) error {
 	uploader, err := session.NormalizeUploaderKey(uploader)
@@ -454,6 +517,9 @@ func (s *S3) DeleteSession(ctx context.Context, id, uploader string) error {
 	}
 	if md.UploaderKey != uploader {
 		return ErrForbidden
+	}
+	if m.MoveID != "" {
+		return ErrConflict
 	}
 	key, _ := s.key(m.Destination, m.ID, "manifest.json")
 	if err := s.client.DeleteObject(ctx, s.bucket, key, S3Condition{IfMatch: manifestETag}); err != nil {

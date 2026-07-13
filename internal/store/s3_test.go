@@ -169,6 +169,12 @@ func TestS3MoveRetriesAfterCommittedSourceManifestDeleteResponseLoss(t *testing.
 	if _, err := s.GetSession(context.Background(), got.ID); err != nil {
 		t.Fatalf("destination = %v", err)
 	}
+	if _, err := fake.GetObject(context.Background(), "bucket", "prod/.moves/"+p.ID+".json"); !errors.Is(err, ErrS3NotFound) {
+		t.Fatalf("move marker = %v", err)
+	}
+	if _, err := fake.GetObject(context.Background(), "bucket", "prod/users/ada/"+p.ID+"/source.jsonl"); !errors.Is(err, ErrS3NotFound) {
+		t.Fatalf("source orphan = %v", err)
+	}
 }
 
 func TestS3MoveRetriesAfterPreFinalizationMetadataResponseLoss(t *testing.T) {
@@ -235,6 +241,24 @@ func TestS3MoveDoesNotHideSourceAfterManifestETagRace(t *testing.T) {
 	}
 	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
 		t.Fatalf("source lost: %v", err)
+	}
+}
+
+func TestS3MoveReconcilesDestinationWhenSourceDeleteWins(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	dest := session.Directory{Kind: "projects", Slug: "demo"}
+	newID := session.PackageID(p.ContentID, dest)
+	fake.setOnPut("prod/projects/demo/"+newID+"/manifest.json", func() { delete(fake.objects, fakeKey("bucket", "prod/users/ada/"+p.ID+"/manifest.json")) })
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); !errors.Is(err, ErrConflict) {
+		t.Fatalf("move = %v", err)
+	}
+	if _, err := s.GetSession(context.Background(), newID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("destination visible = %v", err)
 	}
 }
 
