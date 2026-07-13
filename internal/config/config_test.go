@@ -106,6 +106,13 @@ func TestS3StorageRejectsInvalidEndpoint(t *testing.T) {
 	}
 }
 
+func TestS3StorageRejectsUnsupportedEndpointScheme(t *testing.T) {
+	_, err := Load(writeTempConfig(t, "mode: local\nstorage:\n  type: s3\n  bucket: transcripts\n  endpoint: ftp://storage.example.com\n"), Overrides{})
+	if err == nil || !strings.Contains(err.Error(), "storage.endpoint") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestHostedOIDCRequiresClientSecretEnvironmentValue(t *testing.T) {
 	for _, test := range []struct {
 		name     string

@@ -82,11 +82,13 @@ func TestS3MetadataUsesETagCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	expected := got.Metadata.Revision
 	got.Metadata.Title = "new"
-	if _, err := s.UpdateMetadata(context.Background(), p.ID, got.Metadata.Revision, got.Metadata); err != nil {
+	if _, err := s.UpdateMetadata(context.Background(), p.ID, expected, got.Metadata); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.UpdateMetadata(context.Background(), p.ID, got.Metadata.Revision, got.Metadata); !errors.Is(err, ErrConflict) {
+	got.Metadata.Title = "different"
+	if _, err := s.UpdateMetadata(context.Background(), p.ID, expected, got.Metadata); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale update = %v", err)
 	}
 }
@@ -102,18 +104,62 @@ func TestS3CreateProjectListsEmptyProject(t *testing.T) {
 	}
 }
 
+func TestS3MoveToCurrentDestinationIsOwnershipCheckedNoOp(t *testing.T) {
+	s := NewS3(newFakeS3(), "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.MoveSession(context.Background(), p.ID, "ada", p.Metadata.Destination)
+	if err != nil || got.ID != p.ID {
+		t.Fatalf("move = %+v, %v", got, err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatalf("source removed: %v", err)
+	}
+	if _, err := s.MoveSession(context.Background(), p.ID, "other", p.Metadata.Destination); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("ownership error = %v", err)
+	}
+}
+
+func TestS3UpdateRetriesAfterCommittedManifestResponseLoss(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := got.Metadata.Revision
+	got.Metadata.Title = "recovered"
+	fake.failAfterPut("prod/users/ada/"+p.ID+"/manifest.json", errors.New("response lost"))
+	if _, err := s.UpdateMetadata(context.Background(), p.ID, expected, got.Metadata); err != nil {
+		t.Fatalf("response-loss convergence = %v", err)
+	}
+	if _, err := s.UpdateMetadata(context.Background(), p.ID, expected, got.Metadata); err != nil {
+		t.Fatalf("retry = %v", err)
+	}
+}
+
 type fakeS3 struct {
 	mu       sync.Mutex
 	objects  map[string]S3Object
 	puts     []string
 	sequence int
+	afterPut map[string]error
 }
 
-func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string]S3Object{}} }
-func (f *fakeS3) GetObject(_ context.Context, _, key string) (S3Object, error) {
+func newFakeS3() *fakeS3 {
+	return &fakeS3{objects: map[string]S3Object{}, afterPut: map[string]error{}}
+}
+func fakeKey(bucket, key string) string { return bucket + "\x00" + key }
+func (f *fakeS3) GetObject(_ context.Context, bucket, key string) (S3Object, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	o, ok := f.objects[key]
+	o, ok := f.objects[fakeKey(bucket, key)]
 	if !ok {
 		return S3Object{}, ErrS3NotFound
 	}
@@ -123,42 +169,68 @@ func (f *fakeS3) GetObject(_ context.Context, _, key string) (S3Object, error) {
 func (f *fakeS3) HeadObject(ctx context.Context, bucket, key string) (S3Object, error) {
 	return f.GetObject(ctx, bucket, key)
 }
-func (f *fakeS3) PutObject(_ context.Context, _, key string, body []byte, c S3Condition) (string, error) {
+func (f *fakeS3) PutObject(_ context.Context, bucket, key string, body []byte, c S3Condition) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	old, exists := f.objects[key]
+	objectKey := fakeKey(bucket, key)
+	old, exists := f.objects[objectKey]
 	if c.IfNoneMatch && exists || c.IfMatch != "" && (!exists || old.ETag != c.IfMatch) {
 		return "", ErrS3PreconditionFailed
 	}
 	f.sequence++
 	etag := "etag-" + string(rune(f.sequence))
-	f.objects[key] = S3Object{Body: append([]byte(nil), body...), ETag: etag}
+	f.objects[objectKey] = S3Object{Body: append([]byte(nil), body...), ETag: etag}
 	f.puts = append(f.puts, key)
-	return etag, nil
-}
-func (f *fakeS3) CopyObject(ctx context.Context, bucket, src, dst string, c S3Condition) (string, error) {
-	o, err := f.GetObject(ctx, bucket, src)
-	if err != nil {
+	if err := f.afterPut[key]; err != nil {
+		delete(f.afterPut, key)
 		return "", err
 	}
-	return f.PutObject(ctx, bucket, dst, o.Body, c)
+	return etag, nil
 }
-func (f *fakeS3) DeleteObject(_ context.Context, _, key string) error {
+func (f *fakeS3) failAfterPut(key string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.objects[key]; !ok {
+	f.afterPut[key] = err
+}
+func (f *fakeS3) CopyObject(_ context.Context, bucket, src, dst string, c S3Condition) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o, ok := f.objects[fakeKey(bucket, src)]
+	if !ok {
+		return "", ErrS3NotFound
+	}
+	dstKey := fakeKey(bucket, dst)
+	old, exists := f.objects[dstKey]
+	if c.IfNoneMatch && exists || c.IfMatch != "" && (!exists || old.ETag != c.IfMatch) {
+		return "", ErrS3PreconditionFailed
+	}
+	f.sequence++
+	etag := "etag-" + string(rune(f.sequence))
+	f.objects[dstKey] = S3Object{Body: append([]byte(nil), o.Body...), ETag: etag}
+	return etag, nil
+}
+func (f *fakeS3) DeleteObject(_ context.Context, bucket, key string, c S3Condition) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	objectKey := fakeKey(bucket, key)
+	o, ok := f.objects[objectKey]
+	if !ok {
 		return ErrS3NotFound
 	}
-	delete(f.objects, key)
+	if c.IfMatch != "" && c.IfMatch != o.ETag {
+		return ErrS3PreconditionFailed
+	}
+	delete(f.objects, objectKey)
 	return nil
 }
 func (f *fakeS3) ListObjectsV2(_ context.Context, _, prefix, token string) (S3ListPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var keys []string
-	for key := range f.objects {
-		if strings.HasPrefix(key, prefix) {
-			keys = append(keys, key)
+	for objectKey := range f.objects {
+		parts := strings.SplitN(objectKey, "\x00", 2)
+		if len(parts) == 2 && strings.HasPrefix(parts[1], prefix) {
+			keys = append(keys, parts[1])
 		}
 	}
 	sort.Strings(keys)

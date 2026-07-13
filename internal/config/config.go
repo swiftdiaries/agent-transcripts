@@ -189,7 +189,7 @@ func (cfg Config) validate() error {
 	}
 	if cfg.Storage.Type == "s3" && cfg.Storage.Endpoint != "" {
 		u, err := url.Parse(cfg.Storage.Endpoint)
-		if err != nil || u.Scheme == "" || u.Host == "" {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("storage.endpoint must be an absolute URL")
 		}
 	}
