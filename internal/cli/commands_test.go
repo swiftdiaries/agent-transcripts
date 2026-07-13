@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/config"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 )
 
@@ -142,10 +143,10 @@ func TestParseServeArgs(t *testing.T) {
 	}
 }
 
-func TestServeRejectsHostedAndNonLoopbackLocalConfig(t *testing.T) {
+func TestServeRejectsNonLoopbackLocalConfig(t *testing.T) {
 	t.Setenv("KEY", strings.Repeat("k", 32))
 	t.Setenv("TOKEN", strings.Repeat("t", 32))
-	for _, test := range []struct{ contents, want string }{{"mode: hosted\nexternal_origin: https://example.com\nauth:\n  type: proxy\n  proxy:\n    user_header: X-User\ntrusted_proxy_cidrs: [127.0.0.1/32]\ncookie_key_envs: [KEY]\ntoken_key_env: TOKEN\n", "only supports local mode"}, {"mode: local\nlisten: 0.0.0.0:8080\n", "loopback"}} {
+	for _, test := range []struct{ contents, want string }{{"mode: local\nlisten: 0.0.0.0:8080\n", "loopback"}} {
 		path := filepath.Join(t.TempDir(), "config.yaml")
 		if err := os.WriteFile(path, []byte(test.contents), 0o600); err != nil {
 			t.Fatal(err)
@@ -154,6 +155,41 @@ func TestServeRejectsHostedAndNonLoopbackLocalConfig(t *testing.T) {
 		if got := runServe(context.Background(), []string{"--config", path}, &bytes.Buffer{}, &stderr); got != 1 || !strings.Contains(stderr.String(), test.want) {
 			t.Fatalf("exit = %d, stderr = %q", got, stderr.String())
 		}
+	}
+}
+
+func TestServeHandlerComposesHostedProxyWithoutListener(t *testing.T) {
+	t.Setenv("KEY", strings.Repeat("k", 32))
+	t.Setenv("TOKEN", strings.Repeat("t", 32))
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "mode: hosted\nexternal_origin: https://example.com\nstorage:\n  root: " + filepath.Join(t.TempDir(), "library") + "\nauth:\n  type: proxy\n  proxy:\n    user_header: X-User\ntrusted_proxy_cidrs: [127.0.0.1/32]\ncookie_key_envs: [KEY]\ntoken_key_env: TOKEN\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serveHandler(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServeHandlerComposesHostedOIDCWithoutListener(t *testing.T) {
+	t.Setenv("KEY", strings.Repeat("k", 32))
+	t.Setenv("TOKEN", strings.Repeat("t", 32))
+	t.Setenv("OIDC_SECRET", "secret")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "mode: hosted\nexternal_origin: https://example.com\nstorage:\n  root: " + filepath.Join(t.TempDir(), "library") + "\nauth:\n  type: oidc\n  oidc:\n    issuer: https://issuer.example.com\n    client_id: client\n    client_secret_env: OIDC_SECRET\ntrusted_proxy_cidrs: []\ncookie_key_envs: [KEY]\ntoken_key_env: TOKEN\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serveHandler(cfg); err != nil {
+		t.Fatal(err)
 	}
 }
 

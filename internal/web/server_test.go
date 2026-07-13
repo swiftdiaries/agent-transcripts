@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +46,15 @@ func TestDifferentUserCannotDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, cidr, _ := net.ParseCIDR("192.0.2.0/24")
-	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr})})
+	csrf, err := auth.NewCSRF(bytes.Repeat([]byte("k"), 32), "https://transcripts.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := auth.NewTokenManager(bytes.Repeat([]byte("t"), 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr}), CSRF: csrf, Tokens: tokens})
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/"+pkg.ID, nil)
 	req.RemoteAddr = "192.0.2.10:1234"
 	req.Header.Set("X-User", "grace@example.com")
@@ -66,7 +76,11 @@ func TestBrowserMutationRejectsMissingCSRF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr}), CSRF: csrf})
+	tokens, err := auth.NewTokenManager(bytes.Repeat([]byte("t"), 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr}), CSRF: csrf, Tokens: tokens})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+pkg.ID+"/move", strings.NewReader(`{"kind":"projects","slug":"demo","revision":"`+pkg.Metadata.Revision+`"}`))
 	req.RemoteAddr = "192.0.2.10:1234"
 	req.Header.Set("X-User", "ada@example.com")
@@ -76,6 +90,60 @@ func TestBrowserMutationRejectsMissingCSRF(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d", rr.Code)
+	}
+}
+
+func TestBrowserMintsBearerThenBearerExcludesProxyIdentity(t *testing.T) {
+	pkg := fixturePackage(t)
+	st := store.NewFilesystem(t.TempDir())
+	if _, err := st.PutSession(context.Background(), pkg); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetSession(context.Background(), pkg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cidr, _ := net.ParseCIDR("192.0.2.0/24")
+	csrf, _ := auth.NewCSRF(bytes.Repeat([]byte("k"), 32), "https://transcripts.example.com")
+	tokens, _ := auth.NewTokenManager(bytes.Repeat([]byte("t"), 32))
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Mode: "hosted", Provider: auth.NewProxy("X-User", "", []*net.IPNet{cidr}), CSRF: csrf, Tokens: tokens})
+	page := httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID, nil)
+	page.RemoteAddr = "192.0.2.10:1"
+	page.Header.Set("X-User", "ada")
+	pr := httptest.NewRecorder()
+	h.ServeHTTP(pr, page)
+	match := regexp.MustCompile(`name="csrf-token" content="([^"]+)"`).FindStringSubmatch(pr.Body.String())
+	if len(match) != 2 {
+		t.Fatalf("csrf token absent: %s", pr.Body.String())
+	}
+	cookies := pr.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("csrf cookie absent")
+	}
+	mint := httptest.NewRequest(http.MethodPost, "/auth/token", nil)
+	mint.RemoteAddr = "192.0.2.10:1"
+	mint.Header.Set("X-User", "ada")
+	mint.Header.Set("Origin", "https://transcripts.example.com")
+	mint.Header.Set("X-CSRF-Token", match[1])
+	mint.AddCookie(cookies[0])
+	mr := httptest.NewRecorder()
+	h.ServeHTTP(mr, mint)
+	if mr.Code != http.StatusOK {
+		t.Fatalf("mint=%d", mr.Code)
+	}
+	var result map[string]string
+	if err := json.Unmarshal(mr.Body.Bytes(), &result); err != nil || result["token"] == "" {
+		t.Fatal("token absent")
+	}
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/"+pkg.ID, nil)
+	deleteReq.RemoteAddr = "203.0.113.9:1"
+	deleteReq.Header.Set("Authorization", "Bearer "+result["token"])
+	deleteReq.Header.Set("X-User", "grace@example.com")
+	deleteReq.Header.Set("If-Match", stored.Metadata.Revision)
+	dr := httptest.NewRecorder()
+	h.ServeHTTP(dr, deleteReq)
+	if dr.Code != http.StatusNoContent {
+		t.Fatalf("delete=%d", dr.Code)
 	}
 }
 

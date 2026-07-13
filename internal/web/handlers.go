@@ -177,7 +177,7 @@ func (s *server) moveSession(w http.ResponseWriter, r *http.Request, id string, 
 	if _, ok := s.owner(w, r, id, who, revision(r, input.Revision)); !ok {
 		return
 	}
-	md, err := s.store.MoveSession(r.Context(), id, who.Key, session.Directory{Kind: input.Kind, Slug: input.Slug})
+	md, err := s.store.MoveSession(r.Context(), id, who.Key, session.Directory{Kind: input.Kind, Slug: input.Slug}, revision(r, input.Revision))
 	if errors.Is(err, store.ErrConflict) {
 		http.Error(w, "revision conflict", http.StatusConflict)
 		return
@@ -201,7 +201,7 @@ func (s *server) deleteSession(w http.ResponseWriter, r *http.Request, id string
 	if _, ok := s.owner(w, r, id, who, revision(r, "")); !ok {
 		return
 	}
-	if err := s.store.DeleteSession(r.Context(), id, who.Key); errors.Is(err, store.ErrForbidden) {
+	if err := s.store.DeleteSession(r.Context(), id, who.Key, revision(r, "")); errors.Is(err, store.ErrForbidden) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 	} else if err != nil {
 		s.internalError(w, err)
@@ -386,7 +386,11 @@ func (s *server) transcript(w http.ResponseWriter, r *http.Request, id string) {
 		s.internalError(w, err)
 		return
 	}
-	s.render(w, "transcript", transcriptPage(pkg.Session, pkg.Metadata.Title))
+	p := transcriptPage(pkg.Session, pkg.Metadata.Title)
+	if s.csrf != nil {
+		p.CSRFToken = s.csrf.Token(w, r)
+	}
+	s.render(w, "transcript", p)
 }
 
 type page struct {
@@ -396,6 +400,7 @@ type page struct {
 	Candidates []discovery.Candidate
 	IsLive     bool
 	Transcript transcript
+	CSRFToken  string
 }
 type transcript struct {
 	Title  string

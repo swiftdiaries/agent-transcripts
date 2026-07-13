@@ -142,3 +142,27 @@ func TestBearerIsAudienceBoundAndExpires(t *testing.T) {
 		t.Fatal("accepted expired token")
 	}
 }
+
+func TestCSRFChecksOriginOrSameOriginReferer(t *testing.T) {
+	c, err := NewCSRF(bytes.Repeat([]byte("k"), 32), "https://app.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		origin, referer string
+		want            bool
+	}{{"https://app.example.com", "", true}, {"", "https://app.example.com/sessions/x", true}, {"https://evil.example", "https://app.example.com/", false}, {"", "", false}, {"not a URL", "", false}} {
+		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		r.Header.Set("Origin", test.origin)
+		r.Header.Set("Referer", test.referer)
+		if got := sameOrigin(r, c.origin); got != test.want {
+			t.Fatalf("origin=%q referer=%q got=%v", test.origin, test.referer, got)
+		}
+	}
+}
+
+func TestOIDCRejectsCleartextIssuer(t *testing.T) {
+	if _, err := NewOIDC(OIDCConfig{Issuer: "http://issuer.example", ClientID: "x", ClientSecret: "y", RedirectURL: "https://app.example/callback", CookieKeys: [][]byte{make([]byte, 32)}}); err == nil {
+		t.Fatal("accepted cleartext issuer")
+	}
+}

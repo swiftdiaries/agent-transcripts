@@ -358,7 +358,7 @@ func (s *S3) UpdateMetadata(ctx context.Context, id, expected string, md session
 	return md.Revision, nil
 }
 
-func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Directory) (session.Metadata, error) {
+func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Directory, expectedRevision ...string) (session.Metadata, error) {
 	if err := session.ValidateDirectory(d); err != nil {
 		return session.Metadata{}, err
 	}
@@ -386,7 +386,7 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 		if err := s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(id), S3Condition{}); err != nil && !errors.Is(err, ErrS3NotFound) {
 			return session.Metadata{}, err
 		}
-		return s.MoveSession(ctx, id, uploader, d)
+		return s.MoveSession(ctx, id, uploader, d, expectedRevision...)
 	} else if !errors.Is(err, ErrS3NotFound) {
 		return session.Metadata{}, err
 	}
@@ -400,6 +400,9 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 	}
 	if p.Metadata.UploaderKey != uploader {
 		return session.Metadata{}, ErrForbidden
+	}
+	if len(expectedRevision) > 0 && expectedRevision[0] != p.Metadata.Revision {
+		return session.Metadata{}, ErrConflict
 	}
 	if p.Metadata.Destination == d {
 		return p.Metadata, nil
@@ -568,7 +571,7 @@ func (s *S3) reconcileMoveConflict(ctx context.Context, intent s3MoveIntent) (se
 	_ = s.client.DeleteObject(ctx, s.bucket, s.moveMarkerKey(intent.OldID), S3Condition{})
 	return session.Metadata{}, ErrConflict
 }
-func (s *S3) DeleteSession(ctx context.Context, id, uploader string) error {
+func (s *S3) DeleteSession(ctx context.Context, id, uploader string, expectedRevision ...string) error {
 	uploader, err := session.NormalizeUploaderKey(uploader)
 	if err != nil {
 		return err
@@ -583,6 +586,9 @@ func (s *S3) DeleteSession(ctx context.Context, id, uploader string) error {
 	}
 	if md.UploaderKey != uploader {
 		return ErrForbidden
+	}
+	if len(expectedRevision) > 0 && expectedRevision[0] != md.Revision {
+		return ErrConflict
 	}
 	if m.MoveID != "" {
 		return ErrConflict

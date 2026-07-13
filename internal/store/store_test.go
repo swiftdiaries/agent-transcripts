@@ -81,6 +81,27 @@ func TestFilesystemMetadataUsesCompareAndSwap(t *testing.T) {
 	}
 }
 
+func TestFilesystemMoveAndDeleteRejectStaleRevisionAtomically(t *testing.T) {
+	s := NewFilesystem(t.TempDir())
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", session.Directory{Kind: "projects", Slug: "demo"}, "stale"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("move error=%v", err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada", "stale"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("delete error=%v", err)
+	}
+	if _, err := s.GetSession(context.Background(), current.ID); err != nil {
+		t.Fatalf("stale mutation changed package: %v", err)
+	}
+}
+
 func TestFilesystemRejectsSymlinkedRootComponent(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

@@ -67,8 +67,11 @@ func (c *CSRF) Check(r *http.Request) bool {
 func sameOrigin(r *http.Request, want *url.URL) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		return false
+		origin = r.Referer()
+		if origin == "" {
+			return false
+		}
 	}
 	u, err := url.Parse(origin)
-	return err == nil && strings.EqualFold(u.Scheme, want.Scheme) && strings.EqualFold(u.Host, want.Host)
+	return err == nil && u.Scheme != "" && u.Host != "" && strings.EqualFold(u.Scheme, want.Scheme) && strings.EqualFold(u.Host, want.Host)
 }

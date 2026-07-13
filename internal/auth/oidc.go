@@ -26,6 +26,7 @@ type OIDCConfig struct {
 	CookieKeys                                  [][]byte
 	HTTPClient                                  *http.Client
 	SessionLifetime                             time.Duration
+	AllowInsecureTest                           bool
 }
 type OIDC struct {
 	cfg    OIDCConfig
@@ -49,7 +50,7 @@ type oidcSession struct {
 
 func NewOIDC(cfg OIDCConfig) (*OIDC, error) {
 	u, err := url.Parse(cfg.Issuer)
-	if err != nil || u.Scheme != "https" && u.Scheme != "http" || u.Host == "" || cfg.ClientID == "" || cfg.ClientSecret == "" || cfg.RedirectURL == "" || len(cfg.CookieKeys) == 0 || len(cfg.CookieKeys[0]) < 32 {
+	if err != nil || (u.Scheme != "https" && !cfg.AllowInsecureTest) || u.Host == "" || cfg.ClientID == "" || cfg.ClientSecret == "" || cfg.RedirectURL == "" || len(cfg.CookieKeys) == 0 || len(cfg.CookieKeys[0]) < 32 {
 		return nil, errors.New("invalid OIDC configuration")
 	}
 	for _, k := range cfg.CookieKeys {
@@ -102,10 +103,15 @@ func (o *OIDC) discovery() (oidcDiscovery, error) {
 		return d, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 || json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 1<<20)).Decode(&d) != nil || d.Issuer != o.cfg.Issuer || d.AuthorizationEndpoint == "" || d.TokenEndpoint == "" || d.JWKSURI == "" {
+	if resp.StatusCode != 200 || json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 1<<20)).Decode(&d) != nil || d.Issuer != o.cfg.Issuer || !o.secureEndpoint(d.AuthorizationEndpoint) || !o.secureEndpoint(d.TokenEndpoint) || !o.secureEndpoint(d.JWKSURI) {
 		return d, errors.New("invalid OIDC discovery")
 	}
 	return d, nil
+}
+
+func (o *OIDC) secureEndpoint(value string) bool {
+	u, err := url.Parse(value)
+	return err == nil && u.Host != "" && (u.Scheme == "https" || o.cfg.AllowInsecureTest)
 }
 func randomURL(n int) string {
 	b := make([]byte, n)

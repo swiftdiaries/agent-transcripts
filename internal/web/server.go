@@ -63,6 +63,11 @@ func New(cfg ServerConfig) http.Handler {
 		mode = "local"
 	}
 	s := &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates, mode: mode, csrf: cfg.CSRF, tokens: cfg.Tokens, discover: discovery.Discover}
+	if mode == "hosted" && (cfg.Provider == nil || cfg.CSRF == nil || cfg.Tokens == nil) {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "server configuration invalid", http.StatusInternalServerError)
+		})
+	}
 	if cfg.Provider == nil {
 		// Preserve the concrete server for local composition and tests; local
 		// routes never expose hosted mutation APIs.

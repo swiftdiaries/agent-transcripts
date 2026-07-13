@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/auth"
 	"github.com/swiftdiaries/agent-transcripts/internal/config"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
@@ -89,16 +90,15 @@ func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writ
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if cfg.Mode != "local" {
-		_, _ = fmt.Fprintln(stderr, "serve only supports local mode until hosted authentication is configured")
-		return 1
-	}
 	if cfg.Storage.Type != "filesystem" {
 		_, _ = fmt.Fprintln(stderr, "serve currently requires filesystem storage")
 		return 1
 	}
-	st := store.NewFilesystem(cfg.Storage.Root)
-	h := web.New(web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: defaultRoots(), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode})
+	h, err := serveHandler(cfg)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "invalid server authentication configuration")
+		return 1
+	}
 	listener, err := listen("tcp", cfg.Listen)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -120,6 +120,44 @@ func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writ
 		return 1
 	}
 	return 0
+}
+
+func serveHandler(cfg config.Config) (http.Handler, error) {
+	st := store.NewFilesystem(cfg.Storage.Root)
+	base := web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: defaultRoots(), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode}
+	if cfg.Mode == "local" {
+		return web.New(base), nil
+	}
+	csrf, err := auth.NewCSRF(cfg.CookieKeys[0], cfg.ExternalOrigin)
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := auth.NewTokenManager(cfg.TokenKey)
+	if err != nil {
+		return nil, err
+	}
+	switch cfg.Auth.Type {
+	case "proxy":
+		cidrs, err := auth.ParseCIDRs(cfg.TrustedProxyCIDRs)
+		if err != nil {
+			return nil, err
+		}
+		base.Provider = auth.NewProxy(cfg.Auth.Proxy.UserHeader, cfg.Auth.Proxy.NameHeader, cidrs)
+	case "oidc":
+		redirect := cfg.Auth.OIDC.RedirectURL
+		if redirect == "" {
+			redirect = strings.TrimSuffix(cfg.ExternalOrigin, "/") + "/auth/callback"
+		}
+		provider, err := auth.NewOIDC(auth.OIDCConfig{Issuer: cfg.Auth.OIDC.Issuer, ClientID: cfg.Auth.OIDC.ClientID, ClientSecret: cfg.Auth.OIDC.ClientSecret, RedirectURL: redirect, CookieKeys: cfg.CookieKeys})
+		if err != nil {
+			return nil, err
+		}
+		base.Provider = provider
+	default:
+		return nil, errors.New("unsupported hosted auth")
+	}
+	base.CSRF, base.Tokens = csrf, tokens
+	return web.New(base), nil
 }
 
 func localURL(listen string) string {
