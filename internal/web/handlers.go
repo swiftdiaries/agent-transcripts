@@ -14,6 +14,7 @@ import (
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/parser"
+	"github.com/swiftdiaries/agent-transcripts/internal/review"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
 )
@@ -566,8 +567,14 @@ type page struct {
 	CSRFToken  string
 }
 type transcript struct {
-	Title  string
-	Events []eventView
+	Title       string
+	Turns       []turnView
+	Diagnostics []eventView
+}
+type turnView struct {
+	Prompt      eventView
+	Events      []eventView
+	Diagnostics []eventView
 }
 type eventView struct {
 	ID       string
@@ -585,10 +592,24 @@ func transcriptPage(value session.Session, title string) page {
 		title = "Transcript"
 	}
 	p := page{Title: title, Section: "transcript", Transcript: transcript{Title: title}}
-	for _, event := range value.Events {
-		p.Transcript.Events = append(p.Transcript.Events, eventView{ID: event.ID, Kind: event.Kind, Text: event.Text, ToolName: event.ToolName, Input: string(event.Input), Output: string(event.Output), RawType: event.RawType, Raw: string(event.Raw)})
+	projected := review.Project(value)
+	for _, turn := range projected.Turns {
+		p.Transcript.Turns = append(p.Transcript.Turns, turnView{Prompt: eventViewFor(turn.Prompt), Events: eventViews(turn.Events), Diagnostics: eventViews(turn.Diagnostics)})
 	}
+	p.Transcript.Diagnostics = eventViews(projected.Diagnostics)
 	return p
+}
+
+func eventViews(events []session.Event) []eventView {
+	views := make([]eventView, 0, len(events))
+	for _, event := range events {
+		views = append(views, eventViewFor(event))
+	}
+	return views
+}
+
+func eventViewFor(event session.Event) eventView {
+	return eventView{ID: event.ID, Kind: event.Kind, Text: event.Text, ToolName: event.ToolName, Input: string(event.Input), Output: string(event.Output), RawType: event.RawType, Raw: string(event.Raw)}
 }
 
 func (s *server) render(w http.ResponseWriter, name string, data page) {

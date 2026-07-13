@@ -40,6 +40,35 @@ func TestTranscriptEscapesContentAndShowsRawEvent(t *testing.T) {
 	}
 }
 
+func TestTranscriptRendersTurnsAndKeepsRawRecordsOutOfPromptIndex(t *testing.T) {
+	pkg := fixturePackage(t)
+	pkg.Session.Events = []session.Event{
+		{ID: "context", Kind: session.EventRaw, RawType: "world_state", Raw: json.RawMessage(`{"full":true}`)},
+		{ID: "prompt", Kind: session.EventUser, Text: "Review the parser"},
+		{ID: "call", Kind: session.EventToolCall, ToolName: "exec", Input: json.RawMessage(`"pwd"`)},
+		{ID: "result", ParentID: "call", Kind: session.EventToolResult, Output: json.RawMessage(`"/repo"`)},
+	}
+	h := newTestServer(t, pkg)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID, nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, `class="turn"`) {
+		t.Fatal("turn missing")
+	}
+	if strings.Count(body, `href="#prompt"`) != 1 {
+		t.Fatalf("prompt index = %s", body)
+	}
+	if strings.Contains(body, `href="#context"`) {
+		t.Fatal("diagnostic in prompt index")
+	}
+	if !strings.Contains(body, `Technical details`) {
+		t.Fatal("diagnostics disclosure missing")
+	}
+	if !strings.Contains(body, `/repo`) {
+		t.Fatal("tool result missing")
+	}
+}
+
 func TestDifferentUserCannotDelete(t *testing.T) {
 	pkg := fixturePackage(t)
 	st := store.NewFilesystem(t.TempDir())

@@ -33,6 +33,9 @@ h1 { font-family: var(--serif); font-size: clamp(2.3rem, 6vw, 4.9rem); letter-sp
 .prompt-index ol { padding-left: 1.1rem; }
 .prompt-index a { display: block; margin: .55rem 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .event-stream { display: grid; gap: .85rem; }
+.turn { background: var(--surface); border: 1px solid var(--rule); border-left: 3px solid var(--verified); display: grid; gap: .85rem; padding: 1rem 1.1rem; scroll-margin-top: 1rem; }
+.turn > .event-card { border-left: 0; }
+.turn-diagnostics { background: var(--surface); border: 1px solid var(--rule); padding: .85rem 1rem; }
 .event-card { background: var(--surface); border: 1px solid var(--rule); border-left: 3px solid var(--ledger); padding: 1rem 1.1rem; scroll-margin-top: 1rem; }
 .event-user { border-left-color: var(--verified); }
 .event-card > header { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
