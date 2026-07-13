@@ -249,7 +249,7 @@ func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writ
 		_, _ = fmt.Fprintln(stderr, "serve currently requires filesystem storage")
 		return 1
 	}
-	h, err := serveHandler(cfg)
+	h, err := serveHandlerWithStoreFactory(ctx, cfg, productionStoreForConfig)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, "invalid server authentication configuration")
 		return 1
@@ -278,7 +278,14 @@ func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writ
 }
 
 func serveHandler(cfg config.Config) (http.Handler, error) {
-	st := store.NewFilesystem(cfg.Storage.Root)
+	return serveHandlerWithStoreFactory(context.Background(), cfg, productionStoreForConfig)
+}
+
+func serveHandlerWithStoreFactory(ctx context.Context, cfg config.Config, makeStore func(context.Context, config.Storage) (store.Store, error)) (http.Handler, error) {
+	st, err := makeStore(ctx, cfg.Storage)
+	if err != nil {
+		return nil, err
+	}
 	base := web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: rootsForConfig(cfg), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode}
 	if cfg.Mode == "local" {
 		return web.New(base), nil
@@ -313,6 +320,17 @@ func serveHandler(cfg config.Config) (http.Handler, error) {
 	}
 	base.CSRF, base.Tokens = csrf, tokens
 	return web.New(base), nil
+}
+
+func productionStoreForConfig(ctx context.Context, cfg config.Storage) (store.Store, error) {
+	if cfg.Type == "filesystem" {
+		return store.NewFilesystem(cfg.Root), nil
+	}
+	client, err := store.NewAWSS3(ctx, cfg.Region, cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return store.NewS3(client, cfg.Bucket, cfg.Prefix), nil
 }
 
 func localURL(listen string) string {

@@ -167,6 +167,14 @@ func TestOIDCRejectsCleartextIssuer(t *testing.T) {
 	}
 }
 
+func TestOIDCRejectsUnsafeRedirectURL(t *testing.T) {
+	for _, redirect := range []string{"http://app.example/auth/callback", "https://app.example/other", "https://app.example/auth/callback?next=evil"} {
+		if _, err := NewOIDC(OIDCConfig{Issuer: "https://issuer.example", ClientID: "x", ClientSecret: "y", RedirectURL: redirect, CookieKeys: [][]byte{make([]byte, 32)}}); err == nil {
+			t.Fatalf("accepted redirect %q", redirect)
+		}
+	}
+}
+
 func TestCSRFCookieSecureIsModeAware(t *testing.T) {
 	hosted, _ := NewCSRF(bytes.Repeat([]byte("k"), 32), "https://app.example.com")
 	local, _ := NewLocalCSRF(bytes.Repeat([]byte("k"), 32))

@@ -249,6 +249,18 @@ func (cfg Config) validate() error {
 		if cfg.Auth.OIDC.ClientSecret == "" {
 			return fmt.Errorf("auth.oidc.client_secret_env %q is missing or empty", cfg.Auth.OIDC.ClientSecretEnv)
 		}
+		if cfg.Auth.OIDC.RedirectURL != "" {
+			redirect, err := url.Parse(cfg.Auth.OIDC.RedirectURL)
+			if err != nil || redirect.Scheme != "https" || redirect.Host == "" {
+				return fmt.Errorf("auth.oidc.redirect_url must use https")
+			}
+			if redirect.Scheme != u.Scheme || redirect.Host != u.Host {
+				return fmt.Errorf("auth.oidc.redirect_url must be bound to external_origin")
+			}
+			if redirect.Path != "/auth/callback" || redirect.RawQuery != "" || redirect.Fragment != "" {
+				return fmt.Errorf("auth.oidc.redirect_url must use /auth/callback without query or fragment")
+			}
+		}
 	}
 	return nil
 }

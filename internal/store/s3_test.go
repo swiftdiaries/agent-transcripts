@@ -94,6 +94,62 @@ func TestS3MetadataUsesETagCAS(t *testing.T) {
 	}
 }
 
+func TestS3UpdateMetadataRecoversAfterMetadataWriteResponseLoss(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod").(*S3)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorTitle := got.Metadata.Title
+	got.Metadata.Title = "recovered"
+	metadataKey := "prod/users/ada/" + p.ID + "/metadata/" + metadataRevision(metadataWithoutRevision(got.Metadata)) + ".json"
+	fake.failAfterPut(metadataKey, errors.New("response lost"))
+	if _, err := s.UpdateMetadata(context.Background(), p.ID, got.Metadata.Revision, got.Metadata); err == nil {
+		t.Fatal("wanted response loss")
+	}
+	// The old manifest remains readable even though the versioned write happened.
+	still, err := s.GetSession(context.Background(), p.ID)
+	if err != nil || still.Metadata.Title != priorTitle {
+		t.Fatalf("after loss = %+v, %v", still.Metadata, err)
+	}
+	if revision, err := s.UpdateMetadata(context.Background(), p.ID, got.Metadata.Revision, got.Metadata); err != nil || revision != metadataRevision(metadataWithoutRevision(got.Metadata)) {
+		t.Fatalf("retry revision=%q err=%v", revision, err)
+	}
+	updated, err := s.GetSession(context.Background(), p.ID)
+	if err != nil || updated.Metadata.Title != "recovered" {
+		t.Fatalf("updated = %+v, %v", updated.Metadata, err)
+	}
+}
+
+func TestS3UpdateMetadataAcceptsManifestResponseLossWhenCommitted(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod").(*S3)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Metadata.Title = "committed despite response loss"
+	manifestKey := "prod/users/ada/" + p.ID + "/manifest.json"
+	fake.failAfterPut(manifestKey, errors.New("response lost"))
+	want := metadataRevision(metadataWithoutRevision(got.Metadata))
+	if revision, err := s.UpdateMetadata(context.Background(), p.ID, got.Metadata.Revision, got.Metadata); err != nil || revision != want {
+		t.Fatalf("revision=%q err=%v", revision, err)
+	}
+	updated, err := s.GetSession(context.Background(), p.ID)
+	if err != nil || updated.Metadata.Revision != want || updated.Metadata.Title != got.Metadata.Title {
+		t.Fatalf("updated=%+v err=%v", updated.Metadata, err)
+	}
+}
+
 func TestS3CreateProjectListsEmptyProject(t *testing.T) {
 	s := NewS3(newFakeS3(), "bucket", "prod")
 	if err := s.CreateProject(context.Background(), "demo"); err != nil {

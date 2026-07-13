@@ -287,6 +287,44 @@ func TestServeHandlerComposesHostedOIDCWithoutListener(t *testing.T) {
 	}
 }
 
+func TestServeHandlerComposesConfiguredS3Store(t *testing.T) {
+	cfg := config.Config{Mode: "local", QuietPeriod: 5 * time.Minute, Storage: config.Storage{Type: "s3", Bucket: "transcripts", Prefix: "prod", Region: "us-east-1", Endpoint: "https://s3.example.test"}}
+	called := false
+	_, err := serveHandlerWithStoreFactory(context.Background(), cfg, func(ctx context.Context, got config.Storage) (store.Store, error) {
+		called = true
+		if got.Bucket != "transcripts" || got.Prefix != "prod" || got.Region != "us-east-1" || got.Endpoint != "https://s3.example.test" {
+			t.Fatalf("storage = %+v", got)
+		}
+		return store.NewS3(newFakeS3ForCLI(), got.Bucket, got.Prefix), nil
+	})
+	if err != nil || !called {
+		t.Fatalf("called=%v err=%v", called, err)
+	}
+}
+
+// newFakeS3ForCLI only proves composition selects S3; store behavior remains
+// covered in the store package's fake-backed tests.
+func newFakeS3ForCLI() store.S3API { return &cliS3{} }
+
+type cliS3 struct{}
+
+func (*cliS3) GetObject(context.Context, string, string) (store.S3Object, error) {
+	return store.S3Object{}, store.ErrS3NotFound
+}
+func (*cliS3) HeadObject(context.Context, string, string) (store.S3Object, error) {
+	return store.S3Object{}, store.ErrS3NotFound
+}
+func (*cliS3) PutObject(context.Context, string, string, []byte, store.S3Condition) (string, error) {
+	return "etag", nil
+}
+func (*cliS3) CopyObject(context.Context, string, string, string, store.S3Condition) (string, error) {
+	return "etag", nil
+}
+func (*cliS3) DeleteObject(context.Context, string, string, store.S3Condition) error { return nil }
+func (*cliS3) ListObjectsV2(context.Context, string, string, string) (store.S3ListPage, error) {
+	return store.S3ListPage{}, nil
+}
+
 func TestServeHandlerUsesConfiguredSourceRoots(t *testing.T) {
 	root := t.TempDir()
 	source, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))

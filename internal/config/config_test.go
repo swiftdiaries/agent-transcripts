@@ -164,6 +164,28 @@ func TestHostedOIDCLoadsClientSecretFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestHostedOIDCRedirectURLMustBeExternalCallback(t *testing.T) {
+	setHostedKeys(t)
+	t.Setenv("OIDC_CLIENT_SECRET", "secret")
+	for _, test := range []struct{ name, redirect, want string }{
+		{"http", "http://transcripts.example.com/auth/callback", "https"},
+		{"other host", "https://evil.example.com/auth/callback", "external_origin"},
+		{"wrong path", "https://transcripts.example.com/other", "auth/callback"},
+		{"valid", "https://transcripts.example.com/auth/callback", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			yaml := strings.Replace(hostedOIDCYAML(), "    client_secret_env: OIDC_CLIENT_SECRET\n", "    client_secret_env: OIDC_CLIENT_SECRET\n    redirect_url: "+test.redirect+"\n", 1)
+			_, err := Load(writeTempConfig(t, yaml), Overrides{})
+			if test.want == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.want != "" && (err == nil || !strings.Contains(err.Error(), test.want)) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
 func setHostedKeys(t *testing.T) {
 	t.Helper()
 	t.Setenv("COOKIE_KEY", strings.Repeat("c", 32))

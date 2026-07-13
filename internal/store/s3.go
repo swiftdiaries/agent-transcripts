@@ -76,7 +76,9 @@ func (s *S3) key(d session.Directory, id, name string) (string, error) {
 	switch name {
 	case "manifest.json", "metadata.json", "session.json", "source-facts.json", "source.jsonl", "normalized.json":
 	default:
-		return "", errors.New("invalid managed filename")
+		if !validMetadataKey(name) {
+			return "", errors.New("invalid managed filename")
+		}
 	}
 	return s.prefix + d.Kind + "/" + d.Slug + "/" + id + "/" + name, nil
 }
@@ -379,7 +381,8 @@ func (s *S3) UpdateMetadata(ctx context.Context, id, expected string, md session
 	}
 	md.Revision = metadataRevision(md)
 	data := mustJSON(md)
-	current, metaETag, err := readS3JSON[session.Metadata](ctx, s, m, "metadata.json")
+	metadataName := metadataObjectName(m)
+	current, _, err := readS3JSON[session.Metadata](ctx, s, m, metadataName)
 	if err != nil {
 		return "", err
 	}
@@ -389,30 +392,33 @@ func (s *S3) UpdateMetadata(ctx context.Context, id, expected string, md session
 	if current.Revision != expected && current.Revision != md.Revision {
 		return "", ErrConflict
 	}
-	key, _ := s.key(m.Destination, m.ID, "metadata.json")
-	var putErr error
-	if current.Revision == expected {
-		_, putErr = s.client.PutObject(ctx, s.bucket, key, data, S3Condition{IfMatch: metaETag})
+	if current.Revision != expected && current.Revision == md.Revision {
+		return md.Revision, nil
 	}
-	observed, _, err := readS3JSON[session.Metadata](ctx, s, m, "metadata.json")
-	if err != nil || observed.Revision != md.Revision {
-		if err != nil {
-			return "", err
-		}
-		if putErr != nil && !errors.Is(putErr, ErrS3PreconditionFailed) {
+	keyName := "metadata/" + md.Revision + ".json"
+	key, _ := s.key(m.Destination, m.ID, keyName)
+	if _, putErr := s.client.PutObject(ctx, s.bucket, key, data, S3Condition{IfNoneMatch: true}); putErr != nil {
+		if !errors.Is(putErr, ErrS3PreconditionFailed) {
 			return "", putErr
 		}
-		return "", ErrConflict
+		existing, getErr := s.get(ctx, key, keyName)
+		if getErr != nil {
+			return "", getErr
+		}
+		if checksum(existing.Body) != checksum(data) {
+			return "", ErrConflict
+		}
 	}
 	m.MetadataHash = checksum(data)
 	m.MetadataRevision = md.Revision
+	m.MetadataKey = keyName
 	manifestKey, _ := s.key(m.Destination, m.ID, "manifest.json")
 	if _, err = s.client.PutObject(ctx, s.bucket, manifestKey, mustJSON(m), S3Condition{IfMatch: manifestETag}); err != nil {
 		winner, _, e := s.readManifest(ctx, m.Destination, m.ID)
 		if e != nil {
 			return "", err
 		}
-		if winner.MetadataRevision != md.Revision || winner.MetadataHash != checksum(data) {
+		if winner.MetadataRevision != md.Revision || winner.MetadataHash != checksum(data) || winner.MetadataKey != keyName {
 			if !errors.Is(err, ErrS3PreconditionFailed) {
 				return "", err
 			}
@@ -420,6 +426,15 @@ func (s *S3) UpdateMetadata(ctx context.Context, id, expected string, md session
 		}
 	}
 	return md.Revision, nil
+}
+
+func metadataWithoutRevision(md session.Metadata) session.Metadata { md.Revision = ""; return md }
+
+func metadataObjectName(m manifest) string {
+	if m.MetadataKey != "" {
+		return m.MetadataKey
+	}
+	return "metadata.json"
 }
 
 func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Directory, expectedRevision string) (session.Metadata, error) {
@@ -650,7 +665,7 @@ func (s *S3) DeleteSession(ctx context.Context, id, uploader string, expectedRev
 	if err != nil {
 		return err
 	}
-	md, _, err := readS3JSON[session.Metadata](ctx, s, m, "metadata.json")
+	md, _, err := readS3JSON[session.Metadata](ctx, s, m, metadataObjectName(m))
 	if err != nil {
 		return err
 	}
@@ -814,7 +829,8 @@ func readS3JSON[T any](ctx context.Context, s *S3, m manifest, name string) (T, 
 	return v, o.ETag, err
 }
 func (s *S3) readPackage(ctx context.Context, m manifest) (session.Package, error) {
-	md, _, err := readS3JSON[session.Metadata](ctx, s, m, "metadata.json")
+	metadataName := metadataObjectName(m)
+	md, _, err := readS3JSON[session.Metadata](ctx, s, m, metadataName)
 	if err != nil {
 		return session.Package{}, err
 	}
@@ -839,7 +855,7 @@ func (s *S3) readPackage(ctx context.Context, m manifest) (session.Package, erro
 	if checksum(src.Body) != m.Files["source.jsonl"] || checksum(norm.Body) != m.Files["normalized.json"] {
 		return session.Package{}, errors.New("package file hash mismatch")
 	}
-	for _, pair := range []struct{ name, want string }{{"metadata.json", m.MetadataHash}, {"session.json", m.SessionHash}, {"source-facts.json", m.SourceFactsHash}} {
+	for _, pair := range []struct{ name, want string }{{metadataName, m.MetadataHash}, {"session.json", m.SessionHash}, {"source-facts.json", m.SourceFactsHash}} {
 		key, _ := s.key(m.Destination, m.ID, pair.name)
 		o, e := s.get(ctx, key, pair.name)
 		if e != nil || checksum(o.Body) != pair.want {

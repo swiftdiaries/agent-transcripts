@@ -50,7 +50,8 @@ type oidcSession struct {
 
 func NewOIDC(cfg OIDCConfig) (*OIDC, error) {
 	u, err := url.Parse(cfg.Issuer)
-	if err != nil || (u.Scheme != "https" && !cfg.AllowInsecureTest) || u.Host == "" || cfg.ClientID == "" || cfg.ClientSecret == "" || cfg.RedirectURL == "" || len(cfg.CookieKeys) == 0 || len(cfg.CookieKeys[0]) < 32 {
+	redirect, redirectErr := url.Parse(cfg.RedirectURL)
+	if err != nil || redirectErr != nil || (u.Scheme != "https" && !cfg.AllowInsecureTest) || u.Host == "" || redirect.Scheme != "https" || redirect.Host == "" || redirect.Path != "/auth/callback" || redirect.RawQuery != "" || redirect.Fragment != "" || cfg.ClientID == "" || cfg.ClientSecret == "" || len(cfg.CookieKeys) == 0 || len(cfg.CookieKeys[0]) < 32 {
 		return nil, errors.New("invalid OIDC configuration")
 	}
 	for _, k := range cfg.CookieKeys {
