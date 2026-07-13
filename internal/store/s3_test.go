@@ -144,16 +144,44 @@ func TestS3UpdateRetriesAfterCommittedManifestResponseLoss(t *testing.T) {
 	}
 }
 
+func TestS3MoveRetriesAfterCommittedSourceManifestDeleteResponseLoss(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	dest := session.Directory{Kind: "projects", Slug: "demo"}
+	fake.failAfterDelete("prod/users/ada/"+p.ID+"/manifest.json", errors.New("response lost"))
+	if _, err := s.MoveSession(context.Background(), p.ID, "ada", dest); err == nil {
+		t.Fatal("wanted response-loss error")
+	}
+	got, err := s.MoveSession(context.Background(), p.ID, "ada", dest)
+	if err != nil {
+		t.Fatalf("retry = %v", err)
+	}
+	if got.ID != session.PackageID(p.ContentID, dest) {
+		t.Fatalf("destination id = %q", got.ID)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("source = %v", err)
+	}
+	if _, err := s.GetSession(context.Background(), got.ID); err != nil {
+		t.Fatalf("destination = %v", err)
+	}
+}
+
 type fakeS3 struct {
-	mu       sync.Mutex
-	objects  map[string]S3Object
-	puts     []string
-	sequence int
-	afterPut map[string]error
+	mu          sync.Mutex
+	objects     map[string]S3Object
+	puts        []string
+	sequence    int
+	afterPut    map[string]error
+	afterDelete map[string]error
 }
 
 func newFakeS3() *fakeS3 {
-	return &fakeS3{objects: map[string]S3Object{}, afterPut: map[string]error{}}
+	return &fakeS3{objects: map[string]S3Object{}, afterPut: map[string]error{}, afterDelete: map[string]error{}}
 }
 func fakeKey(bucket, key string) string { return bucket + "\x00" + key }
 func (f *fakeS3) GetObject(_ context.Context, bucket, key string) (S3Object, error) {
@@ -192,6 +220,11 @@ func (f *fakeS3) failAfterPut(key string, err error) {
 	defer f.mu.Unlock()
 	f.afterPut[key] = err
 }
+func (f *fakeS3) failAfterDelete(key string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterDelete[key] = err
+}
 func (f *fakeS3) CopyObject(_ context.Context, bucket, src, dst string, c S3Condition) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -221,6 +254,10 @@ func (f *fakeS3) DeleteObject(_ context.Context, bucket, key string, c S3Conditi
 		return ErrS3PreconditionFailed
 	}
 	delete(f.objects, objectKey)
+	if err := f.afterDelete[key]; err != nil {
+		delete(f.afterDelete, key)
+		return err
+	}
 	return nil
 }
 func (f *fakeS3) ListObjectsV2(_ context.Context, _, prefix, token string) (S3ListPage, error) {
