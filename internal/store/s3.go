@@ -248,9 +248,24 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 			}
 			if _, e = s.client.PutObject(ctx, s.bucket, metadataKey, files["metadata.json"], S3Condition{IfMatch: existing.ETag}); e != nil {
 				if errors.Is(e, ErrS3PreconditionFailed) {
-					return false, ErrConflict
+					current, ce := s.get(ctx, metadataKey, "metadata.json")
+					if ce != nil {
+						return false, ce
+					}
+					if checksum(current.Body) != checksum(files["metadata.json"]) {
+						if _, ce = s.client.HeadObject(ctx, s.bucket, manifestKey); ce == nil {
+							winner, _, we := s.readManifest(ctx, p.Metadata.Destination, p.ID)
+							if we != nil {
+								return false, we
+							}
+							return s.identical(ctx, winner, p)
+						}
+						return false, ErrConflict
+					}
 				}
-				return false, e
+				if !errors.Is(e, ErrS3PreconditionFailed) {
+					return false, e
+				}
 			}
 		}
 	}

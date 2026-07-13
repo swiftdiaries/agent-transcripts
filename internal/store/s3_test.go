@@ -408,6 +408,44 @@ func TestS3ReclaimClaimDeleteResponseLossDoesNotBreakIdempotency(t *testing.T) {
 	}
 }
 
+func TestS3ConcurrentIdenticalReclaimersConverge(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(context.Background(), p.ID, "ada"); err != nil {
+		t.Fatal(err)
+	}
+	reput := p
+	reput.Metadata.Title = "reclaimed"
+	start := make(chan struct{})
+	results := make(chan struct {
+		created bool
+		err     error
+	}, 2)
+	for range 2 {
+		go func() {
+			<-start
+			created, err := s.PutSession(context.Background(), reput)
+			results <- struct {
+				created bool
+				err     error
+			}{created, err}
+		}()
+	}
+	close(start)
+	a, b := <-results, <-results
+	if a.err != nil || b.err != nil || a.created == b.created {
+		t.Fatalf("results=%+v %+v", a, b)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil || got.Metadata.Title != "reclaimed" {
+		t.Fatalf("got=%+v,%v", got.Metadata, err)
+	}
+}
+
 type fakeS3 struct {
 	mu                   sync.Mutex
 	objects              map[string]S3Object
