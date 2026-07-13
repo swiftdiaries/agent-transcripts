@@ -112,6 +112,13 @@ func TestLoadRejectsInvalidUploadLimits(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsEmptySourceRoot(t *testing.T) {
+	_, err := Load(writeTempConfig(t, "mode: local\nsource_roots: [\"\"]\n"), Overrides{})
+	if err == nil || !strings.Contains(err.Error(), "source_roots") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestS3StorageRejectsInvalidEndpoint(t *testing.T) {
 	_, err := Load(writeTempConfig(t, "mode: local\nstorage:\n  type: s3\n  bucket: transcripts\n  endpoint: not-a-url\n"), Overrides{})
 	if err == nil || !strings.Contains(err.Error(), "storage.endpoint") {

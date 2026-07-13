@@ -1,0 +1,27 @@
+# Container-ready hosted filesystem mode. Terminate TLS and authenticate at the
+# reverse proxy; only the proxy network may reach this listener.
+mode: hosted
+listen: 0.0.0.0:8080
+external_origin: https://transcripts.example.com
+quiet_period: 5m
+storage:
+  type: filesystem
+  root: /var/lib/agent-transcripts
+auth:
+  type: proxy
+  proxy:
+    user_header: X-Forwarded-User
+    name_header: X-Forwarded-Name
+trusted_proxy_cidrs:
+  - 10.42.0.0/16
+cookie_key_envs:
+  - AGENT_TRANSCRIPTS_COOKIE_KEY_CURRENT
+  - AGENT_TRANSCRIPTS_COOKIE_KEY_PREVIOUS
+token_key_env: AGENT_TRANSCRIPTS_TOKEN_KEY
+upload_limits:
+  source_bytes: 67108864
+  record_bytes: 16777216
+  title_bytes: 200
+  description_bytes: 4096
+  tags: 20
+  tag_bytes: 64

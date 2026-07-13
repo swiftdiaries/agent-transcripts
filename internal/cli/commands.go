@@ -31,6 +31,8 @@ import (
 
 const Version = "dev"
 
+const productName = "agent-transcripts"
+
 // Dependencies contains the production collaborators used by process-facing
 // commands. It permits an embedding application to compose the CLI with its
 // own store without replacing the application services it calls.
@@ -60,7 +62,7 @@ func (deps Dependencies) Run(ctx context.Context, args []string, input *os.File,
 	case "help":
 		return usage(stdout)
 	case "version":
-		_, _ = fmt.Fprintln(stdout, Version)
+		_, _ = fmt.Fprintf(stdout, "%s %s\n", productName, Version)
 		return 0
 	case "import":
 		return runImportWithLibrary(ctx, args[1:], input, stdout, stderr, deps.Library)
@@ -277,7 +279,7 @@ func runServeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writ
 
 func serveHandler(cfg config.Config) (http.Handler, error) {
 	st := store.NewFilesystem(cfg.Storage.Root)
-	base := web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: defaultRoots(), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode}
+	base := web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: rootsForConfig(cfg), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode}
 	if cfg.Mode == "local" {
 		return web.New(base), nil
 	}
@@ -442,6 +444,17 @@ func isInteractiveInput(file *os.File) bool {
 func defaultRoots() discovery.Roots {
 	home, _ := os.UserHomeDir()
 	return discovery.Roots{Claude: []string{filepath.Join(home, ".claude", "projects")}, Codex: []string{filepath.Join(home, ".codex", "sessions"), filepath.Join(home, ".codex", "archived_sessions")}}
+}
+
+// rootsForConfig uses configured roots for both adapters. Each adapter applies
+// its provider-specific filename and parser checks, so a shared root supports a
+// combined archive without trusting a path name to identify its provider.
+func rootsForConfig(cfg config.Config) discovery.Roots {
+	if len(cfg.SourceRoots) == 0 {
+		return defaultRoots()
+	}
+	roots := append([]string(nil), cfg.SourceRoots...)
+	return discovery.Roots{Claude: roots, Codex: roots}
 }
 
 func filterCandidates(candidates []discovery.Candidate, opts importOptions) []discovery.Candidate {

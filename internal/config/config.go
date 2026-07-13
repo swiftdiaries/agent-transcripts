@@ -199,6 +199,11 @@ func (cfg Config) validate() error {
 	if err := cfg.UploadLimits.validate(); err != nil {
 		return err
 	}
+	for _, root := range cfg.SourceRoots {
+		if root == "" {
+			return errors.New("source_roots must not contain empty paths")
+		}
+	}
 	if cfg.Auth.Type != "local" && cfg.Auth.Type != "proxy" && cfg.Auth.Type != "oidc" {
 		return fmt.Errorf("auth.type must be local, proxy, or oidc")
 	}

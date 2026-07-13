@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,6 +132,16 @@ func TestRunRecognizesCommands(t *testing.T) {
 				t.Fatalf("exit code = %d", got)
 			}
 		})
+	}
+}
+
+func TestVersionPrintsProductAndBuildVersion(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if got := Run(context.Background(), []string{"version"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", got, stderr.String())
+	}
+	if got, want := stdout.String(), "agent-transcripts dev\n"; got != want {
+		t.Fatalf("version output = %q, want %q", got, want)
 	}
 }
 
@@ -273,6 +284,32 @@ func TestServeHandlerComposesHostedOIDCWithoutListener(t *testing.T) {
 	}
 	if _, err := serveHandler(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServeHandlerUsesConfiguredSourceRoots(t *testing.T) {
+	root := t.TempDir()
+	source, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "claude-session.jsonl"), source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Mode:        "local",
+		QuietPeriod: 5 * time.Minute,
+		Storage:     config.Storage{Type: "filesystem", Root: t.TempDir()},
+		SourceRoots: []string{root},
+	}
+	h, err := serveHandler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "/live", nil))
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), "Fix the parser") {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
 	}
 }
 

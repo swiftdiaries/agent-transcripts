@@ -17,7 +17,9 @@ Local mode listens on `127.0.0.1:8080` and discovers sessions from
 `~/.claude/projects`, `~/.codex/sessions`, and `~/.codex/archived_sessions`.
 Visit the displayed local URL to browse live and library pages. Use
 `agent-transcripts serve --config config.example.yaml` to customize local roots,
-quiet period, or the filesystem library root.
+quiet period, or the filesystem library root. A non-empty `source_roots` list is
+a combined discovery root list: both provider adapters inspect every listed root
+and retain only files that pass their provider-specific checks.
 
 Import creates an immutable library package only after completion is revalidated:
 
@@ -84,18 +86,30 @@ remove it. Rotate `token_key_env` separately; it invalidates existing bearer tok
 ### Container
 
 The Docker image is a static Linux binary in a digest-pinned, non-root distroless
-runtime. Filesystem mode is the only mode requiring a writable application volume:
+runtime. `config.container.example.yaml` is a container-ready hosted filesystem
+configuration: it listens on `0.0.0.0:8080` and writes to
+`/var/lib/agent-transcripts`. Filesystem mode is the only mode requiring a writable
+application volume. Set the named variables in the host or deployment secret
+manager before running; the command forwards their values without placing them in
+the command or YAML.
 
 ```sh
 docker build -t agent-transcripts:test .
 docker run --rm -p 127.0.0.1:8080:8080 \
+  --env AGENT_TRANSCRIPTS_COOKIE_KEY_CURRENT \
+  --env AGENT_TRANSCRIPTS_COOKIE_KEY_PREVIOUS \
+  --env AGENT_TRANSCRIPTS_TOKEN_KEY \
   -v "$PWD/agent-transcripts-library:/var/lib/agent-transcripts" \
-  -v "$PWD/config.yaml:/etc/agent-transcripts/config.yaml:ro" \
+  -v "$PWD/config.container.example.yaml:/etc/agent-transcripts/config.yaml:ro" \
   agent-transcripts:test serve --config /etc/agent-transcripts/config.yaml
 docker image inspect agent-transcripts:test --format '{{.Config.User}}'
 ```
 
-The final command should report the non-root runtime user.
+The published host port reaches the container's `0.0.0.0:8080` listener. The
+reverse proxy, rather than direct clients, must be placed on the forwarded port;
+the final command should report the non-root runtime user. For an OIDC deployment,
+also set `AGENT_TRANSCRIPTS_OIDC_CLIENT_SECRET` and use the OIDC block from
+`config.example.yaml`.
 
 ## Claude and Skills installations
 
