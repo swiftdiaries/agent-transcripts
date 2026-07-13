@@ -31,7 +31,28 @@ import (
 
 const Version = "dev"
 
+// Dependencies contains the production collaborators used by process-facing
+// commands. It permits an embedding application to compose the CLI with its
+// own store without replacing the application services it calls.
+type Dependencies struct {
+	Library store.Store
+}
+
+// DefaultDependencies provides the filesystem-backed composition used by the
+// standalone binary.
+func DefaultDependencies() Dependencies {
+	return Dependencies{Library: store.NewFilesystem("agent-transcripts-library")}
+}
+
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return DefaultDependencies().Run(ctx, args, os.Stdin, stdout, stderr)
+}
+
+// Run executes the command using the supplied production collaborators.
+func (deps Dependencies) Run(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer) int {
+	if deps.Library == nil {
+		deps.Library = DefaultDependencies().Library
+	}
 	if len(args) == 0 {
 		return usage(stdout)
 	}
@@ -42,11 +63,21 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stdout, Version)
 		return 0
 	case "import":
-		return runImport(ctx, args[1:], os.Stdin, stdout, stderr)
+		return runImportWithLibrary(ctx, args[1:], input, stdout, stderr, deps.Library)
 	case "serve":
 		return runServe(ctx, args[1:], stdout, stderr)
 	case "upload":
-		return runUpload(ctx, args[1:], os.Stdin, stdout, stderr)
+		return runUploadWithDeps(ctx, args[1:], input, stdout, stderr, uploadDeps{
+			library:     deps.Library,
+			interactive: isInteractiveInput,
+			getenv:      os.Getenv,
+			readPassword: func(fd int) ([]byte, error) {
+				return term.ReadPassword(fd)
+			},
+			upload: func(ctx context.Context, server string, req publish.Request, token string) (publish.Result, error) {
+				return (publish.Client{BaseURL: server, Token: token}).Upload(ctx, req)
+			},
+		})
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return 2
@@ -94,17 +125,7 @@ func parseUploadDestination(value string) (session.Directory, error) {
 }
 
 func runUpload(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer) int {
-	return runUploadWithDeps(ctx, args, input, stdout, stderr, uploadDeps{
-		library:     store.NewFilesystem("agent-transcripts-library"),
-		interactive: isInteractiveInput,
-		getenv:      os.Getenv,
-		readPassword: func(fd int) ([]byte, error) {
-			return term.ReadPassword(fd)
-		},
-		upload: func(ctx context.Context, server string, req publish.Request, token string) (publish.Result, error) {
-			return (publish.Client{BaseURL: server, Token: token}).Upload(ctx, req)
-		},
-	})
+	return DefaultDependencies().Run(ctx, append([]string{"upload"}, args...), input, stdout, stderr)
 }
 
 // uploadDeps keeps terminal and transport effects injectable for tests while
@@ -353,6 +374,10 @@ func parseImportArgs(args []string) (importOptions, error) {
 }
 
 func runImport(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer) int {
+	return runImportWithLibrary(ctx, args, input, stdout, stderr, DefaultDependencies().Library)
+}
+
+func runImportWithLibrary(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer, libraryStore store.Store) int {
 	opts, err := parseImportArgs(args)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -368,7 +393,7 @@ func runImport(ctx context.Context, args []string, input *os.File, stdout, stder
 			_, _ = fmt.Fprintln(stderr, "source does not match --provider")
 			return 1
 		}
-		return emitEligible(ctx, candidate, stdout, stderr)
+		return emitEligibleWithLibrary(ctx, candidate, stdout, stderr, libraryStore)
 	}
 	interactive := isInteractiveInput(input)
 	if !opts.latest && !interactive {
@@ -386,7 +411,7 @@ func runImport(ctx context.Context, args []string, input *os.File, stdout, stder
 		return 1
 	}
 	if opts.latest {
-		return emitEligible(ctx, candidates[0], stdout, stderr)
+		return emitEligibleWithLibrary(ctx, candidates[0], stdout, stderr, libraryStore)
 	}
 	for i, candidate := range candidates {
 		_, _ = fmt.Fprintf(stdout, "%d) %s  %s  %s\n", i+1, candidate.Provider, candidate.Project, candidate.Title)
@@ -403,7 +428,7 @@ func runImport(ctx context.Context, args []string, input *os.File, stdout, stder
 		return 2
 	}
 	for _, index := range indexes {
-		if code := emitEligible(ctx, candidates[index], stdout, stderr); code != 0 {
+		if code := emitEligibleWithLibrary(ctx, candidates[index], stdout, stderr, libraryStore); code != 0 {
 			return code
 		}
 	}
@@ -455,13 +480,17 @@ func parseSelections(value string, maximum int) ([]int, error) {
 }
 
 func emitEligible(ctx context.Context, candidate discovery.Candidate, stdout, stderr io.Writer) int {
+	return emitEligibleWithLibrary(ctx, candidate, stdout, stderr, DefaultDependencies().Library)
+}
+
+func emitEligibleWithLibrary(ctx context.Context, candidate discovery.Candidate, stdout, stderr io.Writer, libraryStore store.Store) int {
 	reader, facts, err := discovery.OpenEligible(candidate)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	defer reader.Close()
-	svc := library.New(store.NewFilesystem("agent-transcripts-library"), library.AllowLocalQuietEvidence())
+	svc := library.New(libraryStore, library.AllowLocalQuietEvidence())
 	metadata, err := svc.Import(ctx, reader, facts, library.ImportAttrs{
 		Destination: session.Directory{Kind: "users", Slug: "local"},
 		UploaderKey: "local",
