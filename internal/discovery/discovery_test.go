@@ -65,6 +65,28 @@ func TestFormFamiliesGroupsClaudeChildrenUnderMain(t *testing.T) {
 	}
 }
 
+func TestDiscoverFamiliesFiltersToProjectScope(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "inside")
+	outside := t.TempDir()
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeSession(t, filepath.Join(root, "one.jsonl"), `{"type":"user","sessionId":"one","cwd":"`+inside+`","message":{"content":"inside"}}`, 10*time.Minute)
+	writeSession(t, filepath.Join(root, "two.jsonl"), `{"type":"user","sessionId":"two","cwd":"`+outside+`","message":{"content":"outside"}}`, 10*time.Minute)
+	scope, err := ResolveProjectScope(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DiscoverFamilies(context.Background(), Roots{Claude: []string{root}}, scope, fixedNow, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != "one" {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
 func TestDiscoverSortsTiesByPath(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"z.jsonl", "a.jsonl"} {

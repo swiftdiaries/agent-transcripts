@@ -1,13 +1,16 @@
 package discovery
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/parser"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
 
@@ -62,6 +65,33 @@ func FormFamilies(candidates []Candidate, scope session.ProjectScope) ([]Session
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Key < result[j].Key })
 	return result, nil
+}
+
+// DiscoverFamilies applies current-project authorization before returning a
+// provider family. It intentionally re-parses candidates to obtain provider
+// CWD provenance rather than trusting encoded directory names.
+func DiscoverFamilies(ctx context.Context, roots Roots, scope session.ProjectScope, now time.Time, quiet time.Duration) ([]SessionFamilyCandidate, error) {
+	candidates, err := Discover(ctx, roots, now, quiet)
+	if err != nil {
+		return nil, err
+	}
+	eligible := make([]Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		f, err := os.Open(candidate.Path)
+		if err != nil {
+			continue
+		}
+		parsed, parseErr := parser.DefaultRegistry().DetectAndParse(ctx, f)
+		_ = f.Close()
+		if parseErr != nil || parsed.WorkingDirectory == "" {
+			continue
+		}
+		memberScope, scopeErr := ResolveProjectScope(parsed.WorkingDirectory)
+		if scopeErr == nil && memberScope.Ref.Key == scope.Ref.Key {
+			eligible = append(eligible, candidate)
+		}
+	}
+	return FormFamilies(eligible, scope)
 }
 
 func claudeChildIdentity(path string) string {
