@@ -37,6 +37,21 @@ func TestDiscoverMergesNewestFirst(t *testing.T) {
 	}
 }
 
+func TestResolveProjectScopeUsesDirectoryFallback(t *testing.T) {
+	root := t.TempDir()
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := ResolveProjectScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Ref.Kind != "directory" || scope.CanonicalRoot != canonical || !strings.HasPrefix(scope.Ref.Key, "p_") {
+		t.Fatalf("scope = %#v", scope)
+	}
+}
+
 func TestDiscoverSortsTiesByPath(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"z.jsonl", "a.jsonl"} {
