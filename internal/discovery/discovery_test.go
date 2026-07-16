@@ -87,6 +87,30 @@ func TestDiscoverFamiliesFiltersToProjectScope(t *testing.T) {
 	}
 }
 
+func TestSnapshotFamilyCopiesMainAndChildren(t *testing.T) {
+	root := t.TempDir()
+	mainPath := filepath.Join(root, "main.jsonl")
+	childPath := filepath.Join(root, "main", "subagents", "agent-1.jsonl")
+	data := `{"type":"user","sessionId":"main","message":{"content":"hello"}}`
+	writeSession(t, mainPath, data, 10*time.Minute)
+	writeSession(t, childPath, data, 10*time.Minute)
+	main, err := InspectPath(context.Background(), mainPath, fixedNow, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := InspectPath(context.Background(), childPath, fixedNow, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := SnapshotFamily(SessionFamilyCandidate{Main: SourceCandidate{Candidate: main}, Children: []ChildSourceCandidate{{Candidate: child, AgentID: "1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sources) != 2 || string(got.Sources[0].Bytes) != data {
+		t.Fatalf("snapshot = %#v", got)
+	}
+}
+
 func TestDiscoverSortsTiesByPath(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"z.jsonl", "a.jsonl"} {
