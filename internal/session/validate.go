@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -88,6 +89,90 @@ func Validate(s Session) error {
 		}
 	}
 	return nil
+}
+
+func ValidateFamily(f SessionFamily) error {
+	if f.SchemaVersion != 2 {
+		return fmt.Errorf("family schema version must be 2")
+	}
+	if err := validateID("family ID", f.ID); err != nil {
+		return err
+	}
+	if !providerPattern.MatchString(f.Provider) || f.ProviderSessionID == "" || f.ProviderSessionID != f.ID {
+		return fmt.Errorf("invalid family provider identity")
+	}
+	if f.Project.Kind != "git_worktree" && f.Project.Kind != "directory" && f.Project.Kind != "unresolved" {
+		return fmt.Errorf("invalid project kind")
+	}
+	if !hasManagedID(f.Project.Key, "p_") || strings.TrimSpace(f.Project.DisplayName) == "" {
+		return fmt.Errorf("invalid project reference")
+	}
+	if err := Validate(f.Main); err != nil {
+		return fmt.Errorf("main: %w", err)
+	}
+	if f.Main.Provider != f.Provider || f.Main.ProviderSessionID != "" && f.Main.ProviderSessionID != f.ProviderSessionID {
+		return fmt.Errorf("main provider identity mismatch")
+	}
+	if len(f.Children)+1 > MaxFamilySources {
+		return fmt.Errorf("family exceeds %d sources", MaxFamilySources)
+	}
+	members := []Session{f.Main}
+	seen := make(map[string]struct{}, len(f.Children))
+	for i, child := range f.Children {
+		if err := validateID("child agent ID", child.AgentID); err != nil {
+			return fmt.Errorf("child %d: %w", i, err)
+		}
+		if _, ok := seen[child.AgentID]; ok {
+			return fmt.Errorf("duplicate child agent ID")
+		}
+		seen[child.AgentID] = struct{}{}
+		if child.Attached != (child.ParentToolCallID != "") {
+			return fmt.Errorf("child attachment mismatch")
+		}
+		if err := Validate(child.Session); err != nil {
+			return fmt.Errorf("child %d: %w", i, err)
+		}
+		if child.Session.Provider != f.Provider || child.Session.ProviderSessionID != "" && child.Session.ProviderSessionID != f.ProviderSessionID {
+			return fmt.Errorf("child provider identity mismatch")
+		}
+		members = append(members, child.Session)
+	}
+	start, end, last := derivedFamilyTimes(members)
+	if !f.StartedAt.Equal(start) || !f.EndedAt.Equal(end) || !f.Completion.LastEventAt.Equal(last) {
+		return fmt.Errorf("family timestamps are not derived")
+	}
+	allTerminal := true
+	for _, member := range members {
+		allTerminal = allTerminal && member.Completion.Terminal
+	}
+	if allTerminal {
+		if f.Completion.Status != "provider_terminal" || f.Completion.Reason != "all_members_terminal" {
+			return fmt.Errorf("family completion is not derived")
+		}
+	} else if f.Completion.Status != "local_quiet" && f.Completion.Status != "incomplete" {
+		return fmt.Errorf("invalid family completion")
+	}
+	return nil
+}
+
+func derivedFamilyTimes(members []Session) (time.Time, time.Time, time.Time) {
+	var start, end, last time.Time
+	for _, member := range members {
+		if !member.StartedAt.IsZero() && (start.IsZero() || member.StartedAt.Before(start)) {
+			start = member.StartedAt
+		}
+		effectiveEnd := member.EndedAt
+		if effectiveEnd.IsZero() {
+			effectiveEnd = member.Completion.LastEventAt
+		}
+		if !effectiveEnd.IsZero() && (end.IsZero() || effectiveEnd.After(end)) {
+			end = effectiveEnd
+		}
+		if !member.Completion.LastEventAt.IsZero() && (last.IsZero() || member.Completion.LastEventAt.After(last)) {
+			last = member.Completion.LastEventAt
+		}
+	}
+	return start, end, last
 }
 
 func validateEvent(event Event) error {

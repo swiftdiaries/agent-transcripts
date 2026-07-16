@@ -13,6 +13,7 @@ const (
 	MaxTags             = 20
 	MaxTagBytes         = 64
 	MaxUploaderKeyBytes = 256
+	MaxFamilySources    = 256
 )
 
 type EventKind string
@@ -48,6 +49,47 @@ type Completion struct {
 	LastEventAt    time.Time `json:"last_event_at,omitempty"`
 }
 
+// ProjectRef is the persisted, opaque identity of the project that produced a
+// family. CanonicalRoot deliberately belongs only to ProjectScope.
+type ProjectRef struct {
+	Kind        string `json:"kind"`
+	Key         string `json:"key"`
+	DisplayName string `json:"display_name"`
+}
+
+type ProjectScope struct {
+	Ref           ProjectRef
+	CanonicalRoot string
+}
+
+type FamilyCompletion struct {
+	Status      string    `json:"status"`
+	Reason      string    `json:"reason"`
+	LastEventAt time.Time `json:"last_event_at,omitempty"`
+}
+
+type ChildSession struct {
+	AgentID          string  `json:"agent_id"`
+	ParentToolCallID string  `json:"parent_tool_call_id,omitempty"`
+	AgentType        string  `json:"agent_type,omitempty"`
+	Description      string  `json:"description,omitempty"`
+	Attached         bool    `json:"attached"`
+	Session          Session `json:"session"`
+}
+
+type SessionFamily struct {
+	SchemaVersion     int              `json:"schema_version"`
+	ID                string           `json:"id"`
+	Provider          string           `json:"provider"`
+	ProviderSessionID string           `json:"provider_session_id"`
+	Project           ProjectRef       `json:"project"`
+	Main              Session          `json:"main"`
+	Children          []ChildSession   `json:"children"`
+	StartedAt         time.Time        `json:"started_at,omitempty"`
+	EndedAt           time.Time        `json:"ended_at,omitempty"`
+	Completion        FamilyCompletion `json:"completion"`
+}
+
 type Session struct {
 	SchemaVersion     int        `json:"schema_version"`
 	ID                string     `json:"id"`
@@ -70,6 +112,32 @@ type SourceFacts struct {
 	ObservedModTime     time.Time `json:"observed_mod_time,omitempty"`
 	ObservedSize        int64     `json:"observed_size"`
 	QuietPeriodVerified bool      `json:"quiet_period_verified"`
+}
+
+type SourceEntry struct {
+	Role     string `json:"role"`
+	AgentID  string `json:"agent_id,omitempty"`
+	Checksum string `json:"checksum"`
+	Bytes    int64  `json:"bytes"`
+	Name     string `json:"name"`
+}
+
+type SourceManifest struct {
+	SchemaVersion int           `json:"schema_version"`
+	Provider      string        `json:"provider"`
+	SessionID     string        `json:"session_id"`
+	Sources       []SourceEntry `json:"sources"`
+}
+
+type SourceBlob struct {
+	Entry SourceEntry `json:"entry"`
+	Bytes []byte      `json:"-"`
+}
+
+type SourceFactEntry struct {
+	Role    string      `json:"role"`
+	AgentID string      `json:"agent_id,omitempty"`
+	Facts   SourceFacts `json:"facts"`
 }
 
 type Metadata struct {
@@ -101,4 +169,11 @@ type Package struct {
 	Source      []byte      `json:"-"`
 	Normalized  []byte      `json:"-"`
 	SourceFacts SourceFacts `json:"source_facts"`
+	// Family fields are used by schema-v2 packages. The singular fields remain
+	// for schema-v1 compatibility and one-source adapters.
+	SchemaVersion  int               `json:"schema_version,omitempty"`
+	Family         SessionFamily     `json:"family,omitempty"`
+	SourceManifest SourceManifest    `json:"source_manifest,omitempty"`
+	Sources        []SourceBlob      `json:"-"`
+	SourceFactsSet []SourceFactEntry `json:"source_facts_set,omitempty"`
 }

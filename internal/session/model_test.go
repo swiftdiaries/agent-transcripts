@@ -244,6 +244,34 @@ func TestHashInputsAreLengthDelimited(t *testing.T) {
 	}
 }
 
+func TestValidateFamilyDerivesMemberBounds(t *testing.T) {
+	started := time.Unix(5, 0).UTC()
+	ended := time.Unix(30, 0).UTC()
+	family := SessionFamily{
+		SchemaVersion: 2, ID: "family_1", Provider: "claude", ProviderSessionID: "family_1",
+		Project:   ProjectRef{Kind: "git_worktree", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"},
+		Main:      Session{SchemaVersion: 1, ID: "main", Provider: "claude", ProviderSessionID: "family_1", StartedAt: time.Unix(10, 0).UTC(), EndedAt: time.Unix(20, 0).UTC(), Completion: Completion{Terminal: true, TerminalReason: "done", LastEventAt: time.Unix(20, 0).UTC()}},
+		Children:  []ChildSession{{AgentID: "agent_1", Session: Session{SchemaVersion: 1, ID: "child", Provider: "claude", ProviderSessionID: "family_1", StartedAt: started, EndedAt: ended, Completion: Completion{Terminal: true, TerminalReason: "done", LastEventAt: ended}}}},
+		StartedAt: started, EndedAt: ended, Completion: FamilyCompletion{Status: "provider_terminal", Reason: "all_members_terminal", LastEventAt: ended},
+	}
+	if err := ValidateFamily(family); err != nil {
+		t.Fatal(err)
+	}
+	family.EndedAt = time.Unix(20, 0).UTC()
+	if err := ValidateFamily(family); err == nil {
+		t.Fatal("accepted mismatched end")
+	}
+}
+
+func TestContentIDForManifestSortsChildren(t *testing.T) {
+	first := SourceManifest{SchemaVersion: 2, Provider: "claude", SessionID: "session_1", Sources: []SourceEntry{{Role: "main", Checksum: strings.Repeat("a", 64), Bytes: 1, Name: "source/main.jsonl"}, {Role: "child", AgentID: "b", Checksum: strings.Repeat("b", 64), Bytes: 2, Name: "source/children/b.jsonl"}, {Role: "child", AgentID: "a", Checksum: strings.Repeat("c", 64), Bytes: 3, Name: "source/children/a.jsonl"}}}
+	second := first
+	second.Sources = []SourceEntry{first.Sources[0], first.Sources[2], first.Sources[1]}
+	if ContentIDForManifest("claude", first) != ContentIDForManifest("claude", second) {
+		t.Fatal("content ID depends on source order")
+	}
+}
+
 func makeTags(n int) []string {
 	out := make([]string, n)
 	for i := range out {
