@@ -3,9 +3,19 @@
 Browse and publish completed Claude Code and Codex sessions through one small Go
 binary. It retains the original JSONL plus a normalized, server-rendered view.
 
-## Usage
+The product has two intended paths:
 
-The usual workflow is **browse → import → publish**.
+- **Use locally:** install the CLI to browse and import your own completed
+  sessions.
+- **Deploy for a team:** run the shared service on Kubernetes through its Helm
+  chart. A Helm chart is not included in this checkout yet, so do not treat the
+  low-level server configuration below as a supported VM or systemd deployment
+  guide.
+
+## Use locally
+
+The local workflow is **browse → import → publish**. Local mode listens only on
+`127.0.0.1`; it is for an individual operator, not a public or team service.
 
 1. Browse completed local sessions and the library:
 
@@ -24,7 +34,8 @@ The usual workflow is **browse → import → publish**.
 
    Active or incomplete sessions are rejected.
 
-3. Publish an imported package to a hosted user or project directory:
+3. Publish an imported package to a team library after it has been deployed on
+   Kubernetes:
 
    ```sh
    agent-transcripts upload \
@@ -35,10 +46,10 @@ The usual workflow is **browse → import → publish**.
 
    `upload` asks for confirmation unless `--yes` is supplied and reads its
    short-lived bearer from `AGENT_TRANSCRIPTS_TOKEN` or an interactive prompt.
-   See [Publish to a hosted library](#publish-to-a-hosted-library) for metadata,
+   See [Publish to a team library](#publish-to-a-team-library) for metadata,
    token, and idempotency details.
 
-## Install and browse locally
+### Install and browse
 
 Install a Go toolchain compatible with this repository, then build the binary:
 
@@ -48,7 +59,7 @@ agent-transcripts version
 agent-transcripts serve --open
 ```
 
-Local mode listens on `127.0.0.1:8080` and discovers sessions from
+Local mode discovers sessions from
 `~/.claude/projects`, `~/.codex/sessions`, and `~/.codex/archived_sessions`.
 Visit the displayed local URL to browse live and library pages. Use
 `agent-transcripts serve --config config.example.yaml` to customize local roots,
@@ -68,7 +79,7 @@ An active or incomplete session is rejected. A previously written local file is
 accepted only when its descriptor is revalidated as completed; importing a path
 never bypasses eligibility.
 
-## Publish to a hosted library
+### Publish to a team library
 
 First import the completed session and use its returned package ID. Then publish
 it to a user or project directory. The token is read from the environment (or
@@ -89,7 +100,20 @@ publication summary. Repeating the same immutable package to the same destinatio
 returns the existing stable URL. Publishing it to another destination creates a
 distinct URL.
 
-## Host the server
+## Deploy for a team
+
+Kubernetes is the only intended shared-hosting target. The deployment contract
+will be a Helm chart that supplies the existing application configuration,
+references an operator-managed Secret, and exposes health probes. Its default
+profile will use one replica and a filesystem PVC; S3-compatible object storage
+will be an alternative. Native Azure Blob Storage and native Google Cloud Storage
+backends are out of scope unless they expose an S3-compatible API.
+
+The chart is not present in this checkout yet. Until it is, use the material
+below only as an application-configuration reference; it is not a supported
+systemd, standalone VM, or production deployment procedure.
+
+### Application configuration reference
 
 Copy `config.example.yaml` and select one of its hosted examples. Hosted mode
 requires HTTPS in `external_origin`, an authentication mode, cookie-signing keys,
