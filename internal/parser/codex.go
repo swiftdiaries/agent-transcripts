@@ -76,6 +76,14 @@ func (codexParser) Parse(ctx context.Context, lines []json.RawMessage) (session.
 				Message string `json:"message"`
 			}
 			if json.Unmarshal(e.Payload, &event) == nil && event.Message != "" {
+				// Codex commonly emits the same user turn first as a response item
+				// and then as its canonical event message. Preserve the former as
+				// diagnostic evidence, but do not create a second visible prompt.
+				if n := len(got.Events); n > 0 && got.Events[n-1].Kind == session.EventUser && got.Events[n-1].Text == event.Message {
+					paired := got.Events[n-1]
+					raw, _ := json.Marshal(map[string]any{"type": "response_item", "payload": map[string]any{"type": "message", "role": "user", "content": []codexContent{{Type: "input_text", Text: paired.Text}}}})
+					got.Events[n-1] = rawEvent(paired.ID, "", "paired_response_user", paired.Time, raw)
+				}
 				got.Events = append(got.Events, session.Event{ID: eventID(p.ID, lineNumber), Kind: session.EventUser, Time: when, Text: event.Message})
 				continue
 			}

@@ -57,6 +57,9 @@ func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session
 		if got.ProviderSessionID == "" && e.SessionID != "" {
 			got.ProviderSessionID, got.ID = e.SessionID, e.SessionID
 		}
+		if e.SessionID != "" && got.ProviderSessionID != "" && e.SessionID != got.ProviderSessionID {
+			return session.Session{}, fmt.Errorf("Claude line %d session ID does not match source session", lineNumber)
+		}
 		if got.WorkingDirectory == "" {
 			got.WorkingDirectory = e.CWD
 		}

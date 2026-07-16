@@ -78,6 +78,31 @@ func TestCodexParserDoesNotTreatEOFAsTerminal(t *testing.T) {
 	}
 }
 
+func TestCodexPairsResponseUserWithCanonicalEventUser(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"dedupe_1"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect"}]}}`,
+		`{"type":"event_msg","payload":{"type":"user_message","message":"Inspect"}}`,
+	}, "\n")
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countKind(got.Events, session.EventUser) != 1 || got.Events[0].Kind != session.EventRaw {
+		t.Fatalf("events = %#v", got.Events)
+	}
+}
+
+func TestClaudeRejectsMixedSessionIDs(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"user","sessionId":"claude_1","message":{"role":"user","content":"one"}}`,
+		`{"type":"assistant","sessionId":"claude_2","message":{"role":"assistant","content":"two"}}`,
+	}, "\n")
+	if _, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input)); err == nil {
+		t.Fatal("accepted mixed Claude session IDs")
+	}
+}
+
 func TestParsersPreserveUnknownRecordWithoutType(t *testing.T) {
 	for _, tt := range []struct {
 		name, input string
