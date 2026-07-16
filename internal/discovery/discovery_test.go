@@ -52,6 +52,19 @@ func TestResolveProjectScopeUsesDirectoryFallback(t *testing.T) {
 	}
 }
 
+func TestFormFamiliesGroupsClaudeChildrenUnderMain(t *testing.T) {
+	root := t.TempDir()
+	main := Candidate{Path: filepath.Join(root, "session_1.jsonl"), Provider: "claude", SessionID: "session_1", Title: "main"}
+	child := Candidate{Path: filepath.Join(root, "session_1", "subagents", "agent-1.jsonl"), Provider: "claude", SessionID: "session_1", Title: "child"}
+	got, err := FormFamilies([]Candidate{child, main}, session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Main.Path != main.Path || len(got[0].Children) != 1 || got[0].Children[0].Candidate.Path != child.Path {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
 func TestDiscoverSortsTiesByPath(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"z.jsonl", "a.jsonl"} {
