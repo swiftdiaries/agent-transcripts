@@ -1,0 +1,6 @@
+[submodule "references/claude-code-transcripts"]
+	path = references/claude-code-transcripts
+	url = https://github.com/simonw/claude-code-transcripts.git
+[submodule "references/sniffly"]
+	path = references/sniffly
+	url = https://github.com/chiphuyen/sniffly.git
