@@ -103,6 +103,17 @@ func TestClaudeRejectsMixedSessionIDs(t *testing.T) {
 	}
 }
 
+func TestAttachClaudeChildrenUsesStableToolIdentity(t *testing.T) {
+	main := session.Session{Events: []session.Event{{ID: "call_1", Kind: session.EventToolCall, ToolName: "Task"}, {ID: "result_1", ParentID: "call_1", AgentID: "agent_1", Kind: session.EventToolResult}}}
+	children, err := AttachClaudeChildren(main, []ClaudeChild{{AgentID: "agent_1", Session: session.Session{SchemaVersion: 1, ID: "child", Provider: "claude"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || !children[0].Attached || children[0].ParentToolCallID != "call_1" {
+		t.Fatalf("children = %#v", children)
+	}
+}
+
 func TestParsersPreserveUnknownRecordWithoutType(t *testing.T) {
 	for _, tt := range []struct {
 		name, input string

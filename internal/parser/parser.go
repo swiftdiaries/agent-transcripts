@@ -109,13 +109,61 @@ func (r *countingReader) Read(p []byte) (int, error) {
 }
 
 type envelope struct {
-	Type       string          `json:"type"`
-	Timestamp  string          `json:"timestamp"`
-	UUID       string          `json:"uuid"`
-	ParentUUID string          `json:"parentUuid"`
-	SessionID  string          `json:"sessionId"`
-	CWD        string          `json:"cwd"`
-	Subtype    string          `json:"subtype"`
-	Message    json.RawMessage `json:"message"`
-	Payload    json.RawMessage `json:"payload"`
+	Type          string          `json:"type"`
+	Timestamp     string          `json:"timestamp"`
+	UUID          string          `json:"uuid"`
+	ParentUUID    string          `json:"parentUuid"`
+	SessionID     string          `json:"sessionId"`
+	CWD           string          `json:"cwd"`
+	Subtype       string          `json:"subtype"`
+	Message       json.RawMessage `json:"message"`
+	Payload       json.RawMessage `json:"payload"`
+	AgentID       string          `json:"agentId"`
+	ToolUseResult struct {
+		AgentID string `json:"agentId"`
+	} `json:"toolUseResult"`
+}
+
+type ClaudeChild struct {
+	AgentID string
+	Session session.Session
+}
+
+// AttachClaudeChildren proves a parent-child relationship solely through the
+// provider agent ID on a tool result and its referenced Agent or Task call.
+func AttachClaudeChildren(main session.Session, children []ClaudeChild) ([]session.ChildSession, error) {
+	result := make([]session.ChildSession, 0, len(children))
+	seen := make(map[string]struct{}, len(children))
+	for _, child := range children {
+		if child.AgentID == "" {
+			return nil, errors.New("Claude child has no agent ID")
+		}
+		if _, exists := seen[child.AgentID]; exists {
+			return nil, fmt.Errorf("duplicate Claude child agent ID %q", child.AgentID)
+		}
+		seen[child.AgentID] = struct{}{}
+		parentID := ""
+		for _, event := range main.Events {
+			if event.Kind == session.EventToolResult && event.AgentID == child.AgentID {
+				if parentID != "" {
+					return nil, fmt.Errorf("ambiguous Claude parent result for agent %q", child.AgentID)
+				}
+				parentID = event.ParentID
+			}
+		}
+		attached := false
+		if parentID != "" {
+			for _, event := range main.Events {
+				if event.ID == parentID && event.Kind == session.EventToolCall && (event.ToolName == "Agent" || event.ToolName == "Task") {
+					attached = true
+				}
+			}
+		}
+		entry := session.ChildSession{AgentID: child.AgentID, Attached: attached, Session: child.Session}
+		if attached {
+			entry.ParentToolCallID = parentID
+		}
+		result = append(result, entry)
+	}
+	return result, nil
 }
