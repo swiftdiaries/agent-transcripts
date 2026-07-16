@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -29,6 +30,71 @@ func TestRunRejectsUnknownCommand(t *testing.T) {
 	if !strings.Contains(stderr.String(), "unknown command") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
+}
+
+func TestRunWithoutSubcommandBrowses(t *testing.T) {
+	calls := 0
+	code := runWithBrowse(t, nil, func(context.Context, browseOptions) int { calls++; return 0 })
+	if code != 0 || calls != 1 {
+		t.Fatalf("code=%d calls=%d", code, calls)
+	}
+}
+
+func TestFamilySelectorsRejectStaleKeysAndChooseLatest(t *testing.T) {
+	families := []discovery.SessionFamilyCandidate{{Key: "f_new", StartedAt: time.Now()}, {Key: "f_old", StartedAt: time.Now().Add(-time.Hour)}}
+	if _, ok := selectFamily(families, "f_tampered", false); ok {
+		t.Fatal("accepted stale family key")
+	}
+	got, ok := selectFamily(families, "", true)
+	if !ok || got.Key != "f_new" {
+		t.Fatalf("latest=%+v ok=%v", got, ok)
+	}
+}
+
+func TestBrowseExplicitFamilyIncludesChildrenAndStaysLoopbackWithoutOpening(t *testing.T) {
+	root := t.TempDir()
+	main := filepath.Join(root, "claude-session.jsonl")
+	childDir := filepath.Join(root, "claude-session", "subagents")
+	if err := os.MkdirAll(childDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{main, filepath.Join(childDir, "agent-1.jsonl")} {
+		if err := os.WriteFile(path, source, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	family, err := familyForPath(context.Background(), main)
+	if err != nil || len(family.Children) != 1 {
+		t.Fatalf("family=%+v err=%v", family, err)
+	}
+	opts, err := parseBrowseArgs([]string{"--no-open", main})
+	if err != nil || opts.path != main || !opts.noOpen {
+		t.Fatalf("opts=%+v err=%v", opts, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opened := false
+	listener := newTestListener()
+	go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+	var stderr bytes.Buffer
+	code := runBrowseWithDeps(ctx, []string{"--no-open", main}, nil, &bytes.Buffer{}, &stderr, func(string, io.Writer) { opened = true }, func(network, address string) (net.Listener, error) {
+		if network != "tcp" || address != "127.0.0.1:0" {
+			t.Fatalf("listen %s %s", network, address)
+		}
+		return listener, nil
+	}, os.Getwd)
+	if code != 0 || opened {
+		t.Fatalf("code=%d opened=%v stderr=%q", code, opened, stderr.String())
+	}
+}
+
+func runWithBrowse(t *testing.T, args []string, browse func(context.Context, browseOptions) int) int {
+	t.Helper()
+	return runCommand(DefaultDependencies(), context.Background(), args, nil, &bytes.Buffer{}, &bytes.Buffer{}, browse)
 }
 
 func TestImportExplicitPathUsesEligibilityGate(t *testing.T) {
@@ -165,6 +231,28 @@ func TestUploadUsesExistingLibraryPackageWithTerminalConfirmation(t *testing.T) 
 	}
 }
 
+func TestUploadUsesAllStoredFamilySources(t *testing.T) {
+	st, id := uploadFamilyTestLibrary(t)
+	input := writeInput(t, "")
+	code := runUploadWithDeps(context.Background(), []string{"--yes", "--server", "https://publish.example", "--destination", "projects/platform", id}, input, &bytes.Buffer{}, &bytes.Buffer{}, uploadDeps{
+		library: st, interactive: func(*os.File) bool { return false }, getenv: func(string) string { return "token" }, readPassword: func(int) ([]byte, error) { return nil, nil },
+		upload: func(_ context.Context, _ string, request publish.Request, _ string) (publish.Result, error) {
+			main, err := io.ReadAll(request.Source)
+			if err != nil || len(main) == 0 || len(request.Children) != 1 {
+				t.Fatalf("main=%d children=%d err=%v", len(main), len(request.Children), err)
+			}
+			child, err := io.ReadAll(request.Children[0].Source)
+			if err != nil || len(child) == 0 || request.Children[0].SourceName != "source/children/agent-real.jsonl" {
+				t.Fatalf("child=%d name=%q err=%v", len(child), request.Children[0].SourceName, err)
+			}
+			return publish.Result{Location: "/sessions/s_published"}, nil
+		},
+	})
+	if code != 0 {
+		t.Fatalf("code=%d", code)
+	}
+}
+
 func TestUploadYesNonInteractiveNeedsTokenAndNeverDisclosesIt(t *testing.T) {
 	st, id := uploadTestLibrary(t)
 	input := writeInput(t, "")
@@ -222,6 +310,30 @@ func uploadTestLibrary(t *testing.T) (store.Store, string) {
 		t.Fatal(err)
 	}
 	return st, md.ID
+}
+
+func uploadFamilyTestLibrary(t *testing.T) (store.Store, string) {
+	t.Helper()
+	st := store.NewFilesystem(t.TempDir())
+	main := mustReadUploadFixture(t, "claude-session.jsonl")
+	child := bytes.Clone(main)
+	md, _, err := library.New(st, library.AllowLocalQuietEvidence()).ImportFamilyWithStatus(context.Background(), discovery.FamilySnapshot{
+		Candidate: discovery.SessionFamilyCandidate{Provider: "claude", ProviderSessionID: "claude-session-1"},
+		Sources:   []discovery.SnapshotSource{{Role: "main", Bytes: main}, {Role: "child", AgentID: "agent-real", Bytes: child}},
+	}, library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, md.ID
+}
+
+func mustReadUploadFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "parser", "testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func TestParseServeArgs(t *testing.T) {
@@ -362,14 +474,47 @@ func TestServeHandlerUsesConfiguredSourceRoots(t *testing.T) {
 		Storage:     config.Storage{Type: "filesystem", Root: t.TempDir()},
 		SourceRoots: []string{root},
 	}
-	h, err := serveHandler(cfg)
+	h, err := serveHandlerWithStoreFactoryForProjects(context.Background(), cfg, true, productionStoreForConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest("GET", "/live", nil))
-	if rr.Code != 200 || !strings.Contains(rr.Body.String(), "Fix the parser") {
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "/live/projects", nil))
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), "demo") {
 		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestServeHandlerDefaultsToCurrentProjectUnlessAllProjectsIsExplicit(t *testing.T) {
+	root := t.TempDir()
+	source, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "claude-session.jsonl"), source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Mode: "local", QuietPeriod: 5 * time.Minute, Storage: config.Storage{Type: "filesystem", Root: t.TempDir()}, SourceRoots: []string{root}}
+	scoped, err := serveHandlerWithStoreFactory(context.Background(), cfg, productionStoreForConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := serveHandlerWithStoreFactoryForProjects(context.Background(), cfg, true, productionStoreForConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for handler, path := range map[http.Handler]string{scoped: "/live", all: "/live/projects"} {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest("GET", path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s status=%d", path, rr.Code)
+		}
+		if handler == scoped && strings.Contains(rr.Body.String(), "Fix the parser") {
+			t.Fatalf("scoped server exposed another project's session: %s", rr.Body.String())
+		}
+		if handler == all && !strings.Contains(rr.Body.String(), "demo") {
+			t.Fatalf("all-project server omitted project index: %s", rr.Body.String())
+		}
 	}
 }
 

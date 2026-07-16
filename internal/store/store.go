@@ -18,6 +18,7 @@ type Store interface {
 	CreateProject(context.Context, string) error
 	ListSessions(context.Context, session.Directory) ([]session.Metadata, error)
 	GetSession(context.Context, string) (session.Package, error)
+	PutFamily(context.Context, session.Package) (bool, error)
 	PutSession(context.Context, session.Package) (bool, error)
 	UpdateMetadata(context.Context, string, string, session.Metadata) (string, error)
 	MoveSession(context.Context, string, string, session.Directory, string) (session.Metadata, error)

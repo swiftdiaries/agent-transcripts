@@ -185,18 +185,14 @@ func (s *Filesystem) GetSession(ctx context.Context, id string) (session.Package
 	if err != nil {
 		return session.Package{}, err
 	}
-	return s.readPackage(m)
+	p, err := s.readPackage(m)
+	return legacyProjection(p), err
 }
 
-func (s *Filesystem) PutSession(ctx context.Context, p session.Package) (bool, error) {
-	if err := session.ValidatePackage(p); err != nil {
+func (s *Filesystem) PutFamily(ctx context.Context, p session.Package) (bool, error) {
+	p = sanitizeFamilyPackage(p)
+	if err := validateFamilyPut(p); err != nil {
 		return false, err
-	}
-	actualChecksum := checksum(p.Source)
-	actualContentID := session.ContentID(p.Session.Provider, actualChecksum)
-	actualID := session.PackageID(actualContentID, p.Metadata.Destination)
-	if p.Metadata.SourceChecksum != actualChecksum || p.ContentID != actualContentID || p.Metadata.ContentID != actualContentID || p.ID != actualID || p.Metadata.ID != actualID {
-		return false, fmt.Errorf("%w: package identity does not match source bytes", ErrConflict)
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -214,54 +210,61 @@ func (s *Filesystem) PutSession(ctx context.Context, p session.Package) (bool, e
 	if err := s.recoverLocked(); err != nil {
 		return false, fmt.Errorf("recover store: %w", err)
 	}
+	p.Metadata.Revision = metadataRevision(p.Metadata)
 	if m, err := s.readManifestAt(p.Metadata.Destination, p.ID); err == nil {
-		return s.identical("", m, p)
-	} else if manifestExists, e := s.packageFileExists(p.Metadata.Destination, p.ID, "manifest.json"); e != nil {
+		return s.identicalFamily(m, p)
+	} else if exists, e := s.packageFileExists(p.Metadata.Destination, p.ID, "manifest.json"); e != nil {
 		return false, e
-	} else if manifestExists {
+	} else if exists {
 		return false, err
 	}
 	if exists, err := s.packageExists(p.Metadata.Destination, p.ID); err != nil {
 		return false, err
 	} else if exists {
-		parentFD, e := s.openLogicalDir(p.Metadata.Destination)
+		parent, e := s.openLogicalDir(p.Metadata.Destination)
 		if e != nil {
 			return false, e
 		}
-		e = removeTreeAt(parentFD, p.ID)
+		e = removeTreeAt(parent, p.ID)
 		if e == nil {
-			e = unix.Fsync(parentFD)
+			e = unix.Fsync(parent)
 		}
-		unix.Close(parentFD)
+		unix.Close(parent)
 		if e != nil {
 			return false, e
 		}
 	}
-	p.Metadata.Revision = metadataRevision(p.Metadata)
-	p.Metadata.ID = p.ID
-	p.Metadata.ContentID = p.ContentID
-	files := map[string][]byte{"source.jsonl": p.Source, "normalized.json": p.Normalized}
-	files["metadata.json"], err = json.Marshal(p.Metadata)
+	files, err := familyFiles(p)
 	if err != nil {
 		return false, err
 	}
-	files["session.json"], err = json.Marshal(p.Session)
+	metadata, err := json.Marshal(p.Metadata)
 	if err != nil {
 		return false, err
 	}
-	files["source-facts.json"], err = json.Marshal(p.SourceFacts)
-	if err != nil {
-		return false, err
-	}
-	hashes := map[string]string{"source.jsonl": checksum(files["source.jsonl"]), "normalized.json": checksum(files["normalized.json"])}
 	if err := s.stagePackage(p.Metadata.Destination, p.ID, files); err != nil {
 		return false, err
 	}
-	m := manifest{SchemaVersion: manifestSchemaVersion, ID: p.ID, ContentID: p.ContentID, Destination: p.Metadata.Destination, Files: hashes, MetadataRevision: p.Metadata.Revision, MetadataHash: checksum(files["metadata.json"]), SessionHash: checksum(files["session.json"]), SourceFactsHash: checksum(files["source-facts.json"])}
+	hashes := make(map[string]string, len(files))
+	for name, data := range files {
+		hashes[name] = checksum(data)
+	}
+	m := manifest{SchemaVersion: familyManifestSchemaVersion, ID: p.ID, ContentID: p.ContentID, Destination: p.Metadata.Destination, Files: hashes, MetadataRevision: p.Metadata.Revision, MetadataHash: checksum(metadata)}
+	if err := s.writePackageFile(p.Metadata.Destination, p.ID, "metadata.json", metadata); err != nil {
+		return false, err
+	}
 	if err := s.writePackageFile(p.Metadata.Destination, p.ID, "manifest.json", mustJSON(m)); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *Filesystem) PutSession(ctx context.Context, p session.Package) (bool, error) {
+	family, err := legacyAdapter(p)
+	if err != nil {
+		return false, err
+	}
+	return s.PutFamily(ctx, family)
 }
 
 func (s *Filesystem) UpdateMetadata(ctx context.Context, id, expected string, md session.Metadata) (string, error) {
@@ -789,7 +792,7 @@ func (s *Filesystem) stagePackage(d session.Directory, id string, files map[stri
 		return err
 	}
 	for name, data := range files {
-		fd, e := unix.Openat(dirFD, name, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW, 0o600)
+		fd, e := openNestedFile(dirFD, name, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW, 0o600)
 		if e != nil {
 			unix.Close(dirFD)
 			return e
@@ -848,9 +851,7 @@ func removeTreeAt(parent int, name string) error {
 	return unix.Unlinkat(parent, name, unix.AT_REMOVEDIR)
 }
 func (s *Filesystem) readPackageBytes(d session.Directory, id, name string) ([]byte, error) {
-	switch name {
-	case "manifest.json", "metadata.json", "session.json", "source-facts.json", "source.jsonl", "normalized.json":
-	default:
+	if !isManagedFile(name) {
 		return nil, errors.New("invalid managed filename")
 	}
 	fd, err := s.openPackageDir(d, id)
@@ -858,11 +859,38 @@ func (s *Filesystem) readPackageBytes(d session.Directory, id, name string) ([]b
 		return nil, err
 	}
 	defer unix.Close(fd)
-	fileFD, err := unix.Openat(fd, name, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	fileFD, err := openNestedFile(fd, name, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
 	return readBoundedFD(fileFD, name)
+}
+
+func openNestedFile(dirFD int, name string, flags int, mode uint32) (int, error) {
+	parts := strings.Split(name, "/")
+	if len(parts) == 0 || !isManagedFile(name) {
+		return -1, errors.New("invalid managed filename")
+	}
+	current, err := unix.Dup(dirFD)
+	if err != nil {
+		return -1, err
+	}
+	defer func() { _ = unix.Close(current) }()
+	for _, part := range parts[:len(parts)-1] {
+		next, e := unix.Openat(current, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+		if errors.Is(e, unix.ENOENT) && flags&unix.O_CREAT != 0 {
+			e = unix.Mkdirat(current, part, 0o700)
+			if e == nil {
+				next, e = unix.Openat(current, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+			}
+		}
+		if e != nil {
+			return -1, e
+		}
+		unix.Close(current)
+		current = next
+	}
+	return unix.Openat(current, parts[len(parts)-1], flags, mode)
 }
 func readBoundedFD(fd int, name string) ([]byte, error) {
 	f := os.NewFile(uintptr(fd), name)
@@ -872,10 +900,10 @@ func readBoundedFD(fd int, name string) ([]byte, error) {
 		return nil, errors.New("unsafe package file")
 	}
 	limit := int64(1 << 20)
-	switch name {
-	case "source.jsonl", "normalized.json", "session.json":
+	switch {
+	case safeFamilyFile(name), name == "normalized.json", name == "session.json", name == "family.json", name == "source-manifest.json":
 		limit = session.MaxSourceBytes
-	case "source-facts.json":
+	case name == "source-facts.json":
 		limit = 64 << 10
 	}
 	b, err := io.ReadAll(io.LimitReader(f, limit+1))
@@ -1118,8 +1146,21 @@ func (s *Filesystem) find(id string) (string, manifest, error) {
 	return "", manifest{}, ErrNotFound
 }
 func validateManifest(m manifest) error {
-	if m.SchemaVersion != manifestSchemaVersion || !validManaged(m.ID, "s_") || !validManaged(m.ContentID, "c_") || (m.MoveID != "" && !validManaged(m.MoveID, "s_")) || session.ValidateDirectory(m.Destination) != nil || len(m.Files) != 2 || !validHash(m.Files["source.jsonl"]) || !validHash(m.Files["normalized.json"]) || !validHash(m.MetadataHash) || !validHash(m.SessionHash) || !validHash(m.SourceFactsHash) || !validHash(m.MetadataRevision) || (m.MetadataKey != "" && !validMetadataKey(m.MetadataKey)) {
+	if (m.SchemaVersion != manifestSchemaVersion && m.SchemaVersion != familyManifestSchemaVersion) || !validManaged(m.ID, "s_") || !validManaged(m.ContentID, "c_") || (m.MoveID != "" && !validManaged(m.MoveID, "s_")) || session.ValidateDirectory(m.Destination) != nil || !validHash(m.MetadataHash) || !validHash(m.MetadataRevision) || (m.MetadataKey != "" && !validMetadataKey(m.MetadataKey)) {
 		return errors.New("invalid manifest")
+	}
+	if m.SchemaVersion == manifestSchemaVersion && (len(m.Files) != 2 || !validHash(m.Files["source.jsonl"]) || !validHash(m.Files["normalized.json"]) || !validHash(m.SessionHash) || !validHash(m.SourceFactsHash)) {
+		return errors.New("invalid manifest")
+	}
+	if m.SchemaVersion == familyManifestSchemaVersion {
+		if len(m.Files) < 4 || !validHash(m.Files["family.json"]) || !validHash(m.Files["source-manifest.json"]) || !validHash(m.Files["source-facts.json"]) || !validHash(m.Files["normalized.json"]) {
+			return errors.New("invalid manifest")
+		}
+		for name, hash := range m.Files {
+			if !isManagedFile(name) || !validHash(hash) {
+				return errors.New("invalid manifest file")
+			}
+		}
 	}
 	return nil
 }
@@ -1144,6 +1185,45 @@ func validateJournalMetadata(data []byte, m manifest, d session.Directory, id st
 	return md, nil
 }
 func (s *Filesystem) validateRecoveryImmutable(physical session.Directory, physicalID string, m manifest, md session.Metadata) error {
+	if m.SchemaVersion == familyManifestSchemaVersion {
+		for name, want := range m.Files {
+			b, err := s.readPackageBytes(physical, physicalID, name)
+			if err != nil || checksum(b) != want {
+				return errors.New("recovery immutable binding mismatch")
+			}
+		}
+		familyBytes, err := s.readPackageBytes(physical, physicalID, "family.json")
+		if err != nil {
+			return err
+		}
+		manifestBytes, err := s.readPackageBytes(physical, physicalID, "source-manifest.json")
+		if err != nil {
+			return err
+		}
+		factsBytes, err := s.readPackageBytes(physical, physicalID, "source-facts.json")
+		if err != nil {
+			return err
+		}
+		normalized, err := s.readPackageBytes(physical, physicalID, "normalized.json")
+		if err != nil {
+			return err
+		}
+		var family session.SessionFamily
+		var sourcesManifest session.SourceManifest
+		var facts []session.SourceFactEntry
+		if json.Unmarshal(familyBytes, &family) != nil || json.Unmarshal(manifestBytes, &sourcesManifest) != nil || json.Unmarshal(factsBytes, &facts) != nil {
+			return errors.New("invalid recovery family")
+		}
+		sources := make([]session.SourceBlob, len(sourcesManifest.Sources))
+		for i, entry := range sourcesManifest.Sources {
+			b, e := s.readPackageBytes(physical, physicalID, entry.Name)
+			if e != nil {
+				return e
+			}
+			sources[i] = session.SourceBlob{Entry: entry, Bytes: b}
+		}
+		return validateFamilyPut(session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sourcesManifest, Sources: sources, SourceFactsSet: facts, Normalized: normalized})
+	}
 	source, err := s.readPackageBytes(physical, physicalID, "source.jsonl")
 	if err != nil {
 		return err
@@ -1171,6 +1251,9 @@ func (s *Filesystem) validateRecoveryImmutable(physical session.Directory, physi
 	return nil
 }
 func (s *Filesystem) readPackage(m manifest) (session.Package, error) {
+	if m.SchemaVersion == familyManifestSchemaVersion {
+		return s.readFamilyPackage(m)
+	}
 	md, e := readPackageJSON[session.Metadata](s, m, "metadata.json")
 	if e != nil {
 		return session.Package{}, e
@@ -1214,6 +1297,71 @@ func (s *Filesystem) readPackage(m manifest) (session.Package, error) {
 		return session.Package{}, err
 	}
 	return pkg, nil
+}
+
+func (s *Filesystem) readFamilyPackage(m manifest) (session.Package, error) {
+	md, err := readPackageJSON[session.Metadata](s, m, "metadata.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	family, err := readPackageJSON[session.SessionFamily](s, m, "family.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	sm, err := readPackageJSON[session.SourceManifest](s, m, "source-manifest.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	facts, err := readPackageJSON[[]session.SourceFactEntry](s, m, "source-facts.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	normalized, err := s.readPackageBytes(m.Destination, m.ID, "normalized.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	for name, want := range m.Files {
+		b, e := s.readPackageBytes(m.Destination, m.ID, name)
+		if e != nil || checksum(b) != want {
+			return session.Package{}, errors.New("package file hash mismatch")
+		}
+	}
+	if checksumPackage(s, m, "metadata.json") != m.MetadataHash || md.Revision != m.MetadataRevision || md.Destination != m.Destination {
+		return session.Package{}, errors.New("manifest metadata mismatch")
+	}
+	sources := make([]session.SourceBlob, len(sm.Sources))
+	for i, entry := range sm.Sources {
+		b, e := s.readPackageBytes(m.Destination, m.ID, entry.Name)
+		if e != nil {
+			return session.Package{}, e
+		}
+		sources[i] = session.SourceBlob{Entry: entry, Bytes: b}
+	}
+	p := session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sm, Sources: sources, SourceFactsSet: facts, Normalized: normalized}
+	if err := validateFamilyPut(p); err != nil {
+		return session.Package{}, err
+	}
+	return p, nil
+}
+
+func (s *Filesystem) identicalFamily(m manifest, p session.Package) (bool, error) {
+	if m.SchemaVersion != familyManifestSchemaVersion || m.ID != p.ID || m.ContentID != p.ContentID || m.Destination != p.Metadata.Destination {
+		return false, ErrConflict
+	}
+	files, err := familyFiles(p)
+	if err != nil {
+		return false, err
+	}
+	for name, data := range files {
+		if m.Files[name] != checksum(data) {
+			return false, ErrConflict
+		}
+	}
+	metadata, _ := json.Marshal(p.Metadata)
+	if m.MetadataHash != checksum(metadata) {
+		return false, ErrConflict
+	}
+	return false, nil
 }
 func (s *Filesystem) identical(path string, m manifest, p session.Package) (bool, error) {
 	if m.ID != p.ID || m.ContentID != p.ContentID || m.Destination != p.Metadata.Destination {

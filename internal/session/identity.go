@@ -23,6 +23,12 @@ func ContentIDForManifest(provider string, manifest SourceManifest) string {
 		}
 		return entries[i].AgentID < entries[j].AgentID
 	})
+	// A one-main adapter intentionally retains the schema-v1 content identity,
+	// so callers that still address a package by its established ID continue to
+	// work while the bytes are stored in the normalized v2 layout.
+	if len(entries) == 1 && entries[0].Role == "main" && entries[0].AgentID == "" && entries[0].Name == "source.jsonl" {
+		return ContentID(provider, entries[0].Checksum)
+	}
 	parts := []string{provider, manifest.Provider, manifest.SessionID}
 	for _, entry := range entries {
 		parts = append(parts, entry.Role, entry.AgentID, entry.Checksum, strconv.FormatInt(entry.Bytes, 10), entry.Name)

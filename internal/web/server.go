@@ -22,16 +22,23 @@ var assets embed.FS
 
 const csp = "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
 
+// uploadRequestEnvelope allows multipart framing and approved form fields in
+// addition to the 64 MiB aggregate source cap enforced after parsing.
+const uploadRequestEnvelope = session.MaxSourceBytes + (4 << 20)
+
 type ServerConfig struct {
-	Store       store.Store
-	Library     *library.Service
-	Roots       discovery.Roots
-	QuietPeriod time.Duration
-	Now         func() time.Time
-	Mode        string
-	Provider    auth.Provider
-	CSRF        *auth.CSRF
-	Tokens      *auth.TokenManager
+	Store         store.Store
+	Library       *library.Service
+	Roots         discovery.Roots
+	QuietPeriod   time.Duration
+	Now           func() time.Time
+	Mode          string
+	Provider      auth.Provider
+	CSRF          *auth.CSRF
+	Tokens        *auth.TokenManager
+	FocusedFamily discovery.SessionFamilyCandidate
+	ProjectScope  *session.ProjectScope
+	AllProjects   bool
 }
 
 type server struct {
@@ -45,6 +52,9 @@ type server struct {
 	csrf           *auth.CSRF
 	tokens         *auth.TokenManager
 	discover       func(context.Context, discovery.Roots, time.Time, time.Duration) ([]discovery.Candidate, error)
+	focused        *discovery.SessionFamilyCandidate
+	projectScope   *session.ProjectScope
+	allProjects    bool
 }
 
 func New(cfg ServerConfig) http.Handler {
@@ -65,6 +75,15 @@ func New(cfg ServerConfig) http.Handler {
 		mode = "local"
 	}
 	s := &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates, mode: mode, csrf: cfg.CSRF, tokens: cfg.Tokens, discover: discovery.Discover}
+	if cfg.FocusedFamily.Provider != "" {
+		focused := cfg.FocusedFamily
+		s.focused = &focused
+	}
+	if cfg.ProjectScope != nil {
+		scope := *cfg.ProjectScope
+		s.projectScope = &scope
+	}
+	s.allProjects = cfg.AllProjects
 	if mode == "hosted" && (cfg.Provider == nil || cfg.CSRF == nil || cfg.Tokens == nil) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "server configuration invalid", http.StatusInternalServerError)
@@ -89,15 +108,36 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")
+	if s.focused != nil {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/static/app.css" {
+			s.static(w, "static/app.css", "text/css; charset=utf-8")
+			return
+		}
+		if r.URL.Path == "/static/app.js" {
+			s.static(w, "static/app.js", "application/javascript; charset=utf-8")
+			return
+		}
+		want := "/live/" + s.focused.Provider + "/" + s.focused.ProviderSessionID
+		if r.URL.Path != want {
+			http.NotFound(w, r)
+			return
+		}
+		s.focusedSession(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		// This has to happen before CSRF form-token extraction, which may trigger
 		// multipart parsing for a browser upload.
 		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions" {
-			if r.ContentLength > int64(session.MaxSourceBytes+(1<<20)) {
+			if r.ContentLength > int64(uploadRequestEnvelope) {
 				http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
 				return
 			}
-			r.Body = http.MaxBytesReader(w, r.Body, session.MaxSourceBytes+(1<<20))
+			r.Body = http.MaxBytesReader(w, r.Body, uploadRequestEnvelope)
 		}
 		if s.tokens != nil {
 			if id, ok, presented := s.tokens.APIIdentity(r); presented {

@@ -42,6 +42,47 @@ func TestImportUploadBrowseAndAuthorize(t *testing.T) {
 	}
 }
 
+func TestUploadBrowseRendersAttachedDelegatedFamily(t *testing.T) {
+	_, hosted := startRoundTripServers(t)
+	main := []byte("{\"type\":\"user\",\"uuid\":\"main-prompt\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:00Z\",\"message\":{\"content\":\"Main prompt\"}}\n" +
+		"{\"type\":\"assistant\",\"uuid\":\"main-assistant\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"agent-call\",\"name\":\"Agent\",\"input\":{}}]}}\n" +
+		"{\"type\":\"user\",\"uuid\":\"main-result\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:02Z\",\"toolUseResult\":{\"agentId\":\"child-1\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"agent-call\",\"content\":\"done\"}]}}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"main-terminal\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:03Z\"}\n")
+	child := []byte("{\"type\":\"user\",\"uuid\":\"child-prompt\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"message\":{\"content\":\"Child prompt\"}}\n" +
+		"{\"type\":\"future_child\",\"uuid\":\"child-raw\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:02Z\"}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"child-terminal\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:03Z\"}\n")
+	token, err := hosted.tokens.Mint(auth.Identity{Key: "ada@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := (publish.Client{BaseURL: hosted.server.URL, Token: token}).Upload(context.Background(), publish.Request{SourceName: "main.jsonl", Source: bytes.NewReader(main), Children: []publish.ChildSource{{SourceName: "child.jsonl", Source: bytes.NewReader(child)}}, Destination: "projects/platform"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, hosted.server.URL+published.Location, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-User", "ada@example.com")
+	resp, err := hosted.server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Delegated work / child-1", "Child prompt", "future_child", `href="#main-prompt"`} {
+		if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("browse status=%d missing=%q body=%s", resp.StatusCode, want, body)
+		}
+	}
+	if bytes.Contains(body, []byte(`href="#child-child-1-child-prompt"`)) {
+		t.Fatalf("child prompt leaked into main prompt index: %s", body)
+	}
+}
+
 type hostedServer struct {
 	server *httptest.Server
 	store  store.Store

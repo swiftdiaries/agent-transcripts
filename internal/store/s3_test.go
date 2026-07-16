@@ -25,6 +25,32 @@ func TestS3WritesManifestLast(t *testing.T) {
 	}
 }
 
+func TestS3PutFamilyReadsEveryMember(t *testing.T) {
+	s := NewS3(newFakeS3(), "bucket", "prod")
+	p := familyPackage(t, "main", "child")
+	created, err := s.PutFamily(context.Background(), p)
+	if err != nil || !created {
+		t.Fatalf("put = %v, %v", created, err)
+	}
+	got, err := s.GetSession(context.Background(), p.ID)
+	if err != nil || len(got.Sources) != 2 || got.Family.Project.Key == "" {
+		t.Fatalf("get = %#v, %v", got, err)
+	}
+}
+
+func TestS3PutSessionAdaptsToV2Family(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod")
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := s.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := s.(*S3).readManifest(context.Background(), p.Metadata.Destination, p.ID)
+	if err != nil || m.SchemaVersion != familyManifestSchemaVersion {
+		t.Fatalf("manifest=%#v err=%v", m, err)
+	}
+}
+
 func TestS3ConcurrentPutConverges(t *testing.T) {
 	fake := newFakeS3()
 	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})

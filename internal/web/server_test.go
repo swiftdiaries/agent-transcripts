@@ -69,6 +69,30 @@ func TestTranscriptRendersTurnsAndKeepsRawRecordsOutOfPromptIndex(t *testing.T) 
 	}
 }
 
+func TestTranscriptRendersDelegatedWorkInDetails(t *testing.T) {
+	family := session.SessionFamily{Main: session.Session{Events: []session.Event{
+		{ID: "main-prompt", Kind: session.EventUser, Text: "Main prompt"},
+		{ID: "call-1", Kind: session.EventToolCall, ToolName: "Agent", Input: json.RawMessage(`"<input>"`)},
+	}}, Children: []session.ChildSession{
+		{AgentID: "attached", Attached: true, ParentToolCallID: "call-1", AgentType: "researcher", Description: "<delegated work>", Session: session.Session{Completion: session.Completion{Terminal: true, TerminalReason: "done"}, Events: []session.Event{{ID: "child-prompt", Kind: session.EventUser, Text: "Child prompt"}, {ID: "child-raw", Kind: session.EventRaw, RawType: "future_child", Raw: json.RawMessage(`{"raw":true}`)}}}},
+		{AgentID: "unattached", Description: "No parent", Session: session.Session{Events: []session.Event{{ID: "other-prompt", Kind: session.EventUser, Text: "Other child"}}}},
+	}}
+	var body bytes.Buffer
+	s := New(ServerConfig{}).(*server)
+	if err := s.templates["transcript"].ExecuteTemplate(&body, "transcript", transcriptFamilyPage(family, "Family")); err != nil {
+		t.Fatal(err)
+	}
+	got := body.String()
+	for _, want := range []string{"Unattached delegated work", `href="#main-prompt"`, `id="child-attached"`, "researcher", "done", "future_child", "&lt;delegated work&gt;"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered transcript missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, `href="#child-prompt"`) || strings.Contains(got, "<delegated work>") {
+		t.Fatalf("child prompt escaped or leaked into main prompt index: %s", got)
+	}
+}
+
 func TestDifferentUserCannotDelete(t *testing.T) {
 	pkg := fixturePackage(t)
 	st := store.NewFilesystem(t.TempDir())
@@ -215,6 +239,71 @@ func TestHostedUploadRequiresTerminalEvidence(t *testing.T) {
 	}
 }
 
+func TestUploadRejectsUntrustedNonterminalChild(t *testing.T) {
+	h, st, token := hostedUploadServer(t)
+	main := mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))
+	child := []byte(`{"type":"user","uuid":"child-user","sessionId":"claude-session-1","timestamp":"2026-07-12T08:00:01Z","message":{"role":"user","content":"still working"}}`)
+	rr := postFamilyMultipart(t, h, token, main, child)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	packages, err := st.ListSessions(context.Background(), session.Directory{Kind: "projects", Slug: "platform"})
+	if err != nil || len(packages) != 0 {
+		t.Fatalf("stored incomplete family: %#v %v", packages, err)
+	}
+}
+
+func TestHostedUploadDerivesChildIdentityFromProviderEvidence(t *testing.T) {
+	h, st, token := hostedUploadServer(t)
+	main := []byte("{\"type\":\"assistant\",\"uuid\":\"call\",\"sessionId\":\"family-identity\",\"timestamp\":\"2026-07-17T08:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"agent-call\",\"name\":\"Agent\",\"input\":{}}]}}\n" +
+		"{\"type\":\"user\",\"uuid\":\"result\",\"sessionId\":\"family-identity\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"toolUseResult\":{\"agentId\":\"agent-real-42\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"agent-call\",\"content\":\"done\"}]}}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"terminal\",\"sessionId\":\"family-identity\",\"timestamp\":\"2026-07-17T08:00:02Z\"}\n")
+	child := []byte("{\"type\":\"user\",\"uuid\":\"child-result\",\"sessionId\":\"family-identity\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"toolUseResult\":{\"agentId\":\"agent-real-42\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"nested\",\"content\":\"done\"}]}}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"child-terminal\",\"sessionId\":\"family-identity\",\"timestamp\":\"2026-07-17T08:00:02Z\"}\n")
+	rr := postFamilyMultipart(t, h, token, main, child)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var md session.Metadata
+	if err := json.Unmarshal(rr.Body.Bytes(), &md); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := st.GetSession(context.Background(), md.ID)
+	if err != nil || len(pkg.Family.Children) != 1 || pkg.Family.Children[0].AgentID != "agent-real-42" || !pkg.Family.Children[0].Attached {
+		t.Fatalf("package=%#v err=%v", pkg, err)
+	}
+}
+
+func postFamilyMultipart(t *testing.T, h http.Handler, token string, main, child []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for _, part := range []struct {
+		name string
+		data []byte
+	}{{"source", main}, {"child", child}} {
+		file, err := mw.CreateFormFile(part.name, part.name+".jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write(part.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mw.WriteField("destination", "projects/platform"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
 func TestHostedUploadRejectsServerOwnedMultipartParts(t *testing.T) {
 	for _, field := range []string{"normalized", "normalized.json", "uploader", "uploader_key", "uploader-key"} {
 		t.Run(field, func(t *testing.T) {
@@ -260,12 +349,28 @@ func TestHostedUploadRejectsOversizedRequestBeforeMultipartRead(t *testing.T) {
 	h, _, token := hostedUploadServer(t)
 	body := &countingBody{Reader: strings.NewReader("ignored")}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", body)
-	req.ContentLength = int64(session.MaxSourceBytes + (1 << 20) + 1)
+	req.ContentLength = int64(uploadRequestEnvelope + 1)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusRequestEntityTooLarge || body.reads != 0 {
+		t.Fatalf("status=%d reads=%d", rr.Code, body.reads)
+	}
+}
+
+func TestHostedUploadAllowsFamilyEnvelopeBeforeMultipartParse(t *testing.T) {
+	h, _, token := hostedUploadServer(t)
+	body := &countingBody{Reader: strings.NewReader("malformed")}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", body)
+	// This is within the family multipart envelope (64 MiB + 4 MiB), but
+	// exceeds the former 1 MiB outer guard. The handler must get to parsing.
+	req.ContentLength = int64(session.MaxSourceBytes + (2 << 20))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || body.reads == 0 {
 		t.Fatalf("status=%d reads=%d", rr.Code, body.reads)
 	}
 }
@@ -564,6 +669,110 @@ func TestLiveRoutesUseCatalogAndRenderBothProviders(t *testing.T) {
 	}
 }
 
+func TestNormalLiveRouteRendersDelegatedFamily(t *testing.T) {
+	root := t.TempDir()
+	claudeRoot := filepath.Join(root, "claude")
+	mainPath := filepath.Join(claudeRoot, "family-1.jsonl")
+	childPath := filepath.Join(claudeRoot, "family-1", "subagents", "agent-child-1.jsonl")
+	if err := os.MkdirAll(filepath.Dir(childPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	main := []byte("{\"type\":\"user\",\"uuid\":\"main-prompt\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:00Z\",\"message\":{\"content\":\"Main prompt\"}}\n" +
+		"{\"type\":\"assistant\",\"uuid\":\"main-assistant\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"agent-call\",\"name\":\"Agent\",\"input\":{}}]}}\n" +
+		"{\"type\":\"user\",\"uuid\":\"main-result\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:02Z\",\"toolUseResult\":{\"agentId\":\"child-1\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"agent-call\",\"content\":\"done\"}]}}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"main-terminal\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:03Z\"}\n")
+	child := []byte("{\"type\":\"user\",\"uuid\":\"child-prompt\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"message\":{\"content\":\"Child prompt\"}}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"child-terminal\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:03Z\"}\n")
+	if err := os.WriteFile(mainPath, main, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childPath, child, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := New(ServerConfig{Roots: discovery.Roots{Claude: []string{claudeRoot}}})
+	for _, path := range []string{"/live", "/live/claude/family-1"} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", path, rr.Code, rr.Body.String())
+		}
+		if path == "/live" && !strings.Contains(rr.Body.String(), `href="/live/claude/family-1"`) {
+			t.Fatalf("catalog did not contain family: %s", rr.Body.String())
+		}
+		if path != "/live" && (!strings.Contains(rr.Body.String(), "Delegated work / child-1") || !strings.Contains(rr.Body.String(), "Child prompt")) {
+			t.Fatalf("family was flattened: %s", rr.Body.String())
+		}
+	}
+}
+
+func TestFocusedServerRejectsCatalogAndOtherFamilies(t *testing.T) {
+	root := t.TempDir()
+	selectedPath := filepath.Join(root, "claude-session.jsonl")
+	if err := os.WriteFile(selectedPath, mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := discovery.InspectPath(context.Background(), selectedPath, time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := discovery.SessionFamilyCandidate{
+		Provider: "claude", ProviderSessionID: "claude-session-1",
+		Main: discovery.SourceCandidate{Candidate: candidate},
+	}
+	h := New(ServerConfig{FocusedFamily: selected})
+	assertStatus(t, h, "/live", http.StatusNotFound)
+	assertStatus(t, h, "/live/claude/other", http.StatusNotFound)
+	assertStatus(t, h, "/live/claude/claude-session-1", http.StatusOK)
+	assertStatus(t, h, "/static/app.css", http.StatusOK)
+}
+
+func TestAllProjectsRoutesRequireOptInAndUseFamilyKeys(t *testing.T) {
+	root := t.TempDir()
+	claudeRoot := filepath.Join(root, "claude")
+	if err := os.MkdirAll(claudeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeRoot, "claude-session.jsonl"), mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots := discovery.Roots{Claude: []string{claudeRoot}}
+	families, err := discovery.DiscoverAllFamilies(context.Background(), roots, time.Now(), 5*time.Minute)
+	if err != nil || len(families) != 1 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+	projectPath := "/live/projects/" + families[0].Project.Key
+	familyPath := projectPath + "/families/" + families[0].Key
+	for _, path := range []string{"/live/projects", projectPath, familyPath} {
+		assertStatus(t, New(ServerConfig{Roots: roots}), path, http.StatusNotFound)
+	}
+	h := New(ServerConfig{Roots: roots, AllProjects: true})
+	assertStatus(t, h, "/live/projects", http.StatusOK)
+	assertStatus(t, h, projectPath, http.StatusOK)
+	assertStatus(t, h, familyPath, http.StatusOK)
+	assertStatus(t, h, "/live/claude/claude-session-1", http.StatusNotFound)
+}
+
+func TestLiveProjectIndexSortsProjectKeys(t *testing.T) {
+	projects := map[string]session.ProjectRef{
+		"p_z": {Key: "p_z", DisplayName: "z"},
+		"p_a": {Key: "p_a", DisplayName: "a"},
+		"p_m": {Key: "p_m", DisplayName: "m"},
+	}
+	got := sortedProjectKeys(projects)
+	if want := []string{"p_a", "p_m", "p_z"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("keys=%v want=%v", got, want)
+	}
+}
+
+func assertStatus(t *testing.T, h http.Handler, path string, want int) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+	if rr.Code != want {
+		t.Fatalf("%s status = %d, want %d", path, rr.Code, want)
+	}
+}
+
 func TestLiveImportImportsMultipleCatalogSelections(t *testing.T) {
 	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
 	form := "session=claude%3Aclaude-session-1&session=codex%3Acodex-session-1"
@@ -581,6 +790,47 @@ func TestLiveImportImportsMultipleCatalogSelections(t *testing.T) {
 		if err != nil || len(items) != 2 {
 			t.Fatalf("items = %#v, err = %v", items, err)
 		}
+	}
+}
+
+func TestLiveImportPersistsSelectedFamilyAtomically(t *testing.T) {
+	root := t.TempDir()
+	claudeRoot := filepath.Join(root, "claude")
+	mainPath := filepath.Join(claudeRoot, "family-1.jsonl")
+	childPath := filepath.Join(claudeRoot, "family-1", "subagents", "agent-real.jsonl")
+	if err := os.MkdirAll(filepath.Dir(childPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	main := []byte("{\"type\":\"user\",\"uuid\":\"main-prompt\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T07:59:59Z\",\"message\":{\"content\":\"Main prompt\"}}\n" +
+		"{\"type\":\"assistant\",\"uuid\":\"main-call\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"agent-call\",\"name\":\"Agent\",\"input\":{}}]}}\n" +
+		"{\"type\":\"user\",\"uuid\":\"main-result\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"toolUseResult\":{\"agentId\":\"real\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"agent-call\",\"content\":\"done\"}]}}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"main-terminal\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:02Z\"}\n")
+	child := []byte("{\"type\":\"user\",\"uuid\":\"child-prompt\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:01Z\",\"message\":{\"content\":\"Child prompt\"}}\n" +
+		"{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"child-terminal\",\"sessionId\":\"family-1\",\"timestamp\":\"2026-07-17T08:00:02Z\"}\n")
+	if err := os.WriteFile(mainPath, main, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childPath, child, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewFilesystem(t.TempDir())
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: discovery.Roots{Claude: []string{claudeRoot}}}).(*server)
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Afamily-1"))
+	r.Host = "example.test"
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	attachLocalCSRF(t, h, r)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	items, err := st.ListSessions(context.Background(), session.Directory{Kind: "users", Slug: "local"})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items=%#v err=%v", items, err)
+	}
+	pkg, err := st.GetSession(context.Background(), items[0].ID)
+	if err != nil || len(pkg.Sources) != 2 || len(pkg.Family.Children) != 1 || pkg.Family.Children[0].AgentID != "real" {
+		t.Fatalf("package=%#v err=%v", pkg, err)
 	}
 }
 

@@ -12,6 +12,32 @@ import (
 	"testing"
 )
 
+func TestClientUploadSendsMainThenSortedChildren(t *testing.T) {
+	s := newLoopbackServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(64 << 10); err != nil {
+			t.Fatal(err)
+		}
+		defer r.MultipartForm.RemoveAll()
+		if got := len(r.MultipartForm.File["source"]); got != 1 {
+			t.Fatalf("main files = %d", got)
+		}
+		children := r.MultipartForm.File["child"]
+		if len(children) != 2 || children[0].Filename != "a.jsonl" || children[1].Filename != "z.jsonl" {
+			t.Fatalf("children = %#v", children)
+		}
+		w.Header().Set("Location", "/sessions/s_test")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer s.Close()
+	_, err := (Client{BaseURL: s.URL, Token: "short-lived"}).Upload(context.Background(), Request{
+		SourceName: "main.jsonl", Source: bytes.NewBufferString("main"), Destination: "projects/platform",
+		Children: []ChildSource{{SourceName: "z.jsonl", Source: bytes.NewBufferString("z")}, {SourceName: "a.jsonl", Source: bytes.NewBufferString("a")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientUploadRejectsCrossOriginLocation(t *testing.T) {
 	s := newLoopbackServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/sessions" {

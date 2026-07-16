@@ -1,6 +1,11 @@
 package review
 
-import "github.com/swiftdiaries/agent-transcripts/internal/session"
+import (
+	"sort"
+	"time"
+
+	"github.com/swiftdiaries/agent-transcripts/internal/session"
+)
 
 type Turn struct {
 	Prompt      session.Event
@@ -18,6 +23,7 @@ type ChildTranscript struct {
 	ParentToolCallID string
 	AgentType        string
 	Description      string
+	StartedAt        time.Time
 	Completion       session.Completion
 	Transcript       Transcript
 }
@@ -31,13 +37,19 @@ type FamilyTranscript struct {
 func ProjectFamily(family session.SessionFamily) FamilyTranscript {
 	out := FamilyTranscript{Main: Project(family.Main), Attached: make(map[string][]ChildTranscript)}
 	for _, child := range family.Children {
-		projected := ChildTranscript{AgentID: child.AgentID, ParentToolCallID: child.ParentToolCallID, AgentType: child.AgentType, Description: child.Description, Completion: child.Session.Completion, Transcript: Project(child.Session)}
+		projected := ChildTranscript{AgentID: child.AgentID, ParentToolCallID: child.ParentToolCallID, AgentType: child.AgentType, Description: child.Description, StartedAt: child.Session.StartedAt, Completion: child.Session.Completion, Transcript: Project(child.Session)}
 		if child.Attached {
 			out.Attached[child.ParentToolCallID] = append(out.Attached[child.ParentToolCallID], projected)
 		} else {
 			out.Unattached = append(out.Unattached, projected)
 		}
 	}
+	sort.Slice(out.Unattached, func(i, j int) bool {
+		if out.Unattached[i].StartedAt.Equal(out.Unattached[j].StartedAt) {
+			return out.Unattached[i].AgentID < out.Unattached[j].AgentID
+		}
+		return out.Unattached[i].StartedAt.Before(out.Unattached[j].StartedAt)
+	})
 	return out
 }
 

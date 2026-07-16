@@ -11,8 +11,14 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 )
+
+type ChildSource struct {
+	SourceName string
+	Source     io.Reader
+}
 
 type Request struct {
 	SourceName  string
@@ -21,6 +27,7 @@ type Request struct {
 	Title       string
 	Description string
 	Tags        []string
+	Children    []ChildSource
 }
 
 type Result struct {
@@ -53,6 +60,20 @@ func (c Client) Upload(ctx context.Context, input Request) (Result, error) {
 	}
 	if _, err := io.Copy(part, input.Source); err != nil {
 		return Result{}, fmt.Errorf("read source: %w", err)
+	}
+	children := append([]ChildSource(nil), input.Children...)
+	sort.Slice(children, func(i, j int) bool { return children[i].SourceName < children[j].SourceName })
+	for _, child := range children {
+		if child.Source == nil || child.SourceName == "" {
+			return Result{}, errors.New("child source name and source are required")
+		}
+		part, err := mw.CreateFormFile("child", path.Base(child.SourceName))
+		if err != nil {
+			return Result{}, err
+		}
+		if _, err := io.Copy(part, child.Source); err != nil {
+			return Result{}, fmt.Errorf("read child source: %w", err)
+		}
 	}
 	for key, value := range map[string]string{"destination": input.Destination, "title": input.Title, "description": input.Description} {
 		if err := mw.WriteField(key, value); err != nil {

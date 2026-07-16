@@ -21,6 +21,151 @@ func testPackage(dest session.Directory) session.Package {
 	s := session.Session{SchemaVersion: 1, ID: "upstream", Provider: "claude", Events: []session.Event{{ID: "e1", Kind: session.EventUser}}, Completion: session.Completion{Terminal: true, TerminalReason: "done"}}
 	return session.Package{ID: id, ContentID: cid, Metadata: meta, Session: s, Source: []byte("source"), Normalized: []byte(`{"schema_version":1}`)}
 }
+
+func familyPackage(t *testing.T, names ...string) session.Package {
+	t.Helper()
+	if len(names) == 0 {
+		t.Fatal("family needs a main source")
+	}
+	dest := session.Directory{Kind: "users", Slug: "ada"}
+	familyID := "family_1"
+	main := session.Session{SchemaVersion: 1, ID: names[0], Provider: "claude", ProviderSessionID: familyID, Events: []session.Event{{ID: "e_main", Kind: session.EventUser}}, Completion: session.Completion{Terminal: true, TerminalReason: "done"}}
+	family := session.SessionFamily{SchemaVersion: 2, ID: familyID, Provider: "claude", ProviderSessionID: familyID, Project: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"}, Main: main, Completion: session.FamilyCompletion{Status: "provider_terminal", Reason: "all_members_terminal"}}
+	entries := []session.SourceEntry{{Role: "main", Checksum: checksum([]byte(names[0])), Bytes: int64(len(names[0])), Name: "source/main.jsonl"}}
+	sources := []session.SourceBlob{{Entry: entries[0], Bytes: []byte(names[0])}}
+	facts := []session.SourceFactEntry{{Role: "main", Facts: session.SourceFacts{ObservedSize: int64(len(names[0]))}}}
+	for _, name := range names[1:] {
+		child := session.Session{SchemaVersion: 1, ID: name, Provider: "claude", ProviderSessionID: familyID, Events: []session.Event{{ID: "e_" + name, Kind: session.EventUser}}, Completion: session.Completion{Terminal: true, TerminalReason: "done"}}
+		family.Children = append(family.Children, session.ChildSession{AgentID: name, Session: child})
+		entry := session.SourceEntry{Role: "child", AgentID: name, Checksum: checksum([]byte(name)), Bytes: int64(len(name)), Name: "source/children/" + name + ".jsonl"}
+		entries = append(entries, entry)
+		sources = append(sources, session.SourceBlob{Entry: entry, Bytes: []byte(name)})
+		facts = append(facts, session.SourceFactEntry{Role: "child", AgentID: name, Facts: session.SourceFacts{ObservedSize: int64(len(name))}})
+	}
+	sm := session.SourceManifest{SchemaVersion: 2, Provider: "claude", SessionID: familyID, Sources: entries}
+	contentID := session.ContentIDForManifest("claude", sm)
+	id := session.PackageID(contentID, dest)
+	return session.Package{ID: id, ContentID: contentID, Session: main, Metadata: session.Metadata{ID: id, ContentID: contentID, Provider: "claude", UploaderKey: "ada", Destination: dest, SourceChecksum: entries[0].Checksum, ParserVersion: 1, NormalizedSchemaVersion: 2}, SchemaVersion: 2, Family: family, SourceManifest: sm, Sources: sources, SourceFactsSet: facts}
+}
+
+func TestFilesystemPutFamilyReadsEveryMember(t *testing.T) {
+	st, pkg := NewFilesystem(t.TempDir()), familyPackage(t, "main", "child")
+	created, err := st.PutFamily(context.Background(), pkg)
+	if err != nil || !created {
+		t.Fatalf("%v, %v", created, err)
+	}
+	got, err := st.GetSession(context.Background(), pkg.ID)
+	if err != nil || len(got.Sources) != 2 {
+		t.Fatalf("%#v, %v", got, err)
+	}
+}
+
+func TestLegacyPackageReadsAsOneSourceFamily(t *testing.T) {
+	st := NewFilesystem(t.TempDir())
+	pkg := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := st.PutSession(context.Background(), pkg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetSession(context.Background(), pkg.ID)
+	if err != nil || got.Family.Main.ID == "" || len(got.Family.Children) != 0 || len(got.Sources) != 1 {
+		t.Fatalf("%#v, %v", got, err)
+	}
+}
+
+func TestFilesystemPutSessionAdaptsToSanitizedV2Family(t *testing.T) {
+	st := NewFilesystem(t.TempDir())
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	p.Session.WorkingDirectory = "/private/repo"
+	p.Metadata.WorkingDirectory = "/private/repo"
+	if _, err := st.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	_, m, err := st.find(p.ID)
+	if err != nil || m.SchemaVersion != familyManifestSchemaVersion {
+		t.Fatalf("manifest = %#v, %v", m, err)
+	}
+	familyJSON, err := st.readPackageBytes(p.Metadata.Destination, p.ID, "family.json")
+	if err != nil || strings.Contains(string(familyJSON), "/private/repo") {
+		t.Fatalf("family = %s, %v", familyJSON, err)
+	}
+	metadataJSON, err := st.readPackageBytes(p.Metadata.Destination, p.ID, "metadata.json")
+	if err != nil || strings.Contains(string(metadataJSON), "/private/repo") {
+		t.Fatalf("metadata = %s, %v", metadataJSON, err)
+	}
+}
+
+func TestFilesystemRecoversV2MetadataJournal(t *testing.T) {
+	root := t.TempDir()
+	st := NewFilesystem(root)
+	p := testPackage(session.Directory{Kind: "users", Slug: "ada"})
+	if _, err := st.PutSession(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetSession(context.Background(), p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Metadata.Title = "recovered v2"
+	st.testFail = func(boundary string) error {
+		if boundary == "metadata-after-data" {
+			return errors.New("injected")
+		}
+		return nil
+	}
+	if _, err := st.UpdateMetadata(context.Background(), p.ID, got.Metadata.Revision, got.Metadata); err == nil {
+		t.Fatal("wanted injected failure")
+	}
+	reopened, err := NewFilesystem(root).GetSession(context.Background(), p.ID)
+	if err != nil || reopened.Metadata.Title != "recovered v2" {
+		t.Fatalf("recovered = %#v, %v", reopened, err)
+	}
+}
+
+func TestFilesystemFamilyDoesNotPersistProjectPaths(t *testing.T) {
+	st := NewFilesystem(t.TempDir())
+	p := familyPackage(t, "main", "child")
+	p.Metadata.Project = "/private/repo"
+	p.Session.Project = "/private/repo"
+	p.Family.Main.Project = "/private/repo"
+	p.Family.Children[0].Session.Project = "/private/repo"
+	if _, err := st.PutFamily(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"metadata.json", "family.json"} {
+		b, err := st.readPackageBytes(p.Metadata.Destination, p.ID, name)
+		if err != nil || strings.Contains(string(b), "/private/repo") {
+			t.Fatalf("%s = %s, %v", name, b, err)
+		}
+	}
+	p = familyPackage(t, "main")
+	p.Family.Project.DisplayName = "/private/repo"
+	if _, err := st.PutFamily(context.Background(), p); err == nil {
+		t.Fatal("accepted path project reference")
+	}
+}
+
+func TestFilesystemFamilyMetadataConflict(t *testing.T) {
+	st := NewFilesystem(t.TempDir())
+	p := familyPackage(t, "main")
+	if _, err := st.PutFamily(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	p.Metadata.Title = "different"
+	if _, err := st.PutFamily(context.Background(), p); !errors.Is(err, ErrConflict) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestFilesystemFamilyRepeatedPutWithEmptyRevisionIsIdempotent(t *testing.T) {
+	st := NewFilesystem(t.TempDir())
+	p := familyPackage(t, "main")
+	if created, err := st.PutFamily(context.Background(), p); err != nil || !created {
+		t.Fatalf("first = %v, %v", created, err)
+	}
+	if created, err := st.PutFamily(context.Background(), p); err != nil || created {
+		t.Fatalf("repeat = %v, %v", created, err)
+	}
+}
 func currentRevision(t *testing.T, s Store, id string) string {
 	t.Helper()
 	p, err := s.GetSession(context.Background(), id)

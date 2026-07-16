@@ -17,11 +17,17 @@ The product has two intended paths:
 The local workflow is **browse → import → publish**. Local mode listens only on
 `127.0.0.1`; it is for an individual operator, not a public or team service.
 
-1. Browse completed local sessions and the library:
+1. Browse one completed local session from the current Git worktree:
 
    ```sh
-   agent-transcripts serve --open
+   agent-transcripts
    ```
+
+   The default command opens a focused transcript. Use `agent-transcripts
+   browse --latest`, `browse --family <key>`, or `browse /path/to/session.jsonl`
+   for non-interactive selection; pass `--no-open` to suppress the browser.
+   `--all-projects` is the explicit opt-in for sessions outside the current
+   worktree.
 
 2. Import a completed session interactively, select the newest, or provide its
    JSONL path:
@@ -56,16 +62,21 @@ Install a Go toolchain compatible with this repository, then build the binary:
 ```sh
 go install github.com/swiftdiaries/agent-transcripts/cmd/agent-transcripts@latest
 agent-transcripts version
-agent-transcripts serve --open
+agent-transcripts
 ```
 
 Local mode discovers sessions from
 `~/.claude/projects`, `~/.codex/sessions`, and `~/.codex/archived_sessions`.
-Visit the displayed local URL to browse live and library pages. Use
+Visit the displayed local URL to browse the selected transcript. Use
 `agent-transcripts serve --config config.example.yaml` to customize local roots,
 quiet period, or the filesystem library root. A non-empty `source_roots` list is
 a combined discovery root list: both provider adapters inspect every listed root
 and retain only files that pass their provider-specific checks.
+
+`serve` remains the persistent catalog command. Its local live catalog is scoped
+to the current worktree by default; use `serve --all-projects` to opt into a
+cross-project catalog. `import` follows the same rule, and `import --all-projects`
+selects a project before its session families.
 
 Import creates an immutable library package only after completion is revalidated:
 

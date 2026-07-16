@@ -73,12 +73,8 @@ func (s *S3) key(d session.Directory, id, name string) (string, error) {
 	if !validManaged(id, "s_") {
 		return "", errors.New("invalid package ID")
 	}
-	switch name {
-	case "manifest.json", "metadata.json", "session.json", "source-facts.json", "source.jsonl", "normalized.json":
-	default:
-		if !validMetadataKey(name) {
-			return "", errors.New("invalid managed filename")
-		}
+	if !isManagedFile(name) && !validMetadataKey(name) {
+		return "", errors.New("invalid managed filename")
 	}
 	return s.prefix + d.Kind + "/" + d.Slug + "/" + id + "/" + name, nil
 }
@@ -172,35 +168,40 @@ func (s *S3) GetSession(ctx context.Context, id string) (session.Package, error)
 	if err != nil {
 		return session.Package{}, err
 	}
-	return s.readPackage(ctx, m)
+	p, err := s.readPackage(ctx, m)
+	return legacyProjection(p), err
 }
 
-func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
-	if err := validatePutPackage(p); err != nil {
+func (s *S3) PutFamily(ctx context.Context, p session.Package) (bool, error) {
+	p = sanitizeFamilyPackage(p)
+	if err := validateFamilyPut(p); err != nil {
 		return false, err
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	p.Metadata.Revision = metadataRevision(p.Metadata)
-	files, err := packageFiles(p)
+	files, err := familyFiles(p)
 	if err != nil {
 		return false, err
 	}
-	m := makeManifest(p, files)
+	metadata, err := json.Marshal(p.Metadata)
+	if err != nil {
+		return false, err
+	}
 	manifestKey, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
 	if _, err := s.client.HeadObject(ctx, s.bucket, manifestKey); err == nil {
 		winner, _, e := s.readManifest(ctx, p.Metadata.Destination, p.ID)
 		if e != nil {
 			return false, e
 		}
-		return s.identical(ctx, winner, p)
+		return s.identicalFamily(ctx, winner, p)
 	} else if !errors.Is(err, ErrS3NotFound) {
 		return false, err
 	}
-	for _, name := range immutableNames {
+	for name, data := range files {
 		key, _ := s.key(p.Metadata.Destination, p.ID, name)
-		if _, err := s.client.PutObject(ctx, s.bucket, key, files[name], S3Condition{IfNoneMatch: true}); err != nil {
+		if _, err := s.client.PutObject(ctx, s.bucket, key, data, S3Condition{IfNoneMatch: true}); err != nil {
 			if !errors.Is(err, ErrS3PreconditionFailed) {
 				return false, err
 			}
@@ -208,7 +209,7 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 			if e != nil {
 				return false, e
 			}
-			if checksum(existing.Body) != checksum(files[name]) {
+			if checksum(existing.Body) != checksum(data) {
 				return false, ErrConflict
 			}
 		}
@@ -216,7 +217,7 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 	metadataKey, _ := s.key(p.Metadata.Destination, p.ID, "metadata.json")
 	reclaimKey := s.reclaimKey(p.Metadata.Destination, p.ID)
 	claimOwned := false
-	if _, err := s.client.PutObject(ctx, s.bucket, metadataKey, files["metadata.json"], S3Condition{IfNoneMatch: true}); err != nil {
+	if _, err := s.client.PutObject(ctx, s.bucket, metadataKey, metadata, S3Condition{IfNoneMatch: true}); err != nil {
 		if !errors.Is(err, ErrS3PreconditionFailed) {
 			return false, err
 		}
@@ -224,83 +225,75 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 		if e != nil {
 			return false, e
 		}
-		if checksum(existing.Body) != checksum(files["metadata.json"]) {
-			if _, e = s.client.PutObject(ctx, s.bucket, reclaimKey, files["metadata.json"], S3Condition{IfNoneMatch: true}); e != nil {
+		if checksum(existing.Body) != checksum(metadata) {
+			_, e = s.client.PutObject(ctx, s.bucket, reclaimKey, metadata, S3Condition{IfNoneMatch: true})
+			claimOwned = e == nil
+			if e != nil {
 				if !errors.Is(e, ErrS3PreconditionFailed) {
 					return false, e
 				}
+				if _, e = s.client.HeadObject(ctx, s.bucket, reclaimKey); e != nil {
+					return false, e
+				}
 				claim, ce := s.get(ctx, reclaimKey, "metadata.json")
-				if ce != nil || checksum(claim.Body) != checksum(files["metadata.json"]) {
+				if ce != nil || checksum(claim.Body) != checksum(metadata) {
 					return false, ErrConflict
 				}
-				claimOwned = true
-			} else {
-				claimOwned = true
 			}
 			if _, e = s.client.HeadObject(ctx, s.bucket, manifestKey); e == nil {
-				if claimOwned {
-					_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
-				}
 				winner, _, we := s.readManifest(ctx, p.Metadata.Destination, p.ID)
 				if we != nil {
 					return false, we
 				}
-				return s.identical(ctx, winner, p)
+				return s.identicalFamily(ctx, winner, p)
 			} else if !errors.Is(e, ErrS3NotFound) {
 				return false, e
 			}
-			if _, e = s.client.PutObject(ctx, s.bucket, metadataKey, files["metadata.json"], S3Condition{IfMatch: existing.ETag}); e != nil {
-				if errors.Is(e, ErrS3PreconditionFailed) {
-					current, ce := s.get(ctx, metadataKey, "metadata.json")
-					if ce != nil {
-						return false, ce
-					}
-					if checksum(current.Body) != checksum(files["metadata.json"]) {
-						if _, ce = s.client.HeadObject(ctx, s.bucket, manifestKey); ce == nil {
-							winner, _, we := s.readManifest(ctx, p.Metadata.Destination, p.ID)
-							if we != nil {
-								return false, we
-							}
-							return s.identical(ctx, winner, p)
-						}
-						return false, ErrConflict
-					}
-				}
+			if _, e = s.client.PutObject(ctx, s.bucket, metadataKey, metadata, S3Condition{IfMatch: existing.ETag}); e != nil {
 				if !errors.Is(e, ErrS3PreconditionFailed) {
 					return false, e
 				}
+				current, ce := s.get(ctx, metadataKey, "metadata.json")
+				if ce != nil {
+					return false, ce
+				}
+				if checksum(current.Body) != checksum(metadata) {
+					return false, ErrConflict
+				}
 			}
 		}
 	}
-	key, _ := s.key(p.Metadata.Destination, p.ID, "manifest.json")
+	hashes := make(map[string]string, len(files))
+	for name, data := range files {
+		hashes[name] = checksum(data)
+	}
+	m := manifest{SchemaVersion: familyManifestSchemaVersion, ID: p.ID, ContentID: p.ContentID, Destination: p.Metadata.Destination, Files: hashes, MetadataRevision: p.Metadata.Revision, MetadataHash: checksum(metadata)}
 	if !claimOwned {
-		if _, e := s.client.HeadObject(ctx, s.bucket, reclaimKey); e == nil {
-			settled, reconcileErr := s.reconcileReclaim(ctx, p, reclaimKey)
-			if settled || reconcileErr != nil {
-				return false, reconcileErr
-			}
-		} else if !errors.Is(e, ErrS3NotFound) {
+		if settled, e := s.reconcileFamilyReclaim(ctx, p, reclaimKey, metadata); settled || e != nil {
 			return false, e
 		}
 	}
-	_, err = s.client.PutObject(ctx, s.bucket, key, mustJSON(m), S3Condition{IfNoneMatch: true})
-	if err == nil {
+	if _, err := s.client.PutObject(ctx, s.bucket, manifestKey, mustJSON(m), S3Condition{IfNoneMatch: true}); err == nil {
 		if claimOwned {
 			_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
 		}
 		return true, nil
-	}
-	if !errors.Is(err, ErrS3PreconditionFailed) {
+	} else if !errors.Is(err, ErrS3PreconditionFailed) {
 		return false, err
 	}
-	winner, _, e := s.readManifest(ctx, p.Metadata.Destination, p.ID)
-	if e != nil {
-		return false, e
+	winner, _, err := s.readManifest(ctx, p.Metadata.Destination, p.ID)
+	if err != nil {
+		return false, err
 	}
-	if claimOwned {
-		_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
+	return s.identicalFamily(ctx, winner, p)
+}
+
+func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
+	family, err := legacyAdapter(p)
+	if err != nil {
+		return false, err
 	}
-	return s.identical(ctx, winner, p)
+	return s.PutFamily(ctx, family)
 }
 
 const (
@@ -494,16 +487,19 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 	p.Metadata.Destination = d
 	p.Metadata.Revision = metadataRevision(p.Metadata)
 	p.ID = newID
-	files, err := packageFiles(p)
+	files, err := packageFilesFor(p)
 	if err != nil {
 		return session.Metadata{}, err
 	}
-	target := makeManifest(p, files)
+	if p.SchemaVersion == familyManifestSchemaVersion {
+		files["metadata.json"], _ = json.Marshal(p.Metadata)
+	}
+	target := makeManifestFor(p, files)
 	intent := s3MoveIntent{OldID: id, NewID: newID, OldDestination: m.Destination, NewDestination: d, Metadata: p.Metadata, SourceManifestETag: sourceManifestETag, Phase: "preparing"}
 	if err := s.writeMoveIntent(ctx, intent); err != nil {
 		return session.Metadata{}, err
 	}
-	for _, name := range immutableNames {
+	for _, name := range immutableFilesForManifest(m) {
 		src, _ := s.key(m.Destination, m.ID, name)
 		dst, _ := s.key(d, newID, name)
 		if _, err := s.client.CopyObject(ctx, s.bucket, src, dst, S3Condition{IfNoneMatch: true}); err != nil {
@@ -541,7 +537,7 @@ func (s *S3) MoveSession(ctx context.Context, id, uploader string, d session.Dir
 		if e != nil {
 			return session.Metadata{}, e
 		}
-		if _, e := s.identical(ctx, winner, p); e != nil {
+		if _, e := s.identicalPackage(ctx, winner, p); e != nil {
 			return session.Metadata{}, e
 		}
 	}
@@ -719,8 +715,39 @@ func packageFiles(p session.Package) (map[string][]byte, error) {
 	}
 	return files, nil
 }
+func packageFilesFor(p session.Package) (map[string][]byte, error) {
+	if p.SchemaVersion == familyManifestSchemaVersion {
+		return familyFiles(p)
+	}
+	return packageFiles(p)
+}
 func makeManifest(p session.Package, files map[string][]byte) manifest {
 	return manifest{SchemaVersion: manifestSchemaVersion, ID: p.ID, ContentID: p.ContentID, Destination: p.Metadata.Destination, Files: map[string]string{"source.jsonl": checksum(files["source.jsonl"]), "normalized.json": checksum(files["normalized.json"])}, MetadataRevision: p.Metadata.Revision, MetadataHash: checksum(files["metadata.json"]), SessionHash: checksum(files["session.json"]), SourceFactsHash: checksum(files["source-facts.json"])}
+}
+func makeManifestFor(p session.Package, files map[string][]byte) manifest {
+	if p.SchemaVersion != familyManifestSchemaVersion {
+		return makeManifest(p, files)
+	}
+	hashes := make(map[string]string, len(files)-1)
+	for name, data := range files {
+		if name == "metadata.json" {
+			continue
+		}
+		hashes[name] = checksum(data)
+	}
+	metadata, _ := json.Marshal(p.Metadata)
+	return manifest{SchemaVersion: familyManifestSchemaVersion, ID: p.ID, ContentID: p.ContentID, Destination: p.Metadata.Destination, Files: hashes, MetadataRevision: p.Metadata.Revision, MetadataHash: checksum(metadata)}
+}
+func immutableFilesForManifest(m manifest) []string {
+	if m.SchemaVersion != familyManifestSchemaVersion {
+		return immutableNames
+	}
+	names := make([]string, 0, len(m.Files))
+	for name := range m.Files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 func (s *S3) list(ctx context.Context, prefix string) ([]string, error) {
 	var all []string
@@ -749,7 +776,7 @@ func (s *S3) get(ctx context.Context, key, name string) (S3Object, error) {
 		return o, err
 	}
 	limit := 1 << 20
-	if name == "source.jsonl" || name == "normalized.json" || name == "session.json" {
+	if safeFamilyFile(name) || name == "normalized.json" || name == "session.json" || name == "family.json" || name == "source-manifest.json" {
 		limit = session.MaxSourceBytes
 	}
 	if name == "source-facts.json" {
@@ -829,6 +856,9 @@ func readS3JSON[T any](ctx context.Context, s *S3, m manifest, name string) (T, 
 	return v, o.ETag, err
 }
 func (s *S3) readPackage(ctx context.Context, m manifest) (session.Package, error) {
+	if m.SchemaVersion == familyManifestSchemaVersion {
+		return s.readFamilyPackage(ctx, m)
+	}
 	metadataName := metadataObjectName(m)
 	md, _, err := readS3JSON[session.Metadata](ctx, s, m, metadataName)
 	if err != nil {
@@ -870,6 +900,120 @@ func (s *S3) readPackage(ctx context.Context, m manifest) (session.Package, erro
 		return session.Package{}, err
 	}
 	return p, nil
+}
+
+func (s *S3) readFamilyPackage(ctx context.Context, m manifest) (session.Package, error) {
+	metadataName := metadataObjectName(m)
+	md, _, err := readS3JSON[session.Metadata](ctx, s, m, metadataName)
+	if err != nil {
+		return session.Package{}, err
+	}
+	family, _, err := readS3JSON[session.SessionFamily](ctx, s, m, "family.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	sm, _, err := readS3JSON[session.SourceManifest](ctx, s, m, "source-manifest.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	facts, _, err := readS3JSON[[]session.SourceFactEntry](ctx, s, m, "source-facts.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	normKey, _ := s.key(m.Destination, m.ID, "normalized.json")
+	norm, err := s.get(ctx, normKey, "normalized.json")
+	if err != nil {
+		return session.Package{}, err
+	}
+	for name, want := range m.Files {
+		key, _ := s.key(m.Destination, m.ID, name)
+		o, e := s.get(ctx, key, name)
+		if e != nil || checksum(o.Body) != want {
+			return session.Package{}, errors.New("package file hash mismatch")
+		}
+	}
+	metadataKey, _ := s.key(m.Destination, m.ID, metadataName)
+	metadata, err := s.get(ctx, metadataKey, "metadata.json")
+	if err != nil || checksum(metadata.Body) != m.MetadataHash || md.Revision != m.MetadataRevision || md.Destination != m.Destination {
+		return session.Package{}, errors.New("manifest metadata mismatch")
+	}
+	sources := make([]session.SourceBlob, len(sm.Sources))
+	for i, entry := range sm.Sources {
+		key, _ := s.key(m.Destination, m.ID, entry.Name)
+		o, e := s.get(ctx, key, entry.Name)
+		if e != nil {
+			return session.Package{}, e
+		}
+		sources[i] = session.SourceBlob{Entry: entry, Bytes: o.Body}
+	}
+	p := session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sm, Sources: sources, SourceFactsSet: facts, Normalized: norm.Body}
+	if err := validateFamilyPut(p); err != nil {
+		return session.Package{}, err
+	}
+	return p, nil
+}
+
+func (s *S3) identicalFamily(ctx context.Context, m manifest, p session.Package) (bool, error) {
+	if m.SchemaVersion != familyManifestSchemaVersion || m.ID != p.ID || m.ContentID != p.ContentID || m.Destination != p.Metadata.Destination {
+		return false, ErrConflict
+	}
+	files, err := familyFiles(p)
+	if err != nil {
+		return false, err
+	}
+	for name, data := range files {
+		if m.Files[name] != checksum(data) {
+			return false, ErrConflict
+		}
+	}
+	metadata, _ := json.Marshal(p.Metadata)
+	if m.MetadataHash != checksum(metadata) {
+		return false, ErrConflict
+	}
+	return false, nil
+}
+
+func (s *S3) reconcileFamilyReclaim(ctx context.Context, p session.Package, reclaimKey string, metadata []byte) (bool, error) {
+	delay := reclaimRetryInitialDelay
+	for {
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		winner, _, err := s.readManifest(ctx, p.Metadata.Destination, p.ID)
+		if err == nil {
+			_, e := s.identicalFamily(ctx, winner, p)
+			return true, e
+		}
+		if !errors.Is(err, ErrS3NotFound) {
+			return true, err
+		}
+		claim, err := s.get(ctx, reclaimKey, "metadata.json")
+		if errors.Is(err, ErrS3NotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return true, err
+		}
+		if checksum(claim.Body) != checksum(metadata) {
+			return true, ErrConflict
+		}
+		if err := waitForReclaim(ctx, delay); err != nil {
+			return true, err
+		}
+		if delay < reclaimRetryMaxDelay {
+			delay *= 2
+			if delay > reclaimRetryMaxDelay {
+				delay = reclaimRetryMaxDelay
+			}
+		}
+	}
+}
+
+func (s *S3) identicalPackage(ctx context.Context, m manifest, p session.Package) (bool, error) {
+	if m.SchemaVersion == familyManifestSchemaVersion {
+		return s.identicalFamily(ctx, m, p)
+	}
+	return s.identical(ctx, m, p)
 }
 func (s *S3) identical(ctx context.Context, m manifest, p session.Package) (bool, error) {
 	if m.ID != p.ID || m.ContentID != p.ContentID || m.Destination != p.Metadata.Destination {

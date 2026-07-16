@@ -3,6 +3,7 @@ package review
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
@@ -43,5 +44,23 @@ func TestProjectFamilySeparatesAttachedAndUnattachedChildren(t *testing.T) {
 	got := ProjectFamily(family)
 	if len(got.Attached["call"]) != 1 || len(got.Unattached) != 1 {
 		t.Fatalf("family = %#v", got)
+	}
+}
+
+func TestProjectFamilyAttachesChildAtParentToolCallAndOrdersUnattached(t *testing.T) {
+	late := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	early := late.Add(-time.Minute)
+	family := session.SessionFamily{Main: session.Session{Events: []session.Event{{ID: "call-1", Kind: session.EventToolCall, ToolName: "Agent"}}}, Children: []session.ChildSession{
+		{AgentID: "attached", Attached: true, ParentToolCallID: "call-1", Session: session.Session{Events: []session.Event{{ID: "child", Kind: session.EventUser, Text: "attached"}}}},
+		{AgentID: "z", Session: session.Session{StartedAt: early}},
+		{AgentID: "a", Session: session.Session{StartedAt: early}},
+		{AgentID: "later", Session: session.Session{StartedAt: late}},
+	}}
+	got := ProjectFamily(family)
+	if len(got.Attached["call-1"]) != 1 || len(got.Unattached) != 3 {
+		t.Fatalf("family = %#v", got)
+	}
+	if got.Unattached[0].AgentID != "a" || got.Unattached[1].AgentID != "z" || got.Unattached[2].AgentID != "later" {
+		t.Fatalf("unattached order = %#v", got.Unattached)
 	}
 }

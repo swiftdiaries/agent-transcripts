@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
 )
@@ -70,5 +72,35 @@ func TestImportRejectsSourceLargerThanBound(t *testing.T) {
 	_, err := svc.Import(context.Background(), bytes.NewReader(make([]byte, session.MaxSourceBytes+1)), session.SourceFacts{}, ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "ada"}, UploaderKey: "ada"})
 	if err == nil {
 		t.Fatal("accepted oversize source")
+	}
+}
+
+func TestImportFamilyPersistsMainAndChildTogether(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewFilesystem(t.TempDir())
+	attrs := ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "ada"}, UploaderKey: "ada"}
+	md, created, err := New(st, AllowLocalQuietEvidence()).ImportFamilyWithStatus(ctx, snapshotFamily(t), attrs)
+	if err != nil || !created {
+		t.Fatalf("%#v %v %v", md, created, err)
+	}
+	got, err := st.GetSession(ctx, md.ID)
+	if err != nil || len(got.Family.Children) != 1 || len(got.Sources) != 2 {
+		t.Fatalf("%#v %v", got, err)
+	}
+}
+
+func snapshotFamily(t *testing.T) discovery.FamilySnapshot {
+	t.Helper()
+	main := fixture(t, "claude-session.jsonl")
+	child := bytes.Clone(fixture(t, "claude-session.jsonl"))
+	return discovery.FamilySnapshot{
+		Candidate: discovery.SessionFamilyCandidate{
+			Provider: "claude", ProviderSessionID: "claude-session-1",
+			Project: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("a", 64), DisplayName: "demo"},
+		},
+		Sources: []discovery.SnapshotSource{
+			{Role: "main", Bytes: main, Facts: session.SourceFacts{ObservedSize: int64(len(main)), QuietPeriodVerified: true}},
+			{Role: "child", AgentID: "child-1", Bytes: child, Facts: session.SourceFacts{ObservedSize: int64(len(child)), QuietPeriodVerified: true}},
+		},
 	}
 }

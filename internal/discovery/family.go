@@ -71,11 +71,30 @@ func FormFamilies(candidates []Candidate, scope session.ProjectScope) ([]Session
 // provider family. It intentionally re-parses candidates to obtain provider
 // CWD provenance rather than trusting encoded directory names.
 func DiscoverFamilies(ctx context.Context, roots Roots, scope session.ProjectScope, now time.Time, quiet time.Duration) ([]SessionFamilyCandidate, error) {
+	all, err := DiscoverAllFamilies(ctx, roots, now, quiet)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SessionFamilyCandidate, 0, len(all))
+	for _, family := range all {
+		if family.Project.Key == scope.Ref.Key {
+			result = append(result, family)
+		}
+	}
+	return result, nil
+}
+
+// DiscoverAllFamilies returns eligible session families grouped by their
+// canonical project identity. It is reserved for explicit cross-project flows.
+func DiscoverAllFamilies(ctx context.Context, roots Roots, now time.Time, quiet time.Duration) ([]SessionFamilyCandidate, error) {
 	candidates, err := Discover(ctx, roots, now, quiet)
 	if err != nil {
 		return nil, err
 	}
-	eligible := make([]Candidate, 0, len(candidates))
+	byProject := make(map[string]struct {
+		scope      session.ProjectScope
+		candidates []Candidate
+	})
 	for _, candidate := range candidates {
 		f, err := os.Open(candidate.Path)
 		if err != nil {
@@ -87,11 +106,28 @@ func DiscoverFamilies(ctx context.Context, roots Roots, scope session.ProjectSco
 			continue
 		}
 		memberScope, scopeErr := ResolveProjectScope(parsed.WorkingDirectory)
-		if scopeErr == nil && memberScope.Ref.Key == scope.Ref.Key {
-			eligible = append(eligible, candidate)
+		if scopeErr == nil {
+			group := byProject[memberScope.Ref.Key]
+			group.scope = memberScope
+			group.candidates = append(group.candidates, candidate)
+			byProject[memberScope.Ref.Key] = group
 		}
 	}
-	return FormFamilies(eligible, scope)
+	var result []SessionFamilyCandidate
+	for _, group := range byProject {
+		families, err := FormFamilies(group.candidates, group.scope)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, families...)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if !result[i].StartedAt.Equal(result[j].StartedAt) {
+			return result[i].StartedAt.After(result[j].StartedAt)
+		}
+		return result[i].Key < result[j].Key
+	})
+	return result, nil
 }
 
 func claudeChildIdentity(path string) string {
