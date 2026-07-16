@@ -37,3 +37,11 @@ func TestProjectKeepsToolEventsWithTheirPrompt(t *testing.T) {
 		t.Fatalf("turn = %+v", got.Turns)
 	}
 }
+
+func TestProjectFamilySeparatesAttachedAndUnattachedChildren(t *testing.T) {
+	family := session.SessionFamily{Main: session.Session{Events: []session.Event{{ID: "prompt", Kind: session.EventUser, Text: "main"}}}, Children: []session.ChildSession{{AgentID: "a", Attached: true, ParentToolCallID: "call", Session: session.Session{Events: []session.Event{{ID: "child", Kind: session.EventUser, Text: "attached"}}}}, {AgentID: "b", Session: session.Session{Events: []session.Event{{ID: "other", Kind: session.EventUser, Text: "unattached"}}}}}}
+	got := ProjectFamily(family)
+	if len(got.Attached["call"]) != 1 || len(got.Unattached) != 1 {
+		t.Fatalf("family = %#v", got)
+	}
+}

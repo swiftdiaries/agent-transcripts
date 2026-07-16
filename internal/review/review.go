@@ -13,6 +13,34 @@ type Transcript struct {
 	Diagnostics []session.Event
 }
 
+type ChildTranscript struct {
+	AgentID          string
+	ParentToolCallID string
+	AgentType        string
+	Description      string
+	Completion       session.Completion
+	Transcript       Transcript
+}
+
+type FamilyTranscript struct {
+	Main       Transcript
+	Attached   map[string][]ChildTranscript
+	Unattached []ChildTranscript
+}
+
+func ProjectFamily(family session.SessionFamily) FamilyTranscript {
+	out := FamilyTranscript{Main: Project(family.Main), Attached: make(map[string][]ChildTranscript)}
+	for _, child := range family.Children {
+		projected := ChildTranscript{AgentID: child.AgentID, ParentToolCallID: child.ParentToolCallID, AgentType: child.AgentType, Description: child.Description, Completion: child.Session.Completion, Transcript: Project(child.Session)}
+		if child.Attached {
+			out.Attached[child.ParentToolCallID] = append(out.Attached[child.ParentToolCallID], projected)
+		} else {
+			out.Unattached = append(out.Unattached, projected)
+		}
+	}
+	return out
+}
+
 func Project(s session.Session) Transcript {
 	var out Transcript
 	var current *Turn
