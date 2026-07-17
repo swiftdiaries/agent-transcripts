@@ -33,6 +33,7 @@ type Candidate struct {
 	StartedAt time.Time
 	Status    string
 	Origin    session.SessionOrigin
+	Scope     session.ProjectScope
 
 	modTime       time.Time
 	size          int64
@@ -153,9 +154,10 @@ func inspect(ctx context.Context, path, provider string, now time.Time, quiet ti
 	if parsed.Completion.Terminal {
 		status = "terminal"
 	}
+	scope, _ := ResolveProjectScope(parsed.WorkingDirectory)
 	return Candidate{Path: path, Provider: provider, SessionID: parsed.ProviderSessionID,
 		Project: project(parsed), Title: title(parsed), StartedAt: parsed.StartedAt, Status: status,
-		Origin:  parsed.Origin,
+		Origin: parsed.Origin, Scope: scope,
 		modTime: info.ModTime(), size: info.Size(), quietVerified: !parsed.Completion.Terminal && quietOK, sourceInfo: info}, true, nil
 }
 

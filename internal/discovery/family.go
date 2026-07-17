@@ -4,13 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/swiftdiaries/agent-transcripts/internal/parser"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
 
@@ -95,8 +93,53 @@ func formCodexFamilies(candidates []Candidate, scope session.ProjectScope) ([]Se
 		}
 	}
 	markCodexCycles(byID, invalid)
+	markCrossProjectCodexComponents(byID, invalid, scope)
 	propagateInvalidCodexParents(byID, invalid)
 	return buildCodexRootFamilies(byID, invalid, scope), nil
+}
+
+// markCrossProjectCodexComponents rejects a whole connected parent graph when
+// one parent-child edge spans canonical project scopes. Keeping only the root
+// would otherwise expose a partial family after callers partition candidates.
+func markCrossProjectCodexComponents(byID map[string]Candidate, invalid map[string]bool, fallback session.ProjectScope) {
+	neighbors := make(map[string][]string, len(byID))
+	var seeds []string
+	for id, candidate := range byID {
+		parent := candidate.Origin.ParentSessionID
+		parentCandidate, ok := byID[parent]
+		if parent == "" || !ok {
+			continue
+		}
+		neighbors[id] = append(neighbors[id], parent)
+		neighbors[parent] = append(neighbors[parent], id)
+		if codexCandidateScope(candidate, fallback).Ref.Key != codexCandidateScope(parentCandidate, fallback).Ref.Key {
+			seeds = append(seeds, id, parent)
+		}
+	}
+	for _, seed := range seeds {
+		if invalid[seed] {
+			continue
+		}
+		invalid[seed] = true
+		queue := []string{seed}
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			for _, neighbor := range neighbors[id] {
+				if !invalid[neighbor] {
+					invalid[neighbor] = true
+					queue = append(queue, neighbor)
+				}
+			}
+		}
+	}
+}
+
+func codexCandidateScope(candidate Candidate, fallback session.ProjectScope) session.ProjectScope {
+	if candidate.Scope.Ref.Key != "" {
+		return candidate.Scope
+	}
+	return fallback
 }
 
 func markCodexCycles(byID map[string]Candidate, invalid map[string]bool) {
@@ -173,7 +216,8 @@ func buildCodexRootFamilies(byID map[string]Candidate, invalid map[string]bool, 
 	sort.Slice(roots, func(i, j int) bool { return roots[i].SessionID < roots[j].SessionID })
 	result := make([]SessionFamilyCandidate, 0, len(roots))
 	for _, root := range roots {
-		family := SessionFamilyCandidate{Key: familyKey(root.Provider, root.Path), Provider: root.Provider, ProviderSessionID: root.SessionID, Project: scope.Ref, Title: root.Title, StartedAt: root.StartedAt, Status: root.Status, Main: SourceCandidate{Candidate: root}}
+		familyScope := codexCandidateScope(root, scope)
+		family := SessionFamilyCandidate{Key: familyKey(root.Provider, root.Path), Provider: root.Provider, ProviderSessionID: root.SessionID, Project: familyScope.Ref, Title: root.Title, StartedAt: root.StartedAt, Status: root.Status, Main: SourceCandidate{Candidate: root}}
 		var appendDescendants func(string)
 		appendDescendants = func(parent string) {
 			for _, child := range childrenByParent[parent] {
@@ -218,27 +262,31 @@ func DiscoverAllFamilies(ctx context.Context, roots Roots, now time.Time, quiet 
 		scope      session.ProjectScope
 		candidates []Candidate
 	})
+	var codex []Candidate
 	for _, candidate := range candidates {
-		f, err := os.Open(candidate.Path)
-		if err != nil {
+		memberScope := candidate.Scope
+		if memberScope.Ref.Key == "" {
 			continue
 		}
-		parsed, parseErr := parser.DefaultRegistry().DetectAndParse(ctx, f)
-		_ = f.Close()
-		if parseErr != nil || parsed.WorkingDirectory == "" {
+		if candidate.Provider == "codex" {
+			codex = append(codex, candidate)
 			continue
 		}
-		memberScope, scopeErr := ResolveProjectScope(parsed.WorkingDirectory)
-		if scopeErr == nil {
-			group := byProject[memberScope.Ref.Key]
-			group.scope = memberScope
-			group.candidates = append(group.candidates, candidate)
-			byProject[memberScope.Ref.Key] = group
-		}
+		group := byProject[memberScope.Ref.Key]
+		group.scope = memberScope
+		group.candidates = append(group.candidates, candidate)
+		byProject[memberScope.Ref.Key] = group
 	}
 	var result []SessionFamilyCandidate
 	for _, group := range byProject {
 		families, err := FormFamilies(group.candidates, group.scope)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, families...)
+	}
+	if len(codex) != 0 {
+		families, err := formCodexFamilies(codex, session.ProjectScope{})
 		if err != nil {
 			return nil, err
 		}

@@ -104,6 +104,39 @@ func TestFormFamiliesExcludesInvalidCodexComponentsButKeepsValidRoots(t *testing
 	}
 }
 
+func TestDiscoverAllFamiliesExcludesCodexComponentWithCrossProjectParentEdge(t *testing.T) {
+	logs := t.TempDir()
+	inside := t.TempDir()
+	outside := t.TempDir()
+	writeSession(t, filepath.Join(logs, "rollout-valid.jsonl"), codexRootJSONL("valid-root", inside), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-root.jsonl"), codexRootJSONL("cross-project-root", inside), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-child.jsonl"), codexChildJSONL("cross-project-child", "cross-project-root", outside), 10*time.Minute)
+
+	got, err := DiscoverAllFamilies(context.Background(), Roots{Codex: []string{logs}}, fixedNow, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != "valid-root" {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
+func TestFormFamiliesExcludesCodexComponentWithCrossProjectParentEdge(t *testing.T) {
+	inside := testScope()
+	outside := session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "other"}}
+	valid := scopedCodexCandidate("valid-root", "", inside)
+	root := scopedCodexCandidate("cross-project-root", "", inside)
+	child := scopedCodexCandidate("cross-project-child", "cross-project-root", outside)
+
+	got, err := FormFamilies([]Candidate{valid, root, child}, inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != valid.SessionID {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
 func TestMarkCodexCyclesMarksOnlyCycleMembers(t *testing.T) {
 	byID := map[string]Candidate{
 		"a":     codexCandidate("a", "b"),
@@ -140,8 +173,26 @@ func codexCandidate(id, parent string) Candidate {
 	return Candidate{Path: filepath.Join("/codex", id+".jsonl"), Provider: "codex", SessionID: id, Title: id, Origin: session.SessionOrigin{ParentSessionID: parent}}
 }
 
+func scopedCodexCandidate(id, parent string, scope session.ProjectScope) Candidate {
+	candidate := codexCandidate(id, parent)
+	candidate.Scope = scope
+	return candidate
+}
+
 func cyclicCodexCandidates() []Candidate {
 	return []Candidate{codexCandidate("cycle-a", "cycle-b"), codexCandidate("cycle-b", "cycle-a")}
+}
+
+func codexRootJSONL(id, cwd string) string {
+	return `{"type":"session_meta","timestamp":"2026-07-12T10:00:00Z","payload":{"id":"` + id + `","cwd":"` + cwd + `","thread_source":"user"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:01Z","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:02Z","payload":{"type":"task_complete"}}`
+}
+
+func codexChildJSONL(id, parent, cwd string) string {
+	return `{"type":"session_meta","timestamp":"2026-07-12T10:00:00Z","payload":{"id":"` + id + `","parent_thread_id":"` + parent + `","cwd":"` + cwd + `","thread_source":"subagent","source":{"subagent":{"other":"guardian"}}}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:01Z","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:02Z","payload":{"type":"task_complete"}}`
 }
 
 func duplicateCodexCandidates() []Candidate {
