@@ -295,6 +295,16 @@ func TestValidateFamilyAllowsCodexChildSessionIdentity(t *testing.T) {
 	}
 }
 
+func TestValidateFamilyRejectsEvidenceFreeCodexChild(t *testing.T) {
+	f := nestedCodexTerminalFamily(t)
+	f.Children[0].ParentSessionID = ""
+	f.Children[0].Session.Origin = SessionOrigin{}
+	f.Children[0].AgentType = ""
+	if err := ValidateFamily(f); err == nil {
+		t.Fatal("accepted Codex child without parent evidence")
+	}
+}
+
 func TestValidateFamilyRejectsCodexChildThatReusesRootID(t *testing.T) {
 	f := nestedCodexTerminalFamily(t)
 	f.Children[0].Session.ID = f.Main.ID
@@ -309,6 +319,28 @@ func TestValidateRejectsMalformedCodexOrigin(t *testing.T) {
 	f.Children[0].Session.Origin.Kind = "subagent"
 	if err := ValidateFamily(f); err == nil {
 		t.Fatal("accepted unrecognized origin")
+	}
+}
+
+func TestValidateFamilyRejectsOversizedCodexOrigin(t *testing.T) {
+	f := nestedCodexTerminalFamily(t)
+	f.Children[0].Session.Origin.AgentPath = strings.Repeat("a", MaxDescriptionBytes+1)
+	if err := ValidateFamily(f); err == nil {
+		t.Fatal("accepted oversized Codex origin")
+	}
+}
+
+func TestValidateFamilyRejectsDuplicateParentToolCallIdentity(t *testing.T) {
+	f := nestedCodexTerminalFamily(t)
+	parent := &f.Children[0].Session
+	parent.Events = []Event{
+		{ID: "spawn_worker", Kind: EventToolCall, ToolName: "Agent"},
+		{ID: "spawn_worker", Kind: EventToolCall, ToolName: "Task"},
+	}
+	f.Children[1].Attached = true
+	f.Children[1].ParentToolCallID = "spawn_worker"
+	if err := ValidateFamily(f); err == nil {
+		t.Fatal("accepted ambiguous parent tool-call identity")
 	}
 }
 

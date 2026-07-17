@@ -214,8 +214,7 @@ func validateFamilyParents(f SessionFamily, members map[string]Session) error {
 			if child.AgentID != child.Session.ID || child.Session.ProviderSessionID != child.Session.ID {
 				return errors.New("Codex child identity mismatch")
 			}
-			legacyDirectChild := child.ParentSessionID == "" && child.Session.Origin == (SessionOrigin{}) && child.AgentType == ""
-			if !legacyDirectChild && (child.Session.Origin.ParentSessionID != parent || child.AgentType != child.Session.Origin.Kind) {
+			if child.Session.Origin.ParentSessionID != parent || child.AgentType != child.Session.Origin.Kind {
 				return errors.New("Codex child origin mismatch")
 			}
 			parentOf[child.Session.ID] = parent
