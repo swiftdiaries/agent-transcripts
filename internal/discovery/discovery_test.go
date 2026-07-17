@@ -79,7 +79,7 @@ func TestFormFamiliesGroupsCodexDescendantsUnderRoot(t *testing.T) {
 			guardian = &got[0].Children[i]
 		}
 	}
-	if guardian == nil || guardian.ParentSessionID != "codex-worker" {
+	if guardian == nil || guardian.AgentID != "codex-guardian" || guardian.ParentSessionID != "codex-worker" {
 		t.Fatalf("guardian = %#v", guardian)
 	}
 }

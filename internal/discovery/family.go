@@ -255,7 +255,7 @@ func buildCodexRootFamilies(byID map[string]Candidate, invalid map[string]bool, 
 		var appendDescendants func(string)
 		appendDescendants = func(parent string) {
 			for _, child := range childrenByParent[parent] {
-				family.Children = append(family.Children, ChildSourceCandidate{Candidate: child, ParentSessionID: child.Origin.ParentSessionID})
+				family.Children = append(family.Children, ChildSourceCandidate{Candidate: child, AgentID: child.SessionID, ParentSessionID: child.Origin.ParentSessionID})
 				appendDescendants(child.SessionID)
 			}
 		}
