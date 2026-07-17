@@ -263,6 +263,98 @@ func TestValidateFamilyDerivesMemberBounds(t *testing.T) {
 	}
 }
 
+func TestValidateFamilyRejectsUnknownParentSession(t *testing.T) {
+	f := terminalFamily(t, at(5), at(30))
+	f.Children[0].ParentSessionID = "missing"
+	if err := ValidateFamily(f); err == nil {
+		t.Fatal("accepted unknown parent")
+	}
+}
+
+func TestValidateFamilyRejectsParentCycle(t *testing.T) {
+	f := nestedTerminalFamily(t)
+	f.Children[0].ParentSessionID = f.Children[1].Session.ID
+	f.Children[1].ParentSessionID = f.Children[0].Session.ID
+	if err := ValidateFamily(f); err == nil {
+		t.Fatal("accepted parent cycle")
+	}
+}
+
+func TestValidateFamilyReadsLegacyV2DirectChild(t *testing.T) {
+	f := terminalFamily(t, at(5), at(30))
+	f.Children[0].ParentSessionID = ""
+	if err := ValidateFamily(f); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateFamilyAllowsCodexChildSessionIdentity(t *testing.T) {
+	f := nestedCodexTerminalFamily(t)
+	if err := ValidateFamily(f); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateFamilyRejectsCodexChildThatReusesRootID(t *testing.T) {
+	f := nestedCodexTerminalFamily(t)
+	f.Children[0].Session.ID = f.Main.ID
+	f.Children[0].Session.ProviderSessionID = f.Main.ID
+	if err := ValidateFamily(f); err == nil {
+		t.Fatal("accepted reused root ID")
+	}
+}
+
+func TestValidateRejectsMalformedCodexOrigin(t *testing.T) {
+	f := nestedCodexTerminalFamily(t)
+	f.Children[0].Session.Origin.Kind = "subagent"
+	if err := ValidateFamily(f); err == nil {
+		t.Fatal("accepted unrecognized origin")
+	}
+}
+
+func at(seconds int64) time.Time { return time.Unix(seconds, 0).UTC() }
+
+func terminalFamily(t *testing.T, started, ended time.Time) SessionFamily {
+	t.Helper()
+	main := terminalSession("main", "claude", "family_1", at(10), at(20))
+	child := terminalSession("child", "claude", "family_1", started, ended)
+	return derivedTerminalFamily("family_1", "claude", main, []ChildSession{{AgentID: "agent_1", Session: child}})
+}
+
+func nestedTerminalFamily(t *testing.T) SessionFamily {
+	t.Helper()
+	f := terminalFamily(t, at(5), at(25))
+	f.Children = append(f.Children, ChildSession{AgentID: "agent_2", Session: terminalSession("child_2", "claude", "family_1", at(15), at(30))})
+	return derivedTerminalFamily(f.ID, f.Provider, f.Main, f.Children)
+}
+
+func nestedCodexTerminalFamily(t *testing.T) SessionFamily {
+	t.Helper()
+	main := terminalSession("codex-root", "codex", "codex-root", at(10), at(20))
+	worker := terminalSession("codex-worker", "codex", "codex-worker", at(5), at(25))
+	worker.Origin = SessionOrigin{Kind: "thread_spawn", ParentSessionID: main.ID, AgentPath: "root/worker", AgentName: "worker", AgentRole: "implementer"}
+	guardian := terminalSession("codex-guardian", "codex", "codex-guardian", at(15), at(30))
+	guardian.Origin = SessionOrigin{Kind: "guardian", ParentSessionID: worker.ID, AgentPath: "root/worker/guardian", AgentName: "guardian", AgentRole: "reviewer"}
+	return derivedTerminalFamily("codex-root", "codex", main, []ChildSession{
+		{AgentID: worker.ID, ParentSessionID: main.ID, AgentType: worker.Origin.Kind, Session: worker},
+		{AgentID: guardian.ID, ParentSessionID: worker.ID, AgentType: guardian.Origin.Kind, Session: guardian},
+	})
+}
+
+func terminalSession(id, provider, providerID string, started, ended time.Time) Session {
+	return Session{SchemaVersion: 1, ID: id, Provider: provider, ProviderSessionID: providerID, StartedAt: started, EndedAt: ended, Completion: Completion{Terminal: true, TerminalReason: "done", LastEventAt: ended}}
+}
+
+func derivedTerminalFamily(id, provider string, main Session, children []ChildSession) SessionFamily {
+	members := make([]Session, 0, len(children)+1)
+	members = append(members, main)
+	for _, child := range children {
+		members = append(members, child.Session)
+	}
+	start, end, last := derivedFamilyTimes(members)
+	return SessionFamily{SchemaVersion: 2, ID: id, Provider: provider, ProviderSessionID: id, Project: ProjectRef{Kind: "git_worktree", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"}, Main: main, Children: children, StartedAt: start, EndedAt: end, Completion: FamilyCompletion{Status: "provider_terminal", Reason: "all_members_terminal", LastEventAt: last}}
+}
+
 func TestContentIDForManifestSortsChildren(t *testing.T) {
 	first := SourceManifest{SchemaVersion: 2, Provider: "claude", SessionID: "session_1", Sources: []SourceEntry{{Role: "main", Checksum: strings.Repeat("a", 64), Bytes: 1, Name: "source/main.jsonl"}, {Role: "child", AgentID: "b", Checksum: strings.Repeat("b", 64), Bytes: 2, Name: "source/children/b.jsonl"}, {Role: "child", AgentID: "a", Checksum: strings.Repeat("c", 64), Bytes: 3, Name: "source/children/a.jsonl"}}}
 	second := first
