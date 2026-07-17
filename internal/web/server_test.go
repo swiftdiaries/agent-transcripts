@@ -842,6 +842,35 @@ func TestNormalLiveRouteRendersDelegatedFamily(t *testing.T) {
 	}
 }
 
+func TestLiveRouteRendersNestedCodexFamily(t *testing.T) {
+	root := t.TempDir()
+	codexRoot := filepath.Join(root, "codex")
+	if err := os.MkdirAll(codexRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"codex-family-main.jsonl", "codex-family-worker.jsonl", "codex-family-guardian.jsonl"} {
+		if err := os.WriteFile(filepath.Join(codexRoot, "rollout-"+name), mustRead(t, filepath.Join("..", "parser", "testdata", name)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := New(ServerConfig{Roots: discovery.Roots{Codex: []string{codexRoot}}}).(*server)
+	families, err := h.liveFamilies(context.Background())
+	if err != nil || len(families) != 1 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/live/families/"+families[0].Key, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, content := range []string{"Root prompt", "Worker prompt", "Guardian review"} {
+		if !strings.Contains(rr.Body.String(), content) {
+			t.Fatalf("nested Codex content %q missing from %s", content, rr.Body.String())
+		}
+	}
+}
+
 func TestFocusedServerRejectsCatalogAndOtherFamilies(t *testing.T) {
 	root := t.TempDir()
 	selectedPath := filepath.Join(root, "claude-session.jsonl")

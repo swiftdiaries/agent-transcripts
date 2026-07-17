@@ -597,19 +597,32 @@ func parseLiveFamily(ctx context.Context, candidate discovery.SessionFamilyCandi
 	if err != nil {
 		return session.SessionFamily{}, err
 	}
-	family := session.SessionFamily{Main: main}
-	children := make([]parser.ClaudeChild, 0, len(candidate.Children))
+	family := session.SessionFamily{Provider: main.Provider, Main: main}
+	claudeChildren := make([]parser.ClaudeChild, 0, len(candidate.Children))
+	codexChildren := make([]session.Session, 0, len(candidate.Children))
 	for index, child := range candidate.Children {
 		parsed, err := parse(snapshot.Sources[index+1])
 		if err != nil {
 			return session.SessionFamily{}, err
 		}
-		children = append(children, parser.ClaudeChild{AgentID: child.AgentID, Session: parsed})
+		switch main.Provider {
+		case "claude":
+			claudeChildren = append(claudeChildren, parser.ClaudeChild{AgentID: child.AgentID, Session: parsed})
+		case "codex":
+			codexChildren = append(codexChildren, parsed)
+		default:
+			return session.SessionFamily{}, errors.New("provider does not support family children")
+		}
 	}
-	if len(children) == 0 {
+	if len(candidate.Children) == 0 {
 		return family, nil
 	}
-	family.Children, err = parser.AttachClaudeChildren(main, children)
+	switch main.Provider {
+	case "claude":
+		family.Children, err = parser.AttachClaudeChildren(main, claudeChildren)
+	case "codex":
+		family.Children, err = parser.AttachCodexChildren(main, codexChildren)
+	}
 	if err != nil {
 		return session.SessionFamily{}, err
 	}
