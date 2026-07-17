@@ -529,7 +529,11 @@ func runBrowseWithDeps(ctx context.Context, args []string, input *os.File, stdou
 			return 1
 		}
 	}
-	selected, ok := selectFamily(families, opts.family, opts.latest)
+	selected, ok, err := selectFamily(families, opts.family, opts.latest)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
 	if opts.path != "" && len(families) == 1 {
 		selected, ok = families[0], true
 	}
@@ -588,18 +592,16 @@ func discoverCommandFamilies(ctx context.Context, allProjects bool, getwd func()
 	return discovery.DiscoverFamilies(ctx, defaultRoots(), scope, time.Now(), 5*time.Minute)
 }
 
-func selectFamily(families []discovery.SessionFamilyCandidate, key string, latest bool) (discovery.SessionFamilyCandidate, bool) {
+func selectFamily(families []discovery.SessionFamilyCandidate, key string, latest bool) (discovery.SessionFamilyCandidate, bool, error) {
+	byKey, err := discovery.FamilyMap(families)
+	if err != nil {
+		return discovery.SessionFamilyCandidate{}, false, err
+	}
 	if latest && len(families) > 0 {
-		return families[0], true
+		return families[0], true, nil
 	}
-	if key != "" {
-		for _, family := range families {
-			if family.Key == key {
-				return family, true
-			}
-		}
-	}
-	return discovery.SessionFamilyCandidate{}, false
+	family, ok := byKey[key]
+	return family, ok, nil
 }
 
 func pickFamily(input *os.File, stdout io.Writer, families []discovery.SessionFamilyCandidate, allProjects bool) (discovery.SessionFamilyCandidate, bool) {
@@ -647,17 +649,23 @@ func pickFamily(input *os.File, stdout io.Writer, families []discovery.SessionFa
 }
 
 func familyForPath(ctx context.Context, path string) (discovery.SessionFamilyCandidate, error) {
+	return familyForPathWithSnapshot(ctx, path, discovery.SnapshotFamily)
+}
+
+func familyForPathWithSnapshot(ctx context.Context, path string, snapshotFamily func(context.Context, discovery.SessionFamilyCandidate) (*discovery.FamilySnapshot, error)) (discovery.SessionFamilyCandidate, error) {
 	candidate, err := discovery.InspectPath(ctx, path, time.Now(), 5*time.Minute)
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
-	root := filepath.Dir(candidate.Path)
-	roots := discovery.Roots{Claude: []string{root}, Codex: []string{root}}
-	candidates, err := discovery.Discover(ctx, roots, time.Now(), 5*time.Minute)
+	snapshot, err := snapshotFamily(ctx, discovery.SessionFamilyCandidate{Main: discovery.SourceCandidate{Candidate: candidate}})
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
-	f, err := os.Open(candidate.Path)
+	defer snapshot.Close()
+	if len(snapshot.Sources) != 1 {
+		return discovery.SessionFamilyCandidate{}, errors.New("selected snapshot is invalid")
+	}
+	f, err := snapshot.Sources[0].Open()
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
@@ -673,6 +681,12 @@ func familyForPath(ctx context.Context, path string) (discovery.SessionFamilyCan
 		return discovery.SessionFamilyCandidate{}, errors.New("selected session has no working directory")
 	}
 	scope, err := discovery.ResolveProjectScope(parsed.WorkingDirectory)
+	if err != nil {
+		return discovery.SessionFamilyCandidate{}, err
+	}
+	root := filepath.Dir(candidate.Path)
+	roots := discovery.Roots{Claude: []string{root}, Codex: []string{root}}
+	candidates, err := discovery.Discover(ctx, roots, time.Now(), 5*time.Minute)
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
@@ -856,11 +870,12 @@ func emitEligibleWithLibrary(ctx context.Context, candidate discovery.Candidate,
 }
 
 func emitFamilyWithLibrary(ctx context.Context, family discovery.SessionFamilyCandidate, stdout, stderr io.Writer, libraryStore store.Store) int {
-	snapshot, err := discovery.SnapshotFamily(family)
+	snapshot, err := discovery.SnapshotFamily(ctx, family)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
+	defer snapshot.Close()
 	svc := library.New(libraryStore, library.AllowLocalQuietEvidence())
 	metadata, _, err := svc.ImportFamilyWithStatus(ctx, snapshot, library.ImportAttrs{
 		Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local", Title: family.Title, Project: family.Project.DisplayName,

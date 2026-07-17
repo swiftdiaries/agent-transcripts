@@ -30,17 +30,18 @@ const (
 )
 
 type Event struct {
-	ID       string          `json:"id"`
-	ParentID string          `json:"parent_id,omitempty"`
-	AgentID  string          `json:"agent_id,omitempty"`
-	Kind     EventKind       `json:"kind"`
-	Time     time.Time       `json:"time,omitempty"`
-	Text     string          `json:"text,omitempty"`
-	ToolName string          `json:"tool_name,omitempty"`
-	Input    json.RawMessage `json:"input,omitempty"`
-	Output   json.RawMessage `json:"output,omitempty"`
-	RawType  string          `json:"raw_type,omitempty"`
-	Raw      json.RawMessage `json:"raw,omitempty"`
+	ID           string          `json:"id"`
+	ParentID     string          `json:"parent_id,omitempty"`
+	AgentID      string          `json:"agent_id,omitempty"`
+	Kind         EventKind       `json:"kind"`
+	Time         time.Time       `json:"time,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	ToolName     string          `json:"tool_name,omitempty"`
+	Input        json.RawMessage `json:"input,omitempty"`
+	Output       json.RawMessage `json:"output,omitempty"`
+	ResultStatus string          `json:"result_status,omitempty"`
+	RawType      string          `json:"raw_type,omitempty"`
+	Raw          json.RawMessage `json:"raw,omitempty"`
 }
 
 type Completion struct {
@@ -70,6 +71,7 @@ type FamilyCompletion struct {
 
 type ChildSession struct {
 	AgentID          string  `json:"agent_id"`
+	ParentSessionID  string  `json:"parent_session_id,omitempty"`
 	ParentToolCallID string  `json:"parent_tool_call_id,omitempty"`
 	AgentType        string  `json:"agent_type,omitempty"`
 	Description      string  `json:"description,omitempty"`
@@ -91,16 +93,28 @@ type SessionFamily struct {
 }
 
 type Session struct {
-	SchemaVersion     int        `json:"schema_version"`
-	ID                string     `json:"id"`
-	Provider          string     `json:"provider"`
-	ProviderSessionID string     `json:"provider_session_id,omitempty"`
-	Project           string     `json:"project,omitempty"`
-	WorkingDirectory  string     `json:"working_directory,omitempty"`
-	StartedAt         time.Time  `json:"started_at,omitempty"`
-	EndedAt           time.Time  `json:"ended_at,omitempty"`
-	Events            []Event    `json:"events"`
-	Completion        Completion `json:"completion"`
+	SchemaVersion     int           `json:"schema_version"`
+	ID                string        `json:"id"`
+	Provider          string        `json:"provider"`
+	ProviderSessionID string        `json:"provider_session_id,omitempty"`
+	Project           string        `json:"project,omitempty"`
+	WorkingDirectory  string        `json:"working_directory,omitempty"`
+	StartedAt         time.Time     `json:"started_at,omitempty"`
+	EndedAt           time.Time     `json:"ended_at,omitempty"`
+	Events            []Event       `json:"events"`
+	Completion        Completion    `json:"completion"`
+	Origin            SessionOrigin `json:"origin,omitempty"`
+}
+
+// SessionOrigin records provider-supplied relationship evidence for a nested
+// session. It is optional for backward compatibility with schema-v2 packages
+// created before session relationships were normalized.
+type SessionOrigin struct {
+	Kind            string `json:"kind,omitempty"`
+	ParentSessionID string `json:"parent_session_id,omitempty"`
+	AgentPath       string `json:"agent_path,omitempty"`
+	AgentName       string `json:"agent_name,omitempty"`
+	AgentRole       string `json:"agent_role,omitempty"`
 }
 
 type Directory struct {

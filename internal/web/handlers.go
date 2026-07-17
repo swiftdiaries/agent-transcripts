@@ -25,8 +25,6 @@ import (
 
 var managedID = regexp.MustCompile(`^s_[a-f0-9]{64}$`)
 var slug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
-var provider = regexp.MustCompile(`^(claude|codex)$`)
-var providerSessionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
@@ -74,12 +72,12 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		s.liveProjectFamilies(w, r, parts[2])
 	case len(parts) == 5 && parts[0] == "live" && parts[1] == "projects" && parts[3] == "families" && s.allProjects:
 		s.liveProjectFamily(w, r, parts[2], parts[4])
+	case len(parts) == 3 && parts[0] == "live" && parts[1] == "families" && !s.allProjects:
+		s.liveFamily(w, r, parts[2])
 	case len(parts) == 2 && parts[0] == "sessions" && managedID.MatchString(parts[1]):
 		s.transcript(w, r, parts[1])
 	case len(parts) == 2 && (parts[0] == "users" || parts[0] == "projects") && slug.MatchString(parts[1]):
 		s.directory(w, r, session.Directory{Kind: parts[0], Slug: parts[1]})
-	case len(parts) == 3 && parts[0] == "live" && !s.allProjects && provider.MatchString(parts[1]) && providerSessionID.MatchString(parts[2]):
-		s.liveSession(w, r, parts[1], parts[2])
 	default:
 		http.NotFound(w, r)
 	}
@@ -213,11 +211,12 @@ func (s *server) uploadSession(w http.ResponseWriter, r *http.Request, who auth.
 			return
 		}
 	}
-	snapshot, err := uploadSnapshot(r.MultipartForm)
+	snapshot, err := uploadSnapshot(r.Context(), r.MultipartForm)
 	if err != nil {
 		http.Error(w, "invalid upload", http.StatusBadRequest)
 		return
 	}
+	defer snapshot.Close()
 	// A hosted service deliberately does not trust client source facts: terminal
 	// evidence must be parser-derived, never inferred from a quiet local file.
 	svc := library.New(s.store)
@@ -262,38 +261,34 @@ func validUploadForm(form *multipart.Form) bool {
 	return true
 }
 
-func uploadSnapshot(form *multipart.Form) (discovery.FamilySnapshot, error) {
+func uploadSnapshot(ctx context.Context, form *multipart.Form) (*discovery.FamilySnapshot, error) {
 	if form == nil {
-		return discovery.FamilySnapshot{}, errors.New("missing multipart form")
+		return nil, errors.New("missing multipart form")
 	}
 	files := append([]*multipart.FileHeader{}, form.File["source"]...)
 	files = append(files, form.File["child"]...)
-	snapshot := discovery.FamilySnapshot{Sources: make([]discovery.SnapshotSource, 0, len(files))}
-	var total int64
+	inputs := make([]discovery.SnapshotInput, 0, len(files))
+	readers := make([]io.Closer, 0, len(files))
+	defer func() {
+		for _, reader := range readers {
+			_ = reader.Close()
+		}
+	}()
 	for i, header := range files {
 		file, err := header.Open()
 		if err != nil {
-			return discovery.FamilySnapshot{}, err
+			return nil, err
 		}
-		data, readErr := io.ReadAll(io.LimitReader(file, session.MaxSourceBytes-total+1))
-		closeErr := file.Close()
-		if readErr != nil {
-			return discovery.FamilySnapshot{}, readErr
-		}
-		if closeErr != nil {
-			return discovery.FamilySnapshot{}, closeErr
-		}
-		total += int64(len(data))
-		if total > session.MaxSourceBytes {
-			return discovery.FamilySnapshot{}, errors.New("upload too large")
-		}
+		readers = append(readers, file)
 		role := "child"
+		agentID := fmt.Sprintf("upload-child-%d", i)
 		if i == 0 {
 			role = "main"
+			agentID = ""
 		}
-		snapshot.Sources = append(snapshot.Sources, discovery.SnapshotSource{Role: role, Bytes: data, Facts: session.SourceFacts{ObservedSize: int64(len(data))}})
+		inputs = append(inputs, discovery.SnapshotInput{Role: role, AgentID: agentID, Reader: file})
 	}
-	return snapshot, nil
+	return discovery.SnapshotReaders(ctx, discovery.SessionFamilyCandidate{}, inputs)
 }
 
 func jsonRequest(r *http.Request) bool {
@@ -455,12 +450,12 @@ func (s *server) static(w http.ResponseWriter, name, contentType string) {
 }
 
 func (s *server) liveList(w http.ResponseWriter, r *http.Request) {
-	candidates, err := s.liveCandidates(r.Context())
+	families, err := s.liveFamilies(r.Context())
 	if err != nil {
 		s.internalError(w, err)
 		return
 	}
-	p := page{Title: "Live sessions", Heading: "Live sessions", Section: "live", Candidates: candidates, IsLive: true}
+	p := page{Title: "Live sessions", Heading: "Live sessions", Section: "live", Families: families, IsLive: true}
 	if s.csrf != nil {
 		p.CSRFToken = s.csrf.Token(w, r)
 	}
@@ -519,6 +514,10 @@ func (s *server) liveProjectFamilies(w http.ResponseWriter, r *http.Request, pro
 		http.NotFound(w, r)
 		return
 	}
+	if _, err := discovery.FamilyMap(selected); err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, "<!doctype html><title>Live sessions</title><h1>Live sessions</h1><ul>")
 	for _, family := range selected {
@@ -533,26 +532,38 @@ func (s *server) liveProjectFamily(w http.ResponseWriter, r *http.Request, proje
 		s.internalError(w, err)
 		return
 	}
+	selected := make([]discovery.SessionFamilyCandidate, 0, len(families))
 	for _, family := range families {
-		if family.Project.Key != projectKey || family.Key != familyKey {
-			continue
+		if family.Project.Key == projectKey {
+			selected = append(selected, family)
 		}
+	}
+	byKey, err := discovery.FamilyMap(selected)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	family, ok := byKey[familyKey]
+	if ok {
 		s.renderLiveFamily(w, r, family)
 		return
 	}
 	http.NotFound(w, r)
 }
 
-func (s *server) liveSession(w http.ResponseWriter, r *http.Request, wantProvider, wantID string) {
+func (s *server) liveFamily(w http.ResponseWriter, r *http.Request, key string) {
 	families, err := s.liveFamilies(r.Context())
 	if err != nil {
 		s.internalError(w, err)
 		return
 	}
-	for _, family := range families {
-		if family.Provider != wantProvider || family.ProviderSessionID != wantID {
-			continue
-		}
+	byKey, err := discovery.FamilyMap(families)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	family, ok := byKey[key]
+	if ok {
 		s.renderLiveFamily(w, r, family)
 		return
 	}
@@ -569,47 +580,53 @@ func (s *server) renderLiveFamily(w http.ResponseWriter, r *http.Request, family
 }
 
 func parseLiveFamily(ctx context.Context, candidate discovery.SessionFamilyCandidate) (session.SessionFamily, error) {
-	parse := func(source discovery.Candidate) (session.Session, error) {
-		reader, _, err := discovery.OpenEligible(source)
+	snapshot, err := discovery.SnapshotFamily(ctx, candidate)
+	if err != nil {
+		return session.SessionFamily{}, err
+	}
+	defer snapshot.Close()
+	parse := func(source discovery.SnapshotSource) (session.Session, error) {
+		reader, err := source.Open()
 		if err != nil {
 			return session.Session{}, err
 		}
 		defer reader.Close()
 		return parser.DefaultRegistry().DetectAndParse(ctx, reader)
 	}
-	main, err := parse(candidate.Main.Candidate)
+	main, err := parse(snapshot.Sources[0])
 	if err != nil {
 		return session.SessionFamily{}, err
 	}
-	family := session.SessionFamily{Main: main}
-	children := make([]parser.ClaudeChild, 0, len(candidate.Children))
-	for _, child := range candidate.Children {
-		parsed, err := parse(child.Candidate)
+	family := session.SessionFamily{Provider: main.Provider, Main: main}
+	claudeChildren := make([]parser.ClaudeChild, 0, len(candidate.Children))
+	codexChildren := make([]session.Session, 0, len(candidate.Children))
+	for index, child := range candidate.Children {
+		parsed, err := parse(snapshot.Sources[index+1])
 		if err != nil {
 			return session.SessionFamily{}, err
 		}
-		children = append(children, parser.ClaudeChild{AgentID: child.AgentID, Session: parsed})
+		switch main.Provider {
+		case "claude":
+			claudeChildren = append(claudeChildren, parser.ClaudeChild{AgentID: child.AgentID, Session: parsed})
+		case "codex":
+			codexChildren = append(codexChildren, parsed)
+		default:
+			return session.SessionFamily{}, errors.New("provider does not support family children")
+		}
 	}
-	if len(children) == 0 {
+	if len(candidate.Children) == 0 {
 		return family, nil
 	}
-	family.Children, err = parser.AttachClaudeChildren(main, children)
+	switch main.Provider {
+	case "claude":
+		family.Children, err = parser.AttachClaudeChildren(main, claudeChildren)
+	case "codex":
+		family.Children, err = parser.AttachCodexChildren(main, codexChildren)
+	}
 	if err != nil {
 		return session.SessionFamily{}, err
 	}
 	return family, nil
-}
-
-func (s *server) liveCandidates(ctx context.Context) ([]discovery.Candidate, error) {
-	families, err := s.liveFamilies(ctx)
-	if err != nil {
-		return nil, err
-	}
-	candidates := make([]discovery.Candidate, 0, len(families))
-	for _, family := range families {
-		candidates = append(candidates, family.Main.Candidate)
-	}
-	return candidates, nil
 }
 
 func (s *server) liveFamilies(ctx context.Context) ([]discovery.SessionFamilyCandidate, error) {
@@ -653,17 +670,18 @@ func (s *server) importLive(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
-	bySelection := make(map[string]discovery.SessionFamilyCandidate, len(families))
-	for _, family := range families {
-		bySelection[family.Provider+":"+family.ProviderSessionID] = family
+	byKey, err := discovery.FamilyMap(families)
+	if err != nil {
+		http.Error(w, "selected session is no longer available", http.StatusBadRequest)
+		return
 	}
-	selected := make([]discovery.SessionFamilyCandidate, 0, len(r.Form["session"]))
+	selected := make([]discovery.SessionFamilyCandidate, 0, len(r.Form["family"]))
 	seen := make(map[string]bool)
-	for _, value := range r.Form["session"] {
+	for _, value := range r.Form["family"] {
 		if seen[value] {
 			continue
 		}
-		family, ok := bySelection[value]
+		family, ok := byKey[value]
 		if !ok {
 			http.Error(w, "selected session is no longer available", http.StatusBadRequest)
 			return
@@ -675,10 +693,17 @@ func (s *server) importLive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "select at least one session", http.StatusBadRequest)
 		return
 	}
-	snapshots := make([]discovery.FamilySnapshot, 0, len(selected))
+	snapshots := make([]*discovery.FamilySnapshot, 0, len(selected))
+	closeSnapshots := func() {
+		for _, snapshot := range snapshots {
+			_ = snapshot.Close()
+		}
+	}
+	defer closeSnapshots()
 	for _, family := range selected {
-		snapshot, err := discovery.SnapshotFamily(family)
+		snapshot, err := discovery.SnapshotFamily(r.Context(), family)
 		if err != nil {
+			closeSnapshots()
 			http.Error(w, "selected session is no longer eligible", http.StatusBadRequest)
 			return
 		}
@@ -748,7 +773,7 @@ type page struct {
 	Heading    string
 	Section    string
 	Sessions   []session.Metadata
-	Candidates []discovery.Candidate
+	Families   []discovery.SessionFamilyCandidate
 	IsLive     bool
 	Transcript transcript
 	CSRFToken  string
@@ -758,7 +783,7 @@ type transcript struct {
 	Turns       []turnView
 	Diagnostics []eventView
 	Attached    map[string][]childTranscriptView
-	Unattached  []childTranscriptView
+	Children    []childTranscriptView
 }
 type turnView struct {
 	Prompt      eventView
@@ -778,12 +803,15 @@ type eventView struct {
 
 type childTranscriptView struct {
 	Anchor      string
+	SessionID   string
 	AgentID     string
 	AgentType   string
 	Description string
 	Completion  session.Completion
 	Turns       []turnView
 	Diagnostics []eventView
+	Attached    map[string][]childTranscriptView
+	Children    []childTranscriptView
 }
 
 func transcriptPage(value session.Session, title string) page {
@@ -796,30 +824,38 @@ func transcriptFamilyPage(value session.SessionFamily, title string) page {
 	}
 	p := page{Title: title, Section: "transcript", Transcript: transcript{Title: title}}
 	projected := review.ProjectFamily(value)
-	p.Transcript.Attached = make(map[string][]childTranscriptView, len(projected.Attached))
-	for _, turn := range projected.Main.Turns {
+	p.Transcript.Attached = make(map[string][]childTranscriptView, len(projected.Root.Attached))
+	for _, turn := range projected.Root.Transcript.Turns {
 		p.Transcript.Turns = append(p.Transcript.Turns, turnView{Prompt: eventViewFor(turn.Prompt), Events: eventViews(turn.Events), Diagnostics: eventViews(turn.Diagnostics)})
 	}
-	p.Transcript.Diagnostics = eventViews(projected.Main.Diagnostics)
-	for parentID, children := range projected.Attached {
-		p.Transcript.Attached[parentID] = childTranscriptViews(children)
+	p.Transcript.Diagnostics = eventViews(projected.Root.Transcript.Diagnostics)
+	for parentID, children := range projected.Root.Attached {
+		p.Transcript.Attached[parentID] = childNodesView(children)
 	}
-	p.Transcript.Unattached = childTranscriptViews(projected.Unattached)
+	p.Transcript.Children = childNodesView(projected.Root.Children)
 	return p
 }
 
-func childTranscriptViews(children []review.ChildTranscript) []childTranscriptView {
+func childNodesView(children []*review.TranscriptNode) []childTranscriptView {
 	views := make([]childTranscriptView, 0, len(children))
 	for _, child := range children {
-		view := childTranscriptView{Anchor: "child-" + child.AgentID, AgentID: child.AgentID, AgentType: child.AgentType, Description: child.Description, Completion: child.Completion, Diagnostics: eventViews(child.Transcript.Diagnostics)}
-		for _, turn := range child.Transcript.Turns {
-			turnView := turnView{Prompt: eventViewFor(turn.Prompt), Events: eventViews(turn.Events), Diagnostics: eventViews(turn.Diagnostics)}
-			turnView.Prompt.ID = view.Anchor + "-" + turnView.Prompt.ID
-			view.Turns = append(view.Turns, turnView)
-		}
-		views = append(views, view)
+		views = append(views, childNodeView(child))
 	}
 	return views
+}
+
+func childNodeView(node *review.TranscriptNode) childTranscriptView {
+	view := childTranscriptView{Anchor: "child-" + node.AgentID, SessionID: node.SessionID, AgentID: node.AgentID, AgentType: node.AgentType, Description: node.Description, Completion: node.Completion, Diagnostics: eventViews(node.Transcript.Diagnostics), Attached: make(map[string][]childTranscriptView, len(node.Attached))}
+	for _, turn := range node.Transcript.Turns {
+		turnView := turnView{Prompt: eventViewFor(turn.Prompt), Events: eventViews(turn.Events), Diagnostics: eventViews(turn.Diagnostics)}
+		turnView.Prompt.ID = view.Anchor + "-" + turnView.Prompt.ID
+		view.Turns = append(view.Turns, turnView)
+	}
+	for parentID, children := range node.Attached {
+		view.Attached[parentID] = childNodesView(children)
+	}
+	view.Children = childNodesView(node.Children)
+	return view
 }
 
 func eventViews(events []session.Event) []eventView {

@@ -93,6 +93,71 @@ func TestTranscriptRendersDelegatedWorkInDetails(t *testing.T) {
 	}
 }
 
+func TestTranscriptRendersCodexGuardianOnceUnderWorker(t *testing.T) {
+	body := renderFamily(t, codexRootWorkerGuardianFamily(t))
+	if strings.Count(body, "Delegated work / codex-guardian") != 1 {
+		t.Fatalf("body=%s", body)
+	}
+	if strings.Index(body, "Delegated work / codex-guardian") < strings.Index(body, "Delegated work / codex-worker") {
+		t.Fatalf("guardian preceded worker: %s", body)
+	}
+}
+
+func renderFamily(t *testing.T, family session.SessionFamily) string {
+	t.Helper()
+	var body bytes.Buffer
+	s := New(ServerConfig{}).(*server)
+	if err := s.templates["transcript"].ExecuteTemplate(&body, "transcript", transcriptFamilyPage(family, "Family")); err != nil {
+		t.Fatal(err)
+	}
+	return body.String()
+}
+
+func codexRootWorkerGuardianFamily(t *testing.T) session.SessionFamily {
+	t.Helper()
+	at := func(seconds int64) time.Time { return time.Unix(seconds, 0).UTC() }
+	terminal := func(id string, started, ended time.Time) session.Session {
+		return session.Session{
+			SchemaVersion:     1,
+			ID:                id,
+			Provider:          "codex",
+			ProviderSessionID: id,
+			StartedAt:         started,
+			EndedAt:           ended,
+			Completion:        session.Completion{Terminal: true, TerminalReason: "done", LastEventAt: ended},
+			Events:            []session.Event{{ID: "prompt-" + id, Kind: session.EventUser, Text: id}},
+		}
+	}
+	root := terminal("codex-root", at(10), at(20))
+	worker := terminal("codex-worker", at(5), at(25))
+	worker.Origin = session.SessionOrigin{Kind: "thread_spawn", ParentSessionID: root.ID, AgentPath: "root/worker", AgentName: "worker", AgentRole: "implementer"}
+	guardian := terminal("codex-guardian", at(15), at(30))
+	guardian.Origin = session.SessionOrigin{Kind: "guardian", ParentSessionID: worker.ID, AgentPath: "root/worker/guardian", AgentName: "guardian", AgentRole: "reviewer"}
+	family := session.SessionFamily{
+		SchemaVersion:     2,
+		ID:                root.ID,
+		Provider:          "codex",
+		ProviderSessionID: root.ID,
+		Project:           session.ProjectRef{Kind: "git_worktree", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"},
+		Main:              root,
+		Children: []session.ChildSession{
+			{AgentID: worker.ID, ParentSessionID: root.ID, AgentType: worker.Origin.Kind, Session: worker},
+			{AgentID: guardian.ID, ParentSessionID: worker.ID, AgentType: guardian.Origin.Kind, Session: guardian},
+		},
+		StartedAt: at(5),
+		EndedAt:   at(30),
+		Completion: session.FamilyCompletion{
+			Status:      "provider_terminal",
+			Reason:      "all_members_terminal",
+			LastEventAt: at(30),
+		},
+	}
+	if err := session.ValidateFamily(family); err != nil {
+		t.Fatalf("fixture must be valid: %v", err)
+	}
+	return family
+}
+
 func TestDifferentUserCannotDelete(t *testing.T) {
 	pkg := fixturePackage(t)
 	st := store.NewFilesystem(t.TempDir())
@@ -251,6 +316,45 @@ func TestUploadRejectsUntrustedNonterminalChild(t *testing.T) {
 	if err != nil || len(packages) != 0 {
 		t.Fatalf("stored incomplete family: %#v %v", packages, err)
 	}
+}
+
+func TestHostedUploadAcceptsAttachedChildOnlyWithTerminalParentResult(t *testing.T) {
+	assertFamilyUploadStatus(t, "completed", http.StatusCreated)
+	assertFamilyUploadStatus(t, "", http.StatusUnprocessableEntity)
+}
+
+func TestHostedUploadNeverStoresIncompleteFamily(t *testing.T) {
+	h, st, token := hostedUploadServer(t)
+	rr := postFamilyMultipart(t, h, token, hostedParent(""), nonterminalAttachedChild())
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	packages, err := st.ListSessions(context.Background(), session.Directory{Kind: "projects", Slug: "platform"})
+	if err != nil || len(packages) != 0 {
+		t.Fatalf("stored=%d err=%v", len(packages), err)
+	}
+}
+
+func assertFamilyUploadStatus(t *testing.T, parentStatus string, want int) {
+	t.Helper()
+	h, _, token := hostedUploadServer(t)
+	if got := postFamilyMultipart(t, h, token, hostedParent(parentStatus), nonterminalAttachedChild()).Code; got != want {
+		t.Fatalf("parent status %q: got=%d want=%d", parentStatus, got, want)
+	}
+}
+
+func hostedParent(resultStatus string) []byte {
+	status := ""
+	if resultStatus != "" {
+		status = `,"status":"` + resultStatus + `"`
+	}
+	return []byte(`{"type":"assistant","uuid":"call","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Task","input":{"description":"delegate","subagent_type":"reviewer"}}]}}` + "\n" +
+		`{"type":"user","uuid":"result","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"child-1"` + status + `},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"done"}]}}` + "\n" +
+		`{"type":"system","subtype":"turn_duration","uuid":"terminal","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:02Z"}` + "\n")
+}
+
+func nonterminalAttachedChild() []byte {
+	return []byte(`{"type":"user","uuid":"child-result","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"child-1"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"nested","content":"done"}]}}` + "\n")
 }
 
 func TestHostedUploadDerivesChildIdentityFromProviderEvidence(t *testing.T) {
@@ -644,14 +748,18 @@ func TestProjectDirectoryRendersStoredSession(t *testing.T) {
 
 func TestLiveRoutesUseCatalogAndRenderBothProviders(t *testing.T) {
 	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
-	for _, path := range []string{"/live", "/live/claude/claude-session-1", "/live/codex/codex-session-1"} {
+	families, err := h.liveFamilies(context.Background())
+	if err != nil || len(families) != 2 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+	for _, path := range []string{"/live", "/live/families/" + families[0].Key, "/live/families/" + families[1].Key} {
 		t.Run(path, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 			if rr.Code != http.StatusOK {
 				t.Fatalf("status = %d", rr.Code)
 			}
-			if path == "/live" && (!strings.Contains(rr.Body.String(), "/live/claude/claude-session-1") || !strings.Contains(rr.Body.String(), "/live/codex/codex-session-1")) {
+			if path == "/live" && (!strings.Contains(rr.Body.String(), "/live/families/"+families[0].Key) || !strings.Contains(rr.Body.String(), "/live/families/"+families[1].Key)) {
 				t.Fatalf("catalog was not rendered: %s", rr.Body.String())
 			}
 			hasPromptAnchor := strings.Contains(rr.Body.String(), "id=\"claude-user-1\"") || strings.Contains(rr.Body.String(), "id=\"codex-user-1\"")
@@ -660,13 +768,38 @@ func TestLiveRoutesUseCatalogAndRenderBothProviders(t *testing.T) {
 			}
 		})
 	}
-	for _, path := range []string{"/live/claude/not-in-catalog", "/live/claude/.."} {
+	for _, path := range []string{"/live/families/f_" + strings.Repeat("0", 64), "/live/claude/not-in-catalog"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		if rr.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d", path, rr.Code)
 		}
 	}
+}
+
+func TestScopedCatalogUsesDistinctFamilyKeysForDuplicateProviderSessionIDs(t *testing.T) {
+	h, families := scopedServerWithDuplicateSessionIDs(t)
+	body := getBody(t, h, "/live")
+	for _, family := range families {
+		if !strings.Contains(body, "/live/families/"+family.Key) {
+			t.Fatalf("missing key %s: %s", family.Key, body)
+		}
+	}
+}
+
+func TestLiveImportUsesExactRediscoveredFamilyKey(t *testing.T) {
+	h, families := scopedServerWithDuplicateSessionIDs(t)
+	rr := postLiveImport(t, h, families[0].Key)
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	assertOnlyFamilyImported(t, h, families[0])
+}
+
+func TestScopedFamilyRouteRejectsStaleAndPathTextKeys(t *testing.T) {
+	h, _ := scopedServerWithDuplicateSessionIDs(t)
+	assertStatus(t, h, "/live/families/f_"+strings.Repeat("0", 64), http.StatusNotFound)
+	assertStatus(t, h, "/live/families/../../etc/passwd", http.StatusNotFound)
 }
 
 func TestNormalLiveRouteRendersDelegatedFamily(t *testing.T) {
@@ -690,17 +823,50 @@ func TestNormalLiveRouteRendersDelegatedFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := New(ServerConfig{Roots: discovery.Roots{Claude: []string{claudeRoot}}})
-	for _, path := range []string{"/live", "/live/claude/family-1"} {
+	families, err := h.(*server).liveFamilies(context.Background())
+	if err != nil || len(families) != 1 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+	for _, path := range []string{"/live", "/live/families/" + families[0].Key} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		if rr.Code != http.StatusOK {
 			t.Fatalf("%s status = %d body=%s", path, rr.Code, rr.Body.String())
 		}
-		if path == "/live" && !strings.Contains(rr.Body.String(), `href="/live/claude/family-1"`) {
+		if path == "/live" && !strings.Contains(rr.Body.String(), `href="/live/families/`+families[0].Key+`"`) {
 			t.Fatalf("catalog did not contain family: %s", rr.Body.String())
 		}
 		if path != "/live" && (!strings.Contains(rr.Body.String(), "Delegated work / child-1") || !strings.Contains(rr.Body.String(), "Child prompt")) {
 			t.Fatalf("family was flattened: %s", rr.Body.String())
+		}
+	}
+}
+
+func TestLiveRouteRendersNestedCodexFamily(t *testing.T) {
+	root := t.TempDir()
+	codexRoot := filepath.Join(root, "codex")
+	if err := os.MkdirAll(codexRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"codex-family-main.jsonl", "codex-family-worker.jsonl", "codex-family-guardian.jsonl"} {
+		if err := os.WriteFile(filepath.Join(codexRoot, "rollout-"+name), mustRead(t, filepath.Join("..", "parser", "testdata", name)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := New(ServerConfig{Roots: discovery.Roots{Codex: []string{codexRoot}}}).(*server)
+	families, err := h.liveFamilies(context.Background())
+	if err != nil || len(families) != 1 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/live/families/"+families[0].Key, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, content := range []string{"Root prompt", "Worker prompt", "Guardian review"} {
+		if !strings.Contains(rr.Body.String(), content) {
+			t.Fatalf("nested Codex content %q missing from %s", content, rr.Body.String())
 		}
 	}
 }
@@ -775,7 +941,7 @@ func assertStatus(t *testing.T, h http.Handler, path string, want int) {
 
 func TestLiveImportImportsMultipleCatalogSelections(t *testing.T) {
 	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
-	form := "session=claude%3Aclaude-session-1&session=codex%3Acodex-session-1"
+	form := "family=" + liveFamilyKey(t, h, "claude") + "&family=" + liveFamilyKey(t, h, "codex")
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader(form))
 	r.Host = "example.test"
@@ -815,7 +981,7 @@ func TestLiveImportPersistsSelectedFamilyAtomically(t *testing.T) {
 	}
 	st := store.NewFilesystem(t.TempDir())
 	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: discovery.Roots{Claude: []string{claudeRoot}}}).(*server)
-	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Afamily-1"))
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+liveFamilyKey(t, h, "claude")))
 	r.Host = "example.test"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	attachLocalCSRF(t, h, r)
@@ -837,6 +1003,7 @@ func TestLiveImportPersistsSelectedFamilyAtomically(t *testing.T) {
 func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 	h := newLiveTestServer(t, "claude-session.jsonl")
 	root := h.roots.Claude[0]
+	key := liveFamilyKey(t, h, "claude")
 	h.discover = func(ctx context.Context, _ discovery.Roots, now time.Time, quiet time.Duration) ([]discovery.Candidate, error) {
 		items, err := discovery.Discover(ctx, discovery.Roots{Claude: []string{root}}, now, quiet)
 		if err != nil {
@@ -848,7 +1015,7 @@ func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 		return items, nil
 	}
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Aclaude-session-1"))
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+key))
 	r.Host = "example.test"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	attachLocalCSRF(t, h, r)
@@ -859,6 +1026,45 @@ func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 	items, err := h.store.ListSessions(context.Background(), session.Directory{Kind: "users", Slug: "local"})
 	if err != nil || len(items) != 0 {
 		t.Fatalf("items = %#v, err = %v", items, err)
+	}
+}
+
+func TestLiveImportCleansFirstSnapshotWhenSecondSelectionChanges(t *testing.T) {
+	snapshotRoot := t.TempDir()
+	t.Setenv("TMPDIR", snapshotRoot)
+	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
+	claudeRoot, codexRoot := h.roots.Claude[0], h.roots.Codex[0]
+	claudeKey := liveFamilyKey(t, h, "claude")
+	codexKey := liveFamilyKey(t, h, "codex")
+	h.discover = func(ctx context.Context, _ discovery.Roots, now time.Time, quiet time.Duration) ([]discovery.Candidate, error) {
+		items, err := discovery.Discover(ctx, discovery.Roots{Claude: []string{claudeRoot}, Codex: []string{codexRoot}}, now, quiet)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			if item.Provider == "codex" {
+				if err := os.WriteFile(item.Path, append(mustRead(t, item.Path), '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return items, nil
+	}
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+claudeKey+"&family="+codexKey))
+	r.Host = "example.test"
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	attachLocalCSRF(t, h, r)
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	entries, err := os.ReadDir(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("private snapshots remain after second selection failed: %v", entries)
 	}
 }
 
@@ -920,6 +1126,90 @@ func newLiveTestServer(t *testing.T, names ...string) *server {
 	return New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: roots}).(*server)
 }
 
+func scopedServerWithDuplicateSessionIDs(t *testing.T) (*server, []discovery.SessionFamilyCandidate) {
+	t.Helper()
+	root := t.TempDir()
+	firstRoot := filepath.Join(root, "claude-one")
+	secondRoot := filepath.Join(root, "claude-two")
+	first := bytes.ReplaceAll(mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl")), []byte("Fix the parser"), []byte("First duplicate source"))
+	second := bytes.ReplaceAll(mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl")), []byte("Fix the parser"), []byte("Second duplicate source"))
+	for _, source := range []struct {
+		root string
+		body []byte
+	}{{firstRoot, first}, {secondRoot, second}} {
+		if err := os.MkdirAll(source.root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(source.root, "claude-session.jsonl"), source.body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roots := discovery.Roots{Claude: []string{firstRoot, secondRoot}}
+	families, err := discovery.DiscoverAllFamilies(context.Background(), roots, time.Now(), 5*time.Minute)
+	if err != nil || len(families) != 2 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+	if families[0].ProviderSessionID != families[1].ProviderSessionID || families[0].Key == families[1].Key {
+		t.Fatalf("families do not establish key collision fixture: %#v", families)
+	}
+	scope := session.ProjectScope{Ref: families[0].Project}
+	st := store.NewFilesystem(t.TempDir())
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: roots, ProjectScope: &scope}).(*server)
+	return h, families
+}
+
+func getBody(t *testing.T, h http.Handler, path string) string {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("%s status=%d body=%s", path, rr.Code, rr.Body.String())
+	}
+	return rr.Body.String()
+}
+
+func postLiveImport(t *testing.T, h *server, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+key))
+	r.Host = "example.test"
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	attachLocalCSRF(t, h, r)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	return rr
+}
+
+func liveFamilyKey(t *testing.T, h *server, provider string) string {
+	t.Helper()
+	families, err := h.liveFamilies(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.Provider == provider {
+			return family.Key
+		}
+	}
+	t.Fatalf("no %s family in %#v", provider, families)
+	return ""
+}
+
+func assertOnlyFamilyImported(t *testing.T, h *server, selected discovery.SessionFamilyCandidate) {
+	t.Helper()
+	items, err := h.store.ListSessions(context.Background(), session.Directory{Kind: "users", Slug: "local"})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items=%#v err=%v", items, err)
+	}
+	pkg, err := h.store.GetSession(context.Background(), items[0].ID)
+	if err != nil || len(pkg.Sources) != 1 {
+		t.Fatalf("package=%#v err=%v", pkg, err)
+	}
+	want := mustRead(t, selected.Main.Path)
+	if !bytes.Equal(pkg.Sources[0].Bytes, want) {
+		t.Fatalf("imported source did not match selected main %q", selected.Main.Path)
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -945,7 +1235,7 @@ func packageWithText(t *testing.T, text string) session.Package {
 		Source:      source,
 		Normalized:  []byte(`{"schema_version":1}`),
 		SourceFacts: session.SourceFacts{ObservedSize: int64(len(source))},
-		Session: session.Session{SchemaVersion: 1, Provider: "claude", ID: "session-123", Events: []session.Event{
+		Session: session.Session{SchemaVersion: 1, Provider: "claude", ID: "session-123", Completion: session.Completion{Terminal: true, TerminalReason: "done"}, Events: []session.Event{
 			{ID: "event-1", Kind: session.EventUser, Text: text},
 			{ID: "event-2", Kind: session.EventRaw, RawType: "future_event", Raw: []byte(`{"future":true}`)},
 		}},

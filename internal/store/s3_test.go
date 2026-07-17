@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
@@ -35,6 +36,87 @@ func TestS3PutFamilyReadsEveryMember(t *testing.T) {
 	got, err := s.GetSession(context.Background(), p.ID)
 	if err != nil || len(got.Sources) != 2 || got.Family.Project.Key == "" {
 		t.Fatalf("get = %#v, %v", got, err)
+	}
+}
+
+func TestS3ReadsExistingIncompleteV2ButRejectsNewWrite(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod").(*S3)
+	p := familyPackage(t, "main", "child-a", "child-b")
+	if _, err := s.PutFamily(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	p.Family.Children[0].Session.Completion = session.Completion{}
+	p.Family.Completion = session.FamilyCompletion{Status: "incomplete"}
+	familyBytes, err := json.Marshal(p.Family)
+	if err != nil {
+		t.Fatal(err)
+	}
+	familyKey, err := s.key(p.Metadata.Destination, p.ID, "family.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", familyKey, familyBytes, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := s.readManifest(context.Background(), p.Metadata.Destination, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files["family.json"] = checksum(familyBytes)
+	manifestBytes, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestKey, err := s.key(p.Metadata.Destination, p.ID, "manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", manifestKey, manifestBytes, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutFamily(context.Background(), p); err == nil {
+		t.Fatal("stored a new incomplete family")
+	}
+	// A legacy completion state does not excuse child source/fact order.
+	p.SourceManifest.Sources[1], p.SourceManifest.Sources[2] = p.SourceManifest.Sources[2], p.SourceManifest.Sources[1]
+	p.SourceFactsSet[1], p.SourceFactsSet[2] = p.SourceFactsSet[2], p.SourceFactsSet[1]
+	sourceManifest, err := json.Marshal(p.SourceManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceFacts, err := json.Marshal(p.SourceFactsSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceManifestKey, err := s.key(p.Metadata.Destination, p.ID, "source-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", sourceManifestKey, sourceManifest, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	sourceFactsKey, err := s.key(p.Metadata.Destination, p.ID, "source-facts.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", sourceFactsKey, sourceFacts, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	m.Files["source-manifest.json"] = checksum(sourceManifest)
+	m.Files["source-facts.json"] = checksum(sourceFacts)
+	manifestBytes, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", manifestKey, manifestBytes, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err == nil {
+		t.Fatal("read legacy incomplete package with misordered child facts")
 	}
 }
 
@@ -465,7 +547,9 @@ func TestS3ReclaimClaimResponseLossRetryConverges(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), reput); err == nil {
 		t.Fatal("wanted response loss")
 	}
-	if created, err := s.PutSession(context.Background(), reput); err != nil || !created {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if created, err := s.PutSession(ctx, reput); err != nil || !created {
 		t.Fatalf("retry = %v,%v", created, err)
 	}
 }

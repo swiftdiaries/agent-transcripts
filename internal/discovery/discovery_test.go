@@ -65,6 +65,175 @@ func TestFormFamiliesGroupsClaudeChildrenUnderMain(t *testing.T) {
 	}
 }
 
+func TestFormFamiliesGroupsCodexDescendantsUnderRoot(t *testing.T) {
+	got, err := FormFamilies([]Candidate{codexCandidate("codex-root", ""), codexCandidate("codex-worker", "codex-root"), codexCandidate("codex-guardian", "codex-worker")}, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || len(got[0].Children) != 2 {
+		t.Fatalf("families = %#v", got)
+	}
+	var guardian *ChildSourceCandidate
+	for i := range got[0].Children {
+		if got[0].Children[i].Candidate.SessionID == "codex-guardian" {
+			guardian = &got[0].Children[i]
+		}
+	}
+	if guardian == nil || guardian.AgentID != "codex-guardian" || guardian.ParentSessionID != "codex-worker" {
+		t.Fatalf("guardian = %#v", guardian)
+	}
+}
+
+func TestFormFamiliesDoesNotPromoteCodexOrphan(t *testing.T) {
+	got, err := FormFamilies([]Candidate{codexCandidate("orphan", "missing")}, testScope())
+	if err != nil || len(got) != 0 {
+		t.Fatalf("families=%#v err=%v", got, err)
+	}
+}
+
+func TestFormFamiliesExcludesInvalidCodexComponentsButKeepsValidRoots(t *testing.T) {
+	candidates := []Candidate{codexCandidate("valid-root", "")}
+	candidates = append(candidates, cyclicCodexCandidates()...)
+	candidates = append(candidates, duplicateCodexCandidates()...)
+	got, err := FormFamilies(candidates, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != "valid-root" {
+		t.Fatalf("families=%#v", got)
+	}
+}
+
+func TestDiscoverAllFamiliesExcludesCodexComponentWithCrossProjectParentEdge(t *testing.T) {
+	logs := t.TempDir()
+	inside := t.TempDir()
+	outside := t.TempDir()
+	writeSession(t, filepath.Join(logs, "rollout-valid.jsonl"), codexRootJSONL("valid-root", inside), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-root.jsonl"), codexRootJSONL("cross-project-root", inside), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-child.jsonl"), codexChildJSONL("cross-project-child", "cross-project-root", outside), 10*time.Minute)
+
+	got, err := DiscoverAllFamilies(context.Background(), Roots{Codex: []string{logs}}, fixedNow, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != "valid-root" {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
+func TestDiscoverAllFamiliesExcludesCodexComponentWithMalformedDirectChild(t *testing.T) {
+	logs := t.TempDir()
+	project := t.TempDir()
+	writeSession(t, filepath.Join(logs, "rollout-valid.jsonl"), codexRootJSONL("valid-root", project), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-root.jsonl"), codexRootJSONL("malformed-root", project), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-malformed-child.jsonl"), `{"type":"session_meta","timestamp":"2026-07-12T10:00:00Z","payload":{"id":"malformed-child","parent_thread_id":"malformed-root","cwd":"`+project+`","thread_source":"subagent","source":{"subagent":{"other":"future"}}}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:01Z","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:02Z","payload":{"type":"task_complete"}}`, 10*time.Minute)
+
+	got, err := DiscoverAllFamilies(context.Background(), Roots{Codex: []string{logs}}, fixedNow, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != "valid-root" {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
+func TestFormFamiliesExcludesCodexComponentWithCrossProjectParentEdge(t *testing.T) {
+	inside := testScope()
+	outside := session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "other"}}
+	valid := scopedCodexCandidate("valid-root", "", inside)
+	root := scopedCodexCandidate("cross-project-root", "", inside)
+	child := scopedCodexCandidate("cross-project-child", "cross-project-root", outside)
+
+	got, err := FormFamilies([]Candidate{valid, root, child}, inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != valid.SessionID {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
+func TestFormFamiliesExcludesEntireDuplicateCodexComponentWithCrossProjectChild(t *testing.T) {
+	inside := testScope()
+	outside := session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "other"}}
+	valid := scopedCodexCandidate("valid-root", "", inside)
+	root := scopedCodexCandidate("root", "", inside)
+	duplicateMiddle := scopedCodexCandidate("middle", "root", inside)
+	crossProjectChild := scopedCodexCandidate("child", "middle", outside)
+
+	got, err := FormFamilies([]Candidate{valid, root, duplicateMiddle, duplicateMiddle, crossProjectChild}, inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != valid.SessionID {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
+func TestMarkCodexCyclesMarksOnlyCycleMembers(t *testing.T) {
+	byID := map[string]Candidate{
+		"a":     codexCandidate("a", "b"),
+		"b":     codexCandidate("b", "a"),
+		"child": codexCandidate("child", "a"),
+		"root":  codexCandidate("root", ""),
+	}
+	invalid := map[string]bool{}
+	markCodexCycles(byID, invalid)
+	if !invalid["a"] || !invalid["b"] || invalid["child"] || invalid["root"] {
+		t.Fatalf("invalid = %#v", invalid)
+	}
+}
+
+func TestPropagateInvalidCodexParentsMarksDescendants(t *testing.T) {
+	byID := map[string]Candidate{
+		"bad":        codexCandidate("bad", "missing"),
+		"child":      codexCandidate("child", "bad"),
+		"grandchild": codexCandidate("grandchild", "child"),
+		"root":       codexCandidate("root", ""),
+	}
+	invalid := map[string]bool{"bad": true}
+	propagateInvalidCodexParents(byID, invalid)
+	if !invalid["bad"] || !invalid["child"] || !invalid["grandchild"] || invalid["root"] {
+		t.Fatalf("invalid = %#v", invalid)
+	}
+}
+
+func testScope() session.ProjectScope {
+	return session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"}}
+}
+
+func codexCandidate(id, parent string) Candidate {
+	return Candidate{Path: filepath.Join("/codex", id+".jsonl"), Provider: "codex", SessionID: id, Title: id, Origin: session.SessionOrigin{ParentSessionID: parent}}
+}
+
+func scopedCodexCandidate(id, parent string, scope session.ProjectScope) Candidate {
+	candidate := codexCandidate(id, parent)
+	candidate.Scope = scope
+	return candidate
+}
+
+func cyclicCodexCandidates() []Candidate {
+	return []Candidate{codexCandidate("cycle-a", "cycle-b"), codexCandidate("cycle-b", "cycle-a")}
+}
+
+func codexRootJSONL(id, cwd string) string {
+	return `{"type":"session_meta","timestamp":"2026-07-12T10:00:00Z","payload":{"id":"` + id + `","cwd":"` + cwd + `","thread_source":"user"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:01Z","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:02Z","payload":{"type":"task_complete"}}`
+}
+
+func codexChildJSONL(id, parent, cwd string) string {
+	return `{"type":"session_meta","timestamp":"2026-07-12T10:00:00Z","payload":{"id":"` + id + `","parent_thread_id":"` + parent + `","cwd":"` + cwd + `","thread_source":"subagent","source":{"subagent":{"other":"guardian"}}}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:01Z","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:02Z","payload":{"type":"task_complete"}}`
+}
+
+func duplicateCodexCandidates() []Candidate {
+	return []Candidate{codexCandidate("duplicate", ""), codexCandidate("duplicate", "")}
+}
+
 func TestDiscoverFamiliesFiltersToProjectScope(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "inside")
@@ -102,11 +271,21 @@ func TestSnapshotFamilyCopiesMainAndChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := SnapshotFamily(SessionFamilyCandidate{Main: SourceCandidate{Candidate: main}, Children: []ChildSourceCandidate{{Candidate: child, AgentID: "1"}}})
+	got, err := SnapshotFamily(context.Background(), SessionFamilyCandidate{Main: SourceCandidate{Candidate: main}, Children: []ChildSourceCandidate{{Candidate: child, AgentID: "1"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Sources) != 2 || string(got.Sources[0].Bytes) != data {
+	defer got.Close()
+	reader, err := got.Sources[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bytes, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sources) != 2 || string(bytes) != data {
 		t.Fatalf("snapshot = %#v", got)
 	}
 }
@@ -328,8 +507,7 @@ func TestOpenEligibleRejectsOversizeBeforeReparse(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = OpenEligible(got[0])
-	var tooLarge *parser.ErrSourceTooLarge
-	if !errors.As(err, &tooLarge) {
+	if !errors.Is(err, ErrSourceChanged) {
 		t.Fatalf("error = %T %v", err, err)
 	}
 }

@@ -4,11 +4,58 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
+
+func parseFixture(t *testing.T, name string) session.Session {
+	t.Helper()
+	f, err := os.Open(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestCodexPreservesThreadSpawnOrigin(t *testing.T) {
+	got := parseFixture(t, "codex-family-worker.jsonl")
+	if got.Origin.Kind != "thread_spawn" || got.Origin.ParentSessionID != "codex-root" || got.Origin.AgentPath != "/root/reviewer" || got.Origin.AgentName != "Ada" || got.Origin.AgentRole != "reviewer" {
+		t.Fatalf("origin = %#v", got.Origin)
+	}
+}
+
+func TestCodexPreservesGuardianOrigin(t *testing.T) {
+	got := parseFixture(t, "codex-family-guardian.jsonl")
+	if got.Origin.Kind != "guardian" || got.Origin.ParentSessionID != "codex-worker" {
+		t.Fatalf("origin = %#v", got.Origin)
+	}
+}
+
+func TestCodexAcceptsLegacyRootWithoutThreadSource(t *testing.T) {
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(`{"type":"session_meta","payload":{"id":"legacy-root"}}`))
+	if err != nil || got.Origin != (session.SessionOrigin{}) {
+		t.Fatalf("session=%#v err=%v", got, err)
+	}
+}
+
+func TestCodexRejectsMalformedExplicitSubagentOrigin(t *testing.T) {
+	for _, input := range []string{
+		`{"type":"session_meta","payload":{"id":"missing-parent","thread_source":"subagent","source":{"subagent":{"other":"guardian"}}}}`,
+		`{"type":"session_meta","payload":{"id":"unknown-kind","parent_thread_id":"root","thread_source":"subagent","source":{"subagent":{"other":"future"}}}}`,
+	} {
+		if _, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input)); err == nil {
+			t.Fatalf("accepted %s", input)
+		}
+	}
+}
 
 func TestRegistryParsesFixtures(t *testing.T) {
 	for _, tt := range []struct {
@@ -111,6 +158,19 @@ func TestAttachClaudeChildrenUsesStableToolIdentity(t *testing.T) {
 	}
 	if len(children) != 1 || !children[0].Attached || children[0].ParentToolCallID != "call_1" {
 		t.Fatalf("children = %#v", children)
+	}
+}
+
+func TestClaudeParserPreservesParentResultStatus(t *testing.T) {
+	input := `{"type":"user","uuid":"result","sessionId":"claude_status","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"agent_1","status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"done"}]}}`
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range got.Events {
+		if event.ID == "result" && event.ResultStatus != "completed" {
+			t.Fatalf("status=%q", event.ResultStatus)
+		}
 	}
 }
 

@@ -187,7 +187,17 @@ For Claude:
 - Every child must contain one consistent non-empty `agentId`; the filename is checked against it but is not trusted as the identity source.
 - Orphan `subagents` directories and mixed-session or mixed-agent files are invalid and never become top-level candidates.
 
-For Codex, each rollout file is a one-source family. A future multi-file Codex relationship requires explicit provider evidence and a schema revision.
+For Codex, a rollout whose `session_meta.payload.thread_source` is `user` and
+has no `parent_thread_id` is a family root. For compatibility with existing
+Codex logs, a rollout with both fields absent remains an ungrouped one-source
+root. A rollout with `thread_source=subagent` is a child only when its
+non-empty `parent_thread_id` resolves to the root or another descendant in the
+same project. `source.subagent.thread_spawn` supplies agent path, nickname,
+and role; `source.subagent.other=guardian` supplies the guardian type.
+Duplicate IDs, cycles, cross-project edges, and conflicting parent evidence
+invalidate only that connected component. Orphans and malformed explicit
+subagents are excluded and never promoted to roots; unrelated valid roots
+remain visible.
 
 ### Opaque family keys
 
@@ -225,13 +235,28 @@ type FamilyCompletion struct {
 
 type ChildSession struct {
     AgentID          string
+    ParentSessionID  string
     ParentToolCallID string
     AgentType        string
     Description      string
     Attached         bool
     Session          Session
 }
+
+type SessionOrigin struct {
+    Kind            string
+    ParentSessionID string
+    AgentPath       string
+    AgentName       string
+    AgentRole       string
+}
 ```
+
+`Session.Origin` and `ChildSession.ParentSessionID` are backward-compatible
+schema-v2 extensions. Missing relationship fields in previously stored v2
+packages mean that the child is a direct child of the main session. Validation
+and all consumers normalize that empty value to the main session ID without
+rewriting stored JSON.
 
 Children are sorted by `AgentID` in normalized storage. Rendering may order attached children by the parent tool-call position and unattached children by start time, then `AgentID`.
 
@@ -248,6 +273,18 @@ Family semantic fields are derived, never supplied independently:
 - Otherwise the status is `incomplete` with reason `member_incomplete`, and the family cannot be previewed, imported, uploaded, or persisted.
 
 `ValidateFamily` recomputes these values and rejects mismatches, a family end before its start, provider or session-ID disagreement, duplicate child agent IDs, attached children without an existing parent tool-call ID, unattached children with a parent tool-call ID, or child project disagreement. Local packages may persist `provider_terminal` or `local_quiet`; hosted upload accepts only `provider_terminal`.
+
+For Codex, a rollout whose `session_meta.payload.thread_source` is `user` and
+has no `parent_thread_id` is a family root. For compatibility with existing
+Codex logs, a rollout with both fields absent remains an ungrouped one-source
+root. A rollout with `thread_source=subagent` is a child only when its
+non-empty `parent_thread_id` resolves to the root or another descendant in the
+same project. `source.subagent.thread_spawn` supplies agent path, nickname,
+and role; `source.subagent.other=guardian` supplies the guardian type.
+Duplicate IDs, cycles, cross-project edges, and conflicting parent evidence
+invalidate only that connected component. Orphans and malformed explicit
+subagents are excluded and never promoted to roots; unrelated valid roots
+remain visible.
 
 Existing schema-v1 packages remain readable. The read path projects a v1 `Session` as a v2 family with `Main` populated and no children. New imports always write schema v2; no in-place migration rewrites existing immutable packages.
 

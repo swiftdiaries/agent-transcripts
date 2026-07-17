@@ -40,14 +40,18 @@ func TestRunWithoutSubcommandBrowses(t *testing.T) {
 	}
 }
 
-func TestFamilySelectorsRejectStaleKeysAndChooseLatest(t *testing.T) {
-	families := []discovery.SessionFamilyCandidate{{Key: "f_new", StartedAt: time.Now()}, {Key: "f_old", StartedAt: time.Now().Add(-time.Hour)}}
-	if _, ok := selectFamily(families, "f_tampered", false); ok {
-		t.Fatal("accepted stale family key")
+func TestFamilySelectorsRejectDuplicateAndStaleKeysAndChooseLatest(t *testing.T) {
+	duplicate := "f_" + strings.Repeat("a", 64)
+	if _, _, err := selectFamily([]discovery.SessionFamilyCandidate{{Key: duplicate}, {Key: duplicate}}, duplicate, false); err == nil {
+		t.Fatal("accepted duplicate family key")
 	}
-	got, ok := selectFamily(families, "", true)
-	if !ok || got.Key != "f_new" {
-		t.Fatalf("latest=%+v ok=%v", got, ok)
+	families := []discovery.SessionFamilyCandidate{{Key: duplicate, Provider: "claude", ProviderSessionID: "same", StartedAt: time.Now()}, {Key: "f_" + strings.Repeat("b", 64), Provider: "claude", ProviderSessionID: "same", StartedAt: time.Now().Add(-time.Hour)}}
+	if _, ok, err := selectFamily(families, "f_"+strings.Repeat("c", 64), false); err != nil || ok {
+		t.Fatalf("accepted stale family key: ok=%v err=%v", ok, err)
+	}
+	got, ok, err := selectFamily(families, "", true)
+	if err != nil || !ok || got.Key != duplicate {
+		t.Fatalf("latest=%+v ok=%v err=%v", got, ok, err)
 	}
 }
 
@@ -89,6 +93,36 @@ func TestBrowseExplicitFamilyIncludesChildrenAndStaysLoopbackWithoutOpening(t *t
 	}, os.Getwd)
 	if code != 0 || opened {
 		t.Fatalf("code=%d opened=%v stderr=%q", code, opened, stderr.String())
+	}
+}
+
+func TestFamilyForPathDerivesScopeFromOwnedSnapshot(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "claude-session.jsonl")
+	original, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replaced := bytes.ReplaceAll(original, []byte("/workspace/demo"), []byte("/workspace/replaced"))
+	family, err := familyForPathWithSnapshot(context.Background(), path, func(ctx context.Context, candidate discovery.SessionFamilyCandidate) (*discovery.FamilySnapshot, error) {
+		snapshot, err := discovery.SnapshotFamily(ctx, candidate)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, replaced, 0o600); err != nil {
+			_ = snapshot.Close()
+			return nil, err
+		}
+		return snapshot, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if family.Project.DisplayName != "demo" {
+		t.Fatalf("project=%+v, want snapshot project demo", family.Project)
 	}
 }
 
@@ -315,12 +349,17 @@ func uploadTestLibrary(t *testing.T) (store.Store, string) {
 func uploadFamilyTestLibrary(t *testing.T) (store.Store, string) {
 	t.Helper()
 	st := store.NewFilesystem(t.TempDir())
-	main := mustReadUploadFixture(t, "claude-session.jsonl")
-	child := bytes.Clone(main)
-	md, _, err := library.New(st, library.AllowLocalQuietEvidence()).ImportFamilyWithStatus(context.Background(), discovery.FamilySnapshot{
-		Candidate: discovery.SessionFamilyCandidate{Provider: "claude", ProviderSessionID: "claude-session-1"},
-		Sources:   []discovery.SnapshotSource{{Role: "main", Bytes: main}, {Role: "child", AgentID: "agent-real", Bytes: child}},
-	}, library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local"})
+	main := []byte(`{"type":"assistant","uuid":"call","sessionId":"upload-family","timestamp":"2026-07-17T08:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Task","input":{}}]}}
+{"type":"user","uuid":"result","sessionId":"upload-family","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"agent-real","status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"done"}]}}
+{"type":"system","subtype":"turn_duration","uuid":"terminal","sessionId":"upload-family","timestamp":"2026-07-17T08:00:02Z"}`)
+	child := []byte(`{"type":"user","uuid":"child","sessionId":"upload-family","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"agent-real"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"nested","content":"done"}]}}
+{"type":"system","subtype":"turn_duration","uuid":"child-terminal","sessionId":"upload-family","timestamp":"2026-07-17T08:00:02Z"}`)
+	snapshot, err := discovery.SnapshotReaders(context.Background(), discovery.SessionFamilyCandidate{Provider: "claude", ProviderSessionID: "upload-family"}, []discovery.SnapshotInput{{Role: "main", Reader: bytes.NewReader(main)}, {Role: "child", AgentID: "agent-real", Reader: bytes.NewReader(child)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = snapshot.Close() })
+	md, _, err := library.New(st, library.AllowLocalQuietEvidence()).ImportFamilyWithStatus(context.Background(), snapshot, library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local"})
 	if err != nil {
 		t.Fatal(err)
 	}

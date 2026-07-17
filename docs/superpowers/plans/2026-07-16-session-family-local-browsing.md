@@ -1,5 +1,10 @@
 # Project-Scoped Session Families Implementation Plan
 
+> **Remediation:** `2026-07-17-v2-session-family-remediation.md` supersedes
+> this plan's Codex one-source assumption, local source-opening algorithm,
+> hosted completion derivation, S3 reclaim retry behavior, and persistent
+> live selector wiring.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
 **Goal:** Let agent-transcripts discover, browse, import, persist, publish, and render complete provider session families scoped to the current Git worktree by default.

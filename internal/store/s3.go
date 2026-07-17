@@ -226,26 +226,35 @@ func (s *S3) PutFamily(ctx context.Context, p session.Package) (bool, error) {
 			return false, e
 		}
 		if checksum(existing.Body) != checksum(metadata) {
-			_, e = s.client.PutObject(ctx, s.bucket, reclaimKey, metadata, S3Condition{IfNoneMatch: true})
-			claimOwned = e == nil
-			if e != nil {
-				if !errors.Is(e, ErrS3PreconditionFailed) {
+			for {
+				state, e := s.claimFamilyReclaim(ctx, reclaimKey, metadata)
+				if e != nil {
 					return false, e
 				}
-				if _, e = s.client.HeadObject(ctx, s.bucket, reclaimKey); e != nil {
-					return false, e
+				switch state {
+				case familyClaimAbsent:
+					continue
+				case familyClaimWaiting:
+					settled, e := s.reconcileFamilyReclaim(ctx, p, reclaimKey, metadata)
+					if settled || e != nil {
+						return false, e
+					}
+					continue
+				case familyClaimOwned:
+					claimOwned = true
 				}
-				claim, ce := s.get(ctx, reclaimKey, "metadata.json")
-				if ce != nil || checksum(claim.Body) != checksum(metadata) {
-					return false, ErrConflict
-				}
+				break
 			}
 			if _, e = s.client.HeadObject(ctx, s.bucket, manifestKey); e == nil {
 				winner, _, we := s.readManifest(ctx, p.Metadata.Destination, p.ID)
 				if we != nil {
 					return false, we
 				}
-				return s.identicalFamily(ctx, winner, p)
+				created, we := s.identicalFamily(ctx, winner, p)
+				if we == nil {
+					_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
+				}
+				return created, we
 			} else if !errors.Is(e, ErrS3NotFound) {
 				return false, e
 			}
@@ -285,7 +294,11 @@ func (s *S3) PutFamily(ctx context.Context, p session.Package) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return s.identicalFamily(ctx, winner, p)
+	created, err := s.identicalFamily(ctx, winner, p)
+	if claimOwned && err == nil {
+		_ = s.client.DeleteObject(ctx, s.bucket, reclaimKey, S3Condition{})
+	}
+	return created, err
 }
 
 func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
@@ -299,6 +312,14 @@ func (s *S3) PutSession(ctx context.Context, p session.Package) (bool, error) {
 const (
 	reclaimRetryInitialDelay = 5 * time.Millisecond
 	reclaimRetryMaxDelay     = 250 * time.Millisecond
+)
+
+type familyClaimState uint8
+
+const (
+	familyClaimAbsent familyClaimState = iota
+	familyClaimOwned
+	familyClaimWaiting
 )
 
 // reconcileReclaim waits for a matching claimant to publish its manifest. A
@@ -947,7 +968,7 @@ func (s *S3) readFamilyPackage(ctx context.Context, m manifest) (session.Package
 		sources[i] = session.SourceBlob{Entry: entry, Bytes: o.Body}
 	}
 	p := session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sm, Sources: sources, SourceFactsSet: facts, Normalized: norm.Body}
-	if err := validateFamilyPut(p); err != nil {
+	if err := validateFamilyRead(p); err != nil {
 		return session.Package{}, err
 	}
 	return p, nil
@@ -973,6 +994,27 @@ func (s *S3) identicalFamily(ctx context.Context, m manifest, p session.Package)
 	return false, nil
 }
 
+func (s *S3) claimFamilyReclaim(ctx context.Context, key string, metadata []byte) (familyClaimState, error) {
+	if _, err := s.client.PutObject(ctx, s.bucket, key, metadata, S3Condition{IfNoneMatch: true}); err == nil {
+		return familyClaimOwned, nil
+	} else if !errors.Is(err, ErrS3PreconditionFailed) {
+		return familyClaimAbsent, err
+	}
+	claim, err := s.get(ctx, key, "metadata.json")
+	if errors.Is(err, ErrS3NotFound) {
+		return familyClaimAbsent, nil
+	}
+	if err != nil {
+		return familyClaimAbsent, err
+	}
+	if checksum(claim.Body) != checksum(metadata) {
+		return familyClaimWaiting, nil
+	}
+	// A byte-identical orphan claim is this idempotent operation's durable
+	// ownership token after a lost response. The retry must resume publication.
+	return familyClaimOwned, nil
+}
+
 func (s *S3) reconcileFamilyReclaim(ctx context.Context, p session.Package, reclaimKey string, metadata []byte) (bool, error) {
 	delay := reclaimRetryInitialDelay
 	for {
@@ -985,6 +1027,11 @@ func (s *S3) reconcileFamilyReclaim(ctx context.Context, p session.Package, recl
 			return true, e
 		}
 		if !errors.Is(err, ErrS3NotFound) {
+			return true, err
+		}
+		if _, err := s.client.HeadObject(ctx, s.bucket, reclaimKey); errors.Is(err, ErrS3NotFound) {
+			return false, nil
+		} else if err != nil {
 			return true, err
 		}
 		claim, err := s.get(ctx, reclaimKey, "metadata.json")

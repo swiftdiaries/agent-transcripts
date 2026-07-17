@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
@@ -121,6 +122,7 @@ type envelope struct {
 	AgentID       string          `json:"agentId"`
 	ToolUseResult struct {
 		AgentID string `json:"agentId"`
+		Status  string `json:"status"`
 	} `json:"toolUseResult"`
 }
 
@@ -142,28 +144,71 @@ func AttachClaudeChildren(main session.Session, children []ClaudeChild) ([]sessi
 			return nil, fmt.Errorf("duplicate Claude child agent ID %q", child.AgentID)
 		}
 		seen[child.AgentID] = struct{}{}
-		parentID := ""
+		var matchedResult *session.Event
 		for _, event := range main.Events {
 			if event.Kind == session.EventToolResult && event.AgentID == child.AgentID {
-				if parentID != "" {
+				if matchedResult != nil {
 					return nil, fmt.Errorf("ambiguous Claude parent result for agent %q", child.AgentID)
 				}
-				parentID = event.ParentID
+				copy := event
+				matchedResult = &copy
 			}
 		}
-		attached := false
-		if parentID != "" {
-			for _, event := range main.Events {
-				if event.ID == parentID && event.Kind == session.EventToolCall && (event.ToolName == "Agent" || event.ToolName == "Task") {
-					attached = true
+		if matchedResult == nil {
+			return nil, fmt.Errorf("Claude child has no parent result for agent %q", child.AgentID)
+		}
+		var call *session.Event
+		for _, event := range main.Events {
+			if event.ID == matchedResult.ParentID && event.Kind == session.EventToolCall && (event.ToolName == "Agent" || event.ToolName == "Task") {
+				if call != nil {
+					return nil, fmt.Errorf("ambiguous Claude parent call for agent %q", child.AgentID)
 				}
+				copy := event
+				call = &copy
 			}
 		}
-		entry := session.ChildSession{AgentID: child.AgentID, Attached: attached, Session: child.Session}
-		if attached {
-			entry.ParentToolCallID = parentID
+		if call == nil {
+			return nil, fmt.Errorf("Claude child has no Agent or Task call for agent %q", child.AgentID)
+		}
+		var input struct {
+			Description  string `json:"description"`
+			SubagentType string `json:"subagent_type"`
+		}
+		_ = json.Unmarshal(call.Input, &input)
+		agentType := call.ToolName
+		if input.SubagentType != "" {
+			agentType = input.SubagentType
+		}
+		entry := session.ChildSession{AgentID: child.AgentID, ParentSessionID: main.ID, ParentToolCallID: call.ID, AgentType: agentType, Description: input.Description, Attached: true, Session: child.Session}
+		switch matchedResult.ResultStatus {
+		case "completed", "failed", "cancelled", "interrupted":
+			entry.Session.Completion.Terminal = true
+			entry.Session.Completion.TerminalReason = "parent_result_" + matchedResult.ResultStatus
 		}
 		result = append(result, entry)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].AgentID < result[j].AgentID })
 	return result, nil
+}
+
+// AttachCodexChildren derives membership strictly from parsed Codex origin
+// evidence. Unlike Claude, Codex child sessions have distinct identities.
+func AttachCodexChildren(main session.Session, children []session.Session) ([]session.ChildSession, error) {
+	members := map[string]struct{}{main.ID: {}}
+	for _, child := range children {
+		members[child.ID] = struct{}{}
+	}
+	out := make([]session.ChildSession, 0, len(children))
+	for _, child := range children {
+		parent := child.Origin.ParentSessionID
+		if parent == "" {
+			return nil, errors.New("Codex child has no parent thread")
+		}
+		if _, ok := members[parent]; !ok {
+			return nil, errors.New("Codex child parent is outside family")
+		}
+		out = append(out, session.ChildSession{AgentID: child.ID, ParentSessionID: parent, AgentType: child.Origin.Kind, Description: child.Origin.AgentPath, Session: child})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AgentID < out[j].AgentID })
+	return out, nil
 }

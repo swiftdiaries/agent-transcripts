@@ -125,7 +125,7 @@ func mapClaudeMessage(e envelope, line int, when time.Time) ([]session.Event, bo
 		case "tool_use":
 			events = append(events, session.Event{ID: blockID, ParentID: e.UUID, Kind: session.EventToolCall, Time: when, ToolName: block.Name, Input: block.Input})
 		case "tool_result":
-			events = append(events, session.Event{ID: blockID, ParentID: block.ToolUseID, AgentID: e.ToolUseResult.AgentID, Kind: session.EventToolResult, Time: when, Output: jsonValue(block.Content)})
+			events = append(events, session.Event{ID: blockID, ParentID: block.ToolUseID, AgentID: e.ToolUseResult.AgentID, Kind: session.EventToolResult, Time: when, Output: jsonValue(block.Content), ResultStatus: e.ToolUseResult.Status})
 		default:
 			return nil, false, nil
 		}

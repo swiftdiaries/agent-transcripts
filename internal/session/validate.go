@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -88,6 +89,9 @@ func Validate(s Session) error {
 			return fmt.Errorf("event %d: %w", i, err)
 		}
 	}
+	if err := validateSessionOrigin(s.Origin); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -113,6 +117,9 @@ func ValidateFamily(f SessionFamily) error {
 	if f.Main.Provider != f.Provider || f.Main.ProviderSessionID != "" && f.Main.ProviderSessionID != f.ProviderSessionID {
 		return fmt.Errorf("main provider identity mismatch")
 	}
+	if f.Main.Origin != (SessionOrigin{}) {
+		return fmt.Errorf("main session origin must be empty")
+	}
 	if len(f.Children)+1 > MaxFamilySources {
 		return fmt.Errorf("family exceeds %d sources", MaxFamilySources)
 	}
@@ -132,10 +139,20 @@ func ValidateFamily(f SessionFamily) error {
 		if err := Validate(child.Session); err != nil {
 			return fmt.Errorf("child %d: %w", i, err)
 		}
-		if child.Session.Provider != f.Provider || child.Session.ProviderSessionID != "" && child.Session.ProviderSessionID != f.ProviderSessionID {
+		if child.Session.Provider != f.Provider {
+			return fmt.Errorf("child provider identity mismatch")
+		}
+		if f.Provider == "claude" && child.Session.ProviderSessionID != f.ProviderSessionID {
 			return fmt.Errorf("child provider identity mismatch")
 		}
 		members = append(members, child.Session)
+	}
+	familyMembers, err := familyMemberByID(f)
+	if err != nil {
+		return err
+	}
+	if err := validateFamilyParents(f, familyMembers); err != nil {
+		return err
 	}
 	start, end, last := derivedFamilyTimes(members)
 	if !f.StartedAt.Equal(start) || !f.EndedAt.Equal(end) || !f.Completion.LastEventAt.Equal(last) {
@@ -151,6 +168,109 @@ func ValidateFamily(f SessionFamily) error {
 		}
 	} else if f.Completion.Status != "local_quiet" && f.Completion.Status != "incomplete" {
 		return fmt.Errorf("invalid family completion")
+	}
+	return nil
+}
+
+// familyMemberByID returns the sessions that may be referenced as parents.
+// Claude records all children against the main provider session, whereas Codex
+// descendants each have their own provider session identity.
+func familyMemberByID(f SessionFamily) (map[string]Session, error) {
+	members := map[string]Session{f.Main.ID: f.Main}
+	if f.Provider != "codex" {
+		return members, nil
+	}
+	for _, child := range f.Children {
+		if child.Session.ID == f.Main.ID {
+			return nil, fmt.Errorf("Codex child reuses root session ID")
+		}
+		if _, exists := members[child.Session.ID]; exists {
+			return nil, fmt.Errorf("duplicate member session ID")
+		}
+		members[child.Session.ID] = child.Session
+	}
+	return members, nil
+}
+
+func validateFamilyParents(f SessionFamily, members map[string]Session) error {
+	parentOf := make(map[string]string, len(f.Children))
+	for _, child := range f.Children {
+		parent := child.ParentSessionID
+		if parent == "" {
+			parent = f.Main.ID
+		}
+		parentSession, exists := members[parent]
+		if !exists {
+			return fmt.Errorf("unknown parent session %q", parent)
+		}
+		if f.Provider == "claude" {
+			if parent != f.Main.ID {
+				return errors.New("Claude child parent is not the family root")
+			}
+			if child.Session.Origin != (SessionOrigin{}) {
+				return errors.New("Claude child origin must be empty")
+			}
+		} else if f.Provider == "codex" {
+			if child.AgentID != child.Session.ID || child.Session.ProviderSessionID != child.Session.ID {
+				return errors.New("Codex child identity mismatch")
+			}
+			if child.Session.Origin.ParentSessionID != parent || child.AgentType != child.Session.Origin.Kind {
+				return errors.New("Codex child origin mismatch")
+			}
+			parentOf[child.Session.ID] = parent
+		} else if parent != f.Main.ID {
+			return errors.New("child parent is not the family root")
+		}
+		if err := validateParentToolCall(child, parentSession); err != nil {
+			return err
+		}
+	}
+	for child := range parentOf {
+		seen := map[string]bool{}
+		for current := child; current != f.Main.ID; current = parentOf[current] {
+			if current == "" || seen[current] {
+				return fmt.Errorf("family parent graph is cyclic or unreachable")
+			}
+			seen[current] = true
+		}
+	}
+	return nil
+}
+
+func validateParentToolCall(child ChildSession, parent Session) error {
+	if !child.Attached {
+		return nil
+	}
+	matches := 0
+	for _, event := range parent.Events {
+		if event.ID == child.ParentToolCallID && event.Kind == EventToolCall && (event.ToolName == "Agent" || event.ToolName == "Task") {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("attached child parent tool call must identify one Agent or Task call")
+	}
+	return nil
+}
+
+func validateSessionOrigin(origin SessionOrigin) error {
+	if origin == (SessionOrigin{}) {
+		return nil
+	}
+	if origin.Kind != "thread_spawn" && origin.Kind != "guardian" {
+		return fmt.Errorf("invalid session origin kind")
+	}
+	if err := validateID("origin parent session ID", origin.ParentSessionID); err != nil {
+		return err
+	}
+	for label, value := range map[string]string{
+		"origin agent path": origin.AgentPath,
+		"origin agent name": origin.AgentName,
+		"origin agent role": origin.AgentRole,
+	} {
+		if !utf8.ValidString(value) || len(value) > MaxDescriptionBytes {
+			return fmt.Errorf("invalid %s", label)
+		}
 	}
 	return nil
 }

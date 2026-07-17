@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
@@ -59,24 +60,18 @@ func (s *Service) ImportWithStatus(ctx context.Context, source io.Reader, facts 
 	if source == nil {
 		return session.Metadata{}, false, errors.New("source is required")
 	}
-	raw, err := io.ReadAll(io.LimitReader(&contextReader{ctx: ctx, r: source}, session.MaxSourceBytes+1))
+	snapshot, err := discovery.SnapshotReaders(ctx, discovery.SessionFamilyCandidate{}, []discovery.SnapshotInput{{Role: "main", Reader: source, Facts: facts}})
 	if err != nil {
 		return session.Metadata{}, false, err
 	}
-	if len(raw) > session.MaxSourceBytes {
-		return session.Metadata{}, false, &parser.ErrSourceTooLarge{}
-	}
-	if facts.ObservedSize != 0 && facts.ObservedSize != int64(len(raw)) {
-		return session.Metadata{}, false, errors.New("source size differs from descriptor facts")
-	}
-	facts.ObservedSize = int64(len(raw))
-	return s.ImportFamilyWithStatus(ctx, discovery.FamilySnapshot{Sources: []discovery.SnapshotSource{{Role: "main", Bytes: raw, Facts: facts}}}, attrs)
+	defer snapshot.Close()
+	return s.ImportFamilyWithStatus(ctx, snapshot, attrs)
 }
 
 // ImportFamilyWithStatus imports the complete two-pass discovery snapshot as
 // one v2 package. Parser output, rather than transport fields, owns identity,
 // attachment, completion and the source manifest.
-func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery.FamilySnapshot, attrs ImportAttrs) (session.Metadata, bool, error) {
+func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot *discovery.FamilySnapshot, attrs ImportAttrs) (session.Metadata, bool, error) {
 	if err := session.ValidateDirectory(attrs.Destination); err != nil {
 		return session.Metadata{}, false, err
 	}
@@ -88,19 +83,20 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery
 	if err != nil {
 		return session.Metadata{}, false, err
 	}
-	if len(snapshot.Sources) == 0 || len(snapshot.Sources) > session.MaxFamilySources {
+	if snapshot == nil || len(snapshot.Sources) == 0 || len(snapshot.Sources) > session.MaxFamilySources {
 		return session.Metadata{}, false, errors.New("invalid family source set")
 	}
 	type member struct {
 		source discovery.SnapshotSource
 		parsed session.Session
+		raw    []byte
 	}
 	members := make([]member, 0, len(snapshot.Sources))
 	var main *member
 	var children []member
 	var total int64
 	seenChildren := map[string]struct{}{}
-	for sourceIndex, source := range snapshot.Sources {
+	for _, source := range snapshot.Sources {
 		if err := ctx.Err(); err != nil {
 			return session.Metadata{}, false, err
 		}
@@ -110,27 +106,40 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery
 		if source.Role == "main" && (source.AgentID != "" || main != nil) {
 			return session.Metadata{}, false, errors.New("family must have one main source")
 		}
-		if source.Facts.ObservedSize != 0 && source.Facts.ObservedSize != int64(len(source.Bytes)) {
-			return session.Metadata{}, false, errors.New("source size differs from descriptor facts")
-		}
-		total += int64(len(source.Bytes))
-		if total > session.MaxSourceBytes {
-			return session.Metadata{}, false, &parser.ErrSourceTooLarge{}
-		}
-		source.Facts.ObservedSize = int64(len(source.Bytes))
-		snapshot.Sources[sourceIndex].Facts = source.Facts
-		parsed, err := s.parsers.DetectAndParse(ctx, bytes.NewReader(source.Bytes))
+		reader, err := source.Open()
 		if err != nil {
 			return session.Metadata{}, false, err
 		}
-		if source.Role == "child" && source.AgentID == "" {
+		raw, readErr := io.ReadAll(io.LimitReader(&contextReader{ctx: ctx, r: reader}, session.MaxSourceBytes+1))
+		closeErr := reader.Close()
+		if readErr != nil {
+			return session.Metadata{}, false, readErr
+		}
+		if closeErr != nil {
+			return session.Metadata{}, false, closeErr
+		}
+		if len(raw) > session.MaxSourceBytes {
+			return session.Metadata{}, false, &parser.ErrSourceTooLarge{}
+		}
+		if source.Facts.ObservedSize != 0 && source.Facts.ObservedSize != int64(len(raw)) {
+			return session.Metadata{}, false, errors.New("source size differs from descriptor facts")
+		}
+		total += int64(len(raw))
+		if total > session.MaxSourceBytes {
+			return session.Metadata{}, false, &parser.ErrSourceTooLarge{}
+		}
+		source.Facts.ObservedSize = int64(len(raw))
+		parsed, err := s.parsers.DetectAndParse(ctx, bytes.NewReader(raw))
+		if err != nil {
+			return session.Metadata{}, false, err
+		}
+		if source.Role == "child" && (source.AgentID == "" || strings.HasPrefix(source.AgentID, "upload-child-")) {
 			// Hosted multipart filenames are untrusted. Only provider evidence in
 			// the child transcript can establish the agent identity.
 			source.AgentID, err = trustedChildAgentID(parsed)
 			if err != nil {
 				return session.Metadata{}, false, err
 			}
-			snapshot.Sources[sourceIndex].AgentID = source.AgentID
 		}
 		if _, duplicate := seenChildren[source.AgentID]; source.Role == "child" && duplicate {
 			return session.Metadata{}, false, errors.New("duplicate child agent ID")
@@ -138,7 +147,7 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery
 		if source.Role == "child" {
 			seenChildren[source.AgentID] = struct{}{}
 		}
-		entry := member{source: source, parsed: parsed}
+		entry := member{source: source, parsed: parsed, raw: raw}
 		members = append(members, entry)
 		if source.Role == "main" {
 			main = &members[len(members)-1]
@@ -156,33 +165,37 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery
 		return session.Metadata{}, false, errors.New("family session differs from snapshot")
 	}
 	childInputs := make([]parser.ClaudeChild, 0, len(children))
+	codexInputs := make([]session.Session, 0, len(children))
 	for _, child := range children {
-		if child.parsed.Provider != main.parsed.Provider || child.parsed.ProviderSessionID != main.parsed.ProviderSessionID {
-			return session.Metadata{}, false, errors.New("family member identity mismatch")
+		if child.parsed.Provider != main.parsed.Provider {
+			return session.Metadata{}, false, errors.New("family member provider mismatch")
 		}
-		childInputs = append(childInputs, parser.ClaudeChild{AgentID: child.source.AgentID, Session: child.parsed})
+		switch main.parsed.Provider {
+		case "claude":
+			if child.parsed.ProviderSessionID != main.parsed.ProviderSessionID {
+				return session.Metadata{}, false, errors.New("Claude family session mismatch")
+			}
+			childInputs = append(childInputs, parser.ClaudeChild{AgentID: child.source.AgentID, Session: child.parsed})
+		case "codex":
+			if child.parsed.ProviderSessionID != child.parsed.ID || child.source.AgentID != child.parsed.ID {
+				return session.Metadata{}, false, errors.New("Codex child identity mismatch")
+			}
+			codexInputs = append(codexInputs, child.parsed)
+		default:
+			return session.Metadata{}, false, errors.New("provider does not support family children")
+		}
 	}
 	var attached []session.ChildSession
 	if len(childInputs) != 0 {
-		if main.parsed.Provider != "claude" {
-			return session.Metadata{}, false, errors.New("children are only supported for Claude families")
-		}
 		attached, err = parser.AttachClaudeChildren(main.parsed, childInputs)
 		if err != nil {
 			return session.Metadata{}, false, err
 		}
 	}
-	if !main.parsed.Completion.Terminal && !(s.allowLocalQuiet && main.source.Facts.QuietPeriodVerified) {
-		return session.Metadata{}, false, ErrIncomplete
-	}
-	allTerminal := main.parsed.Completion.Terminal
-	allQuiet := !main.parsed.Completion.Terminal && main.source.Facts.QuietPeriodVerified
-	for i := range attached {
-		terminal := attached[i].Session.Completion.Terminal
-		allTerminal = allTerminal && terminal
-		allQuiet = allQuiet && (!terminal && children[i].source.Facts.QuietPeriodVerified)
-		if !terminal && !(s.allowLocalQuiet && children[i].source.Facts.QuietPeriodVerified) && !attached[i].Attached {
-			return session.Metadata{}, false, ErrIncomplete
+	if len(codexInputs) != 0 {
+		attached, err = parser.AttachCodexChildren(main.parsed, codexInputs)
+		if err != nil {
+			return session.Metadata{}, false, err
 		}
 	}
 	project := snapshot.Candidate.Project
@@ -192,25 +205,19 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery
 	}
 	family := session.SessionFamily{SchemaVersion: 2, ID: main.parsed.ProviderSessionID, Provider: main.parsed.Provider, ProviderSessionID: main.parsed.ProviderSessionID, Project: project, Main: main.parsed, Children: attached}
 	family.StartedAt, family.EndedAt, family.Completion.LastEventAt = familyTimes(family)
-	if allTerminal {
-		family.Completion.Status, family.Completion.Reason = "provider_terminal", "all_members_terminal"
-	} else if allQuiet {
-		family.Completion.Status = "local_quiet"
-	} else {
-		family.Completion.Status = "incomplete"
-	}
 	sources := make([]session.SourceBlob, 0, len(members))
 	facts := make([]session.SourceFactEntry, 0, len(members))
-	for _, source := range snapshot.Sources {
+	for _, member := range members {
+		source := member.source
 		name := "source/main.jsonl"
-		if len(snapshot.Sources) == 1 {
+		if len(members) == 1 {
 			name = "source.jsonl"
 		} else if source.Role == "child" {
 			name = "source/children/" + source.AgentID + ".jsonl"
 		}
-		sum := sha256.Sum256(source.Bytes)
-		entry := session.SourceEntry{Role: source.Role, AgentID: source.AgentID, Checksum: hex.EncodeToString(sum[:]), Bytes: int64(len(source.Bytes)), Name: name}
-		sources = append(sources, session.SourceBlob{Entry: entry, Bytes: append([]byte(nil), source.Bytes...)})
+		sum := sha256.Sum256(member.raw)
+		entry := session.SourceEntry{Role: source.Role, AgentID: source.AgentID, Checksum: hex.EncodeToString(sum[:]), Bytes: int64(len(member.raw)), Name: name}
+		sources = append(sources, session.SourceBlob{Entry: entry, Bytes: append([]byte(nil), member.raw...)})
 		facts = append(facts, session.SourceFactEntry{Role: source.Role, AgentID: source.AgentID, Facts: source.Facts})
 	}
 	sort.Slice(sources, func(i, j int) bool {
@@ -219,6 +226,11 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery
 	sort.Slice(facts, func(i, j int) bool {
 		return facts[i].Role == "main" || (facts[j].Role != "main" && facts[i].AgentID < facts[j].AgentID)
 	})
+	completion, err := deriveFamilyCompletion(family, facts, s.allowLocalQuiet)
+	if err != nil {
+		return session.Metadata{}, false, err
+	}
+	family.Completion = completion
 	manifest := session.SourceManifest{SchemaVersion: 2, Provider: family.Provider, SessionID: family.ID}
 	for _, source := range sources {
 		manifest.Sources = append(manifest.Sources, source.Entry)
@@ -256,6 +268,36 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot discovery
 		return session.Metadata{}, false, err
 	}
 	return stored.Metadata, true, nil
+}
+
+func deriveFamilyCompletion(f session.SessionFamily, facts []session.SourceFactEntry, allowLocalQuiet bool) (session.FamilyCompletion, error) {
+	quietByAgent := make(map[string]bool, len(facts))
+	for _, fact := range facts {
+		quietByAgent[fact.AgentID] = fact.Facts.QuietPeriodVerified
+	}
+	allTerminal := f.Main.Completion.Terminal
+	usedQuiet := false
+	if !f.Main.Completion.Terminal {
+		if !allowLocalQuiet || !quietByAgent[""] {
+			return session.FamilyCompletion{}, ErrIncomplete
+		}
+		usedQuiet = true
+	}
+	for _, child := range f.Children {
+		if child.Session.Completion.Terminal {
+			continue
+		}
+		allTerminal = false
+		if !allowLocalQuiet || !quietByAgent[child.AgentID] {
+			return session.FamilyCompletion{}, ErrIncomplete
+		}
+		usedQuiet = true
+	}
+	_, _, last := familyTimes(f)
+	if allTerminal && !usedQuiet {
+		return session.FamilyCompletion{Status: "provider_terminal", Reason: "all_members_terminal", LastEventAt: last}, nil
+	}
+	return session.FamilyCompletion{Status: "local_quiet", Reason: "verified_local_quiet", LastEventAt: last}, nil
 }
 
 func trustedChildAgentID(parsed session.Session) (string, error) {

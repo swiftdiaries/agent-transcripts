@@ -82,6 +82,14 @@ func safeProjectDisplay(value string) bool {
 }
 
 func validateFamilyPut(p session.Package) error {
+	return validateFamilyPackage(p, false)
+}
+
+func validateFamilyRead(p session.Package) error {
+	return validateFamilyPackage(p, true)
+}
+
+func validateFamilyPackage(p session.Package, allowLegacyIncomplete bool) error {
 	if p.SchemaVersion != 2 {
 		return errors.New("family package schema version must be 2")
 	}
@@ -135,6 +143,9 @@ func validateFamilyPut(p session.Package) error {
 			return errors.New("invalid family source role")
 		}
 	}
+	if err := validateStoredCompletion(p.Family, p.SourceFactsSet, allowLegacyIncomplete); err != nil {
+		return err
+	}
 	cid := session.ContentIDForManifest(p.Family.Provider, p.SourceManifest)
 	id := session.PackageID(cid, p.Metadata.Destination)
 	if p.ID != id || p.ContentID != cid || p.Metadata.ID != id || p.Metadata.ContentID != cid {
@@ -145,6 +156,35 @@ func validateFamilyPut(p session.Package) error {
 	}
 	if len(p.Normalized) != 0 && !json.Valid(p.Normalized) {
 		return errors.New("normalized document is not valid JSON")
+	}
+	return nil
+}
+
+func validateStoredCompletion(f session.SessionFamily, facts []session.SourceFactEntry, allowLegacyIncomplete bool) error {
+	if len(facts) != len(f.Children)+1 || facts[0].Role != "main" || facts[0].AgentID != "" {
+		return errors.New("family source facts order mismatch")
+	}
+	allTerminal := f.Main.Completion.Terminal
+	allProven := f.Main.Completion.Terminal || facts[0].Facts.QuietPeriodVerified
+	for i, child := range f.Children {
+		fact := facts[i+1]
+		if fact.Role != "child" || fact.AgentID != child.AgentID {
+			return errors.New("family source facts order mismatch")
+		}
+		allTerminal = allTerminal && child.Session.Completion.Terminal
+		allProven = allProven && (child.Session.Completion.Terminal || fact.Facts.QuietPeriodVerified)
+	}
+	if allowLegacyIncomplete && f.Completion.Status == "incomplete" {
+		return nil
+	}
+	if !allProven || f.Completion.Status == "incomplete" {
+		return errors.New("family completion is unproven")
+	}
+	if allTerminal && (f.Completion.Status != "provider_terminal" || f.Completion.Reason != "all_members_terminal") {
+		return errors.New("family terminal completion mismatch")
+	}
+	if !allTerminal && (f.Completion.Status != "local_quiet" || f.Completion.Reason != "verified_local_quiet") {
+		return errors.New("family quiet completion mismatch")
 	}
 	return nil
 }
