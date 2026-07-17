@@ -1,0 +1,3 @@
+{"timestamp":"2026-07-17T08:02:00Z","type":"session_meta","payload":{"id":"codex-guardian","parent_thread_id":"codex-worker","cwd":"/repo","thread_source":"subagent","source":{"subagent":{"other":"guardian"}}}}
+{"timestamp":"2026-07-17T08:02:01Z","type":"event_msg","payload":{"type":"user_message","message":"Guardian review"}}
+{"timestamp":"2026-07-17T08:02:02Z","type":"event_msg","payload":{"type":"task_complete"}}

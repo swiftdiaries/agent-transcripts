@@ -65,6 +65,89 @@ func TestFormFamiliesGroupsClaudeChildrenUnderMain(t *testing.T) {
 	}
 }
 
+func TestFormFamiliesGroupsCodexDescendantsUnderRoot(t *testing.T) {
+	got, err := FormFamilies([]Candidate{codexCandidate("codex-root", ""), codexCandidate("codex-worker", "codex-root"), codexCandidate("codex-guardian", "codex-worker")}, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || len(got[0].Children) != 2 {
+		t.Fatalf("families = %#v", got)
+	}
+	var guardian *ChildSourceCandidate
+	for i := range got[0].Children {
+		if got[0].Children[i].Candidate.SessionID == "codex-guardian" {
+			guardian = &got[0].Children[i]
+		}
+	}
+	if guardian == nil || guardian.ParentSessionID != "codex-worker" {
+		t.Fatalf("guardian = %#v", guardian)
+	}
+}
+
+func TestFormFamiliesDoesNotPromoteCodexOrphan(t *testing.T) {
+	got, err := FormFamilies([]Candidate{codexCandidate("orphan", "missing")}, testScope())
+	if err != nil || len(got) != 0 {
+		t.Fatalf("families=%#v err=%v", got, err)
+	}
+}
+
+func TestFormFamiliesExcludesInvalidCodexComponentsButKeepsValidRoots(t *testing.T) {
+	candidates := []Candidate{codexCandidate("valid-root", "")}
+	candidates = append(candidates, cyclicCodexCandidates()...)
+	candidates = append(candidates, duplicateCodexCandidates()...)
+	got, err := FormFamilies(candidates, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != "valid-root" {
+		t.Fatalf("families=%#v", got)
+	}
+}
+
+func TestMarkCodexCyclesMarksOnlyCycleMembers(t *testing.T) {
+	byID := map[string]Candidate{
+		"a":     codexCandidate("a", "b"),
+		"b":     codexCandidate("b", "a"),
+		"child": codexCandidate("child", "a"),
+		"root":  codexCandidate("root", ""),
+	}
+	invalid := map[string]bool{}
+	markCodexCycles(byID, invalid)
+	if !invalid["a"] || !invalid["b"] || invalid["child"] || invalid["root"] {
+		t.Fatalf("invalid = %#v", invalid)
+	}
+}
+
+func TestPropagateInvalidCodexParentsMarksDescendants(t *testing.T) {
+	byID := map[string]Candidate{
+		"bad":        codexCandidate("bad", "missing"),
+		"child":      codexCandidate("child", "bad"),
+		"grandchild": codexCandidate("grandchild", "child"),
+		"root":       codexCandidate("root", ""),
+	}
+	invalid := map[string]bool{"bad": true}
+	propagateInvalidCodexParents(byID, invalid)
+	if !invalid["bad"] || !invalid["child"] || !invalid["grandchild"] || invalid["root"] {
+		t.Fatalf("invalid = %#v", invalid)
+	}
+}
+
+func testScope() session.ProjectScope {
+	return session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"}}
+}
+
+func codexCandidate(id, parent string) Candidate {
+	return Candidate{Path: filepath.Join("/codex", id+".jsonl"), Provider: "codex", SessionID: id, Title: id, Origin: session.SessionOrigin{ParentSessionID: parent}}
+}
+
+func cyclicCodexCandidates() []Candidate {
+	return []Candidate{codexCandidate("cycle-a", "cycle-b"), codexCandidate("cycle-b", "cycle-a")}
+}
+
+func duplicateCodexCandidates() []Candidate {
+	return []Candidate{codexCandidate("duplicate", ""), codexCandidate("duplicate", "")}
+}
+
 func TestDiscoverFamiliesFiltersToProjectScope(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "inside")

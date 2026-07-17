@@ -32,6 +32,7 @@ type Candidate struct {
 	Title     string
 	StartedAt time.Time
 	Status    string
+	Origin    session.SessionOrigin
 
 	modTime       time.Time
 	size          int64
@@ -154,6 +155,7 @@ func inspect(ctx context.Context, path, provider string, now time.Time, quiet ti
 	}
 	return Candidate{Path: path, Provider: provider, SessionID: parsed.ProviderSessionID,
 		Project: project(parsed), Title: title(parsed), StartedAt: parsed.StartedAt, Status: status,
+		Origin:  parsed.Origin,
 		modTime: info.ModTime(), size: info.Size(), quietVerified: !parsed.Completion.Terminal && quietOK, sourceInfo: info}, true, nil
 }
 

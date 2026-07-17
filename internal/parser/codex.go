@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,16 +21,29 @@ func (codexParser) Detect(first json.RawMessage) bool {
 }
 
 type codexPayload struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	Role      string          `json:"role"`
-	CWD       string          `json:"cwd"`
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
-	Input     json.RawMessage `json:"input"`
-	Output    json.RawMessage `json:"output"`
-	CallID    string          `json:"call_id"`
-	Content   []codexContent  `json:"content"`
+	ID             string          `json:"id"`
+	Type           string          `json:"type"`
+	Role           string          `json:"role"`
+	CWD            string          `json:"cwd"`
+	ParentThreadID string          `json:"parent_thread_id"`
+	ThreadSource   string          `json:"thread_source"`
+	Source         json.RawMessage `json:"source"`
+	Name           string          `json:"name"`
+	Arguments      json.RawMessage `json:"arguments"`
+	Input          json.RawMessage `json:"input"`
+	Output         json.RawMessage `json:"output"`
+	CallID         string          `json:"call_id"`
+	Content        []codexContent  `json:"content"`
+}
+
+type codexSubagentSource struct {
+	ThreadSpawn *struct {
+		ParentThreadID string `json:"parent_thread_id"`
+		AgentPath      string `json:"agent_path"`
+		AgentNickname  string `json:"agent_nickname"`
+		AgentRole      string `json:"agent_role"`
+	} `json:"thread_spawn,omitempty"`
+	Other string `json:"other,omitempty"`
 }
 type codexContent struct {
 	Type string `json:"type"`
@@ -62,8 +76,13 @@ func (codexParser) Parse(ctx context.Context, lines []json.RawMessage) (session.
 			}
 		}
 		if e.Type == "session_meta" {
+			origin, err := codexOrigin(p)
+			if err != nil {
+				return session.Session{}, fmt.Errorf("Codex session origin at line %d: %w", lineNumber, err)
+			}
 			if got.ProviderSessionID == "" {
 				got.ProviderSessionID, got.ID, got.WorkingDirectory = p.ID, p.ID, p.CWD
+				got.Origin = origin
 			}
 			continue
 		}
@@ -98,6 +117,49 @@ func (codexParser) Parse(ctx context.Context, lines []json.RawMessage) (session.
 		got.ID = "session-line-1"
 	}
 	return got, nil
+}
+
+func codexOrigin(p codexPayload) (session.SessionOrigin, error) {
+	switch p.ThreadSource {
+	case "":
+		if p.ParentThreadID != "" {
+			return session.SessionOrigin{}, errors.New("Codex legacy root has parent evidence")
+		}
+		return session.SessionOrigin{}, nil
+	case "user":
+		if p.ParentThreadID != "" {
+			return session.SessionOrigin{}, errors.New("Codex user root has parent evidence")
+		}
+		return session.SessionOrigin{}, nil
+	case "subagent":
+		if p.ParentThreadID == "" {
+			return session.SessionOrigin{}, errors.New("Codex subagent has no parent thread")
+		}
+	default:
+		return session.SessionOrigin{}, errors.New("Codex session has unknown thread source")
+	}
+	var source struct {
+		Subagent *codexSubagentSource `json:"subagent"`
+	}
+	raw := bytes.TrimSpace(p.Source)
+	if len(raw) == 0 || raw[0] != '{' || json.Unmarshal(raw, &source) != nil || source.Subagent == nil {
+		return session.SessionOrigin{}, errors.New("Codex subagent has invalid source provenance")
+	}
+	spawn := source.Subagent.ThreadSpawn
+	guardian := source.Subagent.Other == "guardian"
+	if (spawn != nil) == guardian || source.Subagent.Other != "" && !guardian {
+		return session.SessionOrigin{}, errors.New("Codex subagent has ambiguous source provenance")
+	}
+	origin := session.SessionOrigin{ParentSessionID: p.ParentThreadID}
+	if spawn != nil {
+		if spawn.ParentThreadID != p.ParentThreadID {
+			return session.SessionOrigin{}, errors.New("Codex subagent parent evidence conflicts")
+		}
+		origin.Kind, origin.AgentPath, origin.AgentName, origin.AgentRole = "thread_spawn", spawn.AgentPath, spawn.AgentNickname, spawn.AgentRole
+	} else {
+		origin.Kind = "guardian"
+	}
+	return origin, nil
 }
 
 func mapCodexResponse(p codexPayload, line int, when time.Time) (session.Event, bool) {
