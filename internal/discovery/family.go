@@ -93,7 +93,7 @@ func formCodexFamilies(candidates []Candidate, scope session.ProjectScope) ([]Se
 		}
 	}
 	markCodexCycles(byID, invalid)
-	markCrossProjectCodexComponents(byID, invalid, scope)
+	markCrossProjectCodexComponents(candidates, byID, invalid, scope)
 	propagateInvalidCodexParents(byID, invalid)
 	return buildCodexRootFamilies(byID, invalid, scope), nil
 }
@@ -101,35 +101,43 @@ func formCodexFamilies(candidates []Candidate, scope session.ProjectScope) ([]Se
 // markCrossProjectCodexComponents rejects a whole connected parent graph when
 // one parent-child edge spans canonical project scopes. Keeping only the root
 // would otherwise expose a partial family after callers partition candidates.
-func markCrossProjectCodexComponents(byID map[string]Candidate, invalid map[string]bool, fallback session.ProjectScope) {
-	neighbors := make(map[string][]string, len(byID))
-	var seeds []string
-	for id, candidate := range byID {
+func markCrossProjectCodexComponents(candidates []Candidate, byID map[string]Candidate, invalid map[string]bool, fallback session.ProjectScope) {
+	neighbors := make(map[string]map[string]struct{}, len(byID))
+	queue := make([]string, 0, len(invalid))
+	for id := range invalid {
+		queue = append(queue, id)
+	}
+	for _, candidate := range candidates {
+		id := candidate.SessionID
 		parent := candidate.Origin.ParentSessionID
 		parentCandidate, ok := byID[parent]
 		if parent == "" || !ok {
 			continue
 		}
-		neighbors[id] = append(neighbors[id], parent)
-		neighbors[parent] = append(neighbors[parent], id)
+		if neighbors[id] == nil {
+			neighbors[id] = make(map[string]struct{})
+		}
+		if neighbors[parent] == nil {
+			neighbors[parent] = make(map[string]struct{})
+		}
+		neighbors[id][parent] = struct{}{}
+		neighbors[parent][id] = struct{}{}
 		if codexCandidateScope(candidate, fallback).Ref.Key != codexCandidateScope(parentCandidate, fallback).Ref.Key {
-			seeds = append(seeds, id, parent)
+			queue = append(queue, id, parent)
 		}
 	}
-	for _, seed := range seeds {
-		if invalid[seed] {
+	seen := make(map[string]bool, len(queue))
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
 			continue
 		}
-		invalid[seed] = true
-		queue := []string{seed}
-		for len(queue) > 0 {
-			id := queue[0]
-			queue = queue[1:]
-			for _, neighbor := range neighbors[id] {
-				if !invalid[neighbor] {
-					invalid[neighbor] = true
-					queue = append(queue, neighbor)
-				}
+		seen[id] = true
+		invalid[id] = true
+		for neighbor := range neighbors[id] {
+			if !seen[neighbor] {
+				queue = append(queue, neighbor)
 			}
 		}
 	}

@@ -137,6 +137,23 @@ func TestFormFamiliesExcludesCodexComponentWithCrossProjectParentEdge(t *testing
 	}
 }
 
+func TestFormFamiliesExcludesEntireDuplicateCodexComponentWithCrossProjectChild(t *testing.T) {
+	inside := testScope()
+	outside := session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "other"}}
+	valid := scopedCodexCandidate("valid-root", "", inside)
+	root := scopedCodexCandidate("root", "", inside)
+	duplicateMiddle := scopedCodexCandidate("middle", "root", inside)
+	crossProjectChild := scopedCodexCandidate("child", "middle", outside)
+
+	got, err := FormFamilies([]Candidate{valid, root, duplicateMiddle, duplicateMiddle, crossProjectChild}, inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != valid.SessionID {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
 func TestMarkCodexCyclesMarksOnlyCycleMembers(t *testing.T) {
 	byID := map[string]Candidate{
 		"a":     codexCandidate("a", "b"),
