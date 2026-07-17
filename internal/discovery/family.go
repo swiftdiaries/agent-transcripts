@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +30,25 @@ type SessionFamilyCandidate struct {
 	Status            string
 	Main              SourceCandidate
 	Children          []ChildSourceCandidate
+}
+
+var familyKeyPattern = regexp.MustCompile(`^f_[a-f0-9]{64}$`)
+
+// FamilyMap returns families by their opaque canonical-main-path key. It is
+// deliberately fail-closed: a malformed or colliding key cannot be used as a
+// live selector.
+func FamilyMap(families []SessionFamilyCandidate) (map[string]SessionFamilyCandidate, error) {
+	out := make(map[string]SessionFamilyCandidate, len(families))
+	for _, family := range families {
+		if !familyKeyPattern.MatchString(family.Key) {
+			return nil, errors.New("invalid family key")
+		}
+		if _, exists := out[family.Key]; exists {
+			return nil, errors.New("duplicate family key")
+		}
+		out[family.Key] = family
+	}
+	return out, nil
 }
 
 // FormFamilies turns provider candidates into a single main record with its

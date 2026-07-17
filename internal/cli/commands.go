@@ -529,7 +529,11 @@ func runBrowseWithDeps(ctx context.Context, args []string, input *os.File, stdou
 			return 1
 		}
 	}
-	selected, ok := selectFamily(families, opts.family, opts.latest)
+	selected, ok, err := selectFamily(families, opts.family, opts.latest)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
 	if opts.path != "" && len(families) == 1 {
 		selected, ok = families[0], true
 	}
@@ -588,18 +592,16 @@ func discoverCommandFamilies(ctx context.Context, allProjects bool, getwd func()
 	return discovery.DiscoverFamilies(ctx, defaultRoots(), scope, time.Now(), 5*time.Minute)
 }
 
-func selectFamily(families []discovery.SessionFamilyCandidate, key string, latest bool) (discovery.SessionFamilyCandidate, bool) {
+func selectFamily(families []discovery.SessionFamilyCandidate, key string, latest bool) (discovery.SessionFamilyCandidate, bool, error) {
+	byKey, err := discovery.FamilyMap(families)
+	if err != nil {
+		return discovery.SessionFamilyCandidate{}, false, err
+	}
 	if latest && len(families) > 0 {
-		return families[0], true
+		return families[0], true, nil
 	}
-	if key != "" {
-		for _, family := range families {
-			if family.Key == key {
-				return family, true
-			}
-		}
-	}
-	return discovery.SessionFamilyCandidate{}, false
+	family, ok := byKey[key]
+	return family, ok, nil
 }
 
 func pickFamily(input *os.File, stdout io.Writer, families []discovery.SessionFamilyCandidate, allProjects bool) (discovery.SessionFamilyCandidate, bool) {

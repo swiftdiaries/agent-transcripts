@@ -40,14 +40,18 @@ func TestRunWithoutSubcommandBrowses(t *testing.T) {
 	}
 }
 
-func TestFamilySelectorsRejectStaleKeysAndChooseLatest(t *testing.T) {
-	families := []discovery.SessionFamilyCandidate{{Key: "f_new", StartedAt: time.Now()}, {Key: "f_old", StartedAt: time.Now().Add(-time.Hour)}}
-	if _, ok := selectFamily(families, "f_tampered", false); ok {
-		t.Fatal("accepted stale family key")
+func TestFamilySelectorsRejectDuplicateAndStaleKeysAndChooseLatest(t *testing.T) {
+	duplicate := "f_" + strings.Repeat("a", 64)
+	if _, _, err := selectFamily([]discovery.SessionFamilyCandidate{{Key: duplicate}, {Key: duplicate}}, duplicate, false); err == nil {
+		t.Fatal("accepted duplicate family key")
 	}
-	got, ok := selectFamily(families, "", true)
-	if !ok || got.Key != "f_new" {
-		t.Fatalf("latest=%+v ok=%v", got, ok)
+	families := []discovery.SessionFamilyCandidate{{Key: duplicate, Provider: "claude", ProviderSessionID: "same", StartedAt: time.Now()}, {Key: "f_" + strings.Repeat("b", 64), Provider: "claude", ProviderSessionID: "same", StartedAt: time.Now().Add(-time.Hour)}}
+	if _, ok, err := selectFamily(families, "f_"+strings.Repeat("c", 64), false); err != nil || ok {
+		t.Fatalf("accepted stale family key: ok=%v err=%v", ok, err)
+	}
+	got, ok, err := selectFamily(families, "", true)
+	if err != nil || !ok || got.Key != duplicate {
+		t.Fatalf("latest=%+v ok=%v err=%v", got, ok, err)
 	}
 }
 

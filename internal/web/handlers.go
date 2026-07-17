@@ -25,8 +25,6 @@ import (
 
 var managedID = regexp.MustCompile(`^s_[a-f0-9]{64}$`)
 var slug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
-var provider = regexp.MustCompile(`^(claude|codex)$`)
-var providerSessionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
@@ -74,12 +72,12 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		s.liveProjectFamilies(w, r, parts[2])
 	case len(parts) == 5 && parts[0] == "live" && parts[1] == "projects" && parts[3] == "families" && s.allProjects:
 		s.liveProjectFamily(w, r, parts[2], parts[4])
+	case len(parts) == 3 && parts[0] == "live" && parts[1] == "families" && !s.allProjects:
+		s.liveFamily(w, r, parts[2])
 	case len(parts) == 2 && parts[0] == "sessions" && managedID.MatchString(parts[1]):
 		s.transcript(w, r, parts[1])
 	case len(parts) == 2 && (parts[0] == "users" || parts[0] == "projects") && slug.MatchString(parts[1]):
 		s.directory(w, r, session.Directory{Kind: parts[0], Slug: parts[1]})
-	case len(parts) == 3 && parts[0] == "live" && !s.allProjects && provider.MatchString(parts[1]) && providerSessionID.MatchString(parts[2]):
-		s.liveSession(w, r, parts[1], parts[2])
 	default:
 		http.NotFound(w, r)
 	}
@@ -452,12 +450,12 @@ func (s *server) static(w http.ResponseWriter, name, contentType string) {
 }
 
 func (s *server) liveList(w http.ResponseWriter, r *http.Request) {
-	candidates, err := s.liveCandidates(r.Context())
+	families, err := s.liveFamilies(r.Context())
 	if err != nil {
 		s.internalError(w, err)
 		return
 	}
-	p := page{Title: "Live sessions", Heading: "Live sessions", Section: "live", Candidates: candidates, IsLive: true}
+	p := page{Title: "Live sessions", Heading: "Live sessions", Section: "live", Families: families, IsLive: true}
 	if s.csrf != nil {
 		p.CSRFToken = s.csrf.Token(w, r)
 	}
@@ -516,6 +514,10 @@ func (s *server) liveProjectFamilies(w http.ResponseWriter, r *http.Request, pro
 		http.NotFound(w, r)
 		return
 	}
+	if _, err := discovery.FamilyMap(selected); err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, "<!doctype html><title>Live sessions</title><h1>Live sessions</h1><ul>")
 	for _, family := range selected {
@@ -530,26 +532,38 @@ func (s *server) liveProjectFamily(w http.ResponseWriter, r *http.Request, proje
 		s.internalError(w, err)
 		return
 	}
+	selected := make([]discovery.SessionFamilyCandidate, 0, len(families))
 	for _, family := range families {
-		if family.Project.Key != projectKey || family.Key != familyKey {
-			continue
+		if family.Project.Key == projectKey {
+			selected = append(selected, family)
 		}
+	}
+	byKey, err := discovery.FamilyMap(selected)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	family, ok := byKey[familyKey]
+	if ok {
 		s.renderLiveFamily(w, r, family)
 		return
 	}
 	http.NotFound(w, r)
 }
 
-func (s *server) liveSession(w http.ResponseWriter, r *http.Request, wantProvider, wantID string) {
+func (s *server) liveFamily(w http.ResponseWriter, r *http.Request, key string) {
 	families, err := s.liveFamilies(r.Context())
 	if err != nil {
 		s.internalError(w, err)
 		return
 	}
-	for _, family := range families {
-		if family.Provider != wantProvider || family.ProviderSessionID != wantID {
-			continue
-		}
+	byKey, err := discovery.FamilyMap(families)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	family, ok := byKey[key]
+	if ok {
 		s.renderLiveFamily(w, r, family)
 		return
 	}
@@ -602,18 +616,6 @@ func parseLiveFamily(ctx context.Context, candidate discovery.SessionFamilyCandi
 	return family, nil
 }
 
-func (s *server) liveCandidates(ctx context.Context) ([]discovery.Candidate, error) {
-	families, err := s.liveFamilies(ctx)
-	if err != nil {
-		return nil, err
-	}
-	candidates := make([]discovery.Candidate, 0, len(families))
-	for _, family := range families {
-		candidates = append(candidates, family.Main.Candidate)
-	}
-	return candidates, nil
-}
-
 func (s *server) liveFamilies(ctx context.Context) ([]discovery.SessionFamilyCandidate, error) {
 	if s.projectScope == nil {
 		if s.allProjects {
@@ -655,17 +657,18 @@ func (s *server) importLive(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
-	bySelection := make(map[string]discovery.SessionFamilyCandidate, len(families))
-	for _, family := range families {
-		bySelection[family.Provider+":"+family.ProviderSessionID] = family
+	byKey, err := discovery.FamilyMap(families)
+	if err != nil {
+		http.Error(w, "selected session is no longer available", http.StatusBadRequest)
+		return
 	}
-	selected := make([]discovery.SessionFamilyCandidate, 0, len(r.Form["session"]))
+	selected := make([]discovery.SessionFamilyCandidate, 0, len(r.Form["family"]))
 	seen := make(map[string]bool)
-	for _, value := range r.Form["session"] {
+	for _, value := range r.Form["family"] {
 		if seen[value] {
 			continue
 		}
-		family, ok := bySelection[value]
+		family, ok := byKey[value]
 		if !ok {
 			http.Error(w, "selected session is no longer available", http.StatusBadRequest)
 			return
@@ -757,7 +760,7 @@ type page struct {
 	Heading    string
 	Section    string
 	Sessions   []session.Metadata
-	Candidates []discovery.Candidate
+	Families   []discovery.SessionFamilyCandidate
 	IsLive     bool
 	Transcript transcript
 	CSRFToken  string

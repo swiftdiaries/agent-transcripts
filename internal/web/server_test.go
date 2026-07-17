@@ -748,14 +748,18 @@ func TestProjectDirectoryRendersStoredSession(t *testing.T) {
 
 func TestLiveRoutesUseCatalogAndRenderBothProviders(t *testing.T) {
 	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
-	for _, path := range []string{"/live", "/live/claude/claude-session-1", "/live/codex/codex-session-1"} {
+	families, err := h.liveFamilies(context.Background())
+	if err != nil || len(families) != 2 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+	for _, path := range []string{"/live", "/live/families/" + families[0].Key, "/live/families/" + families[1].Key} {
 		t.Run(path, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 			if rr.Code != http.StatusOK {
 				t.Fatalf("status = %d", rr.Code)
 			}
-			if path == "/live" && (!strings.Contains(rr.Body.String(), "/live/claude/claude-session-1") || !strings.Contains(rr.Body.String(), "/live/codex/codex-session-1")) {
+			if path == "/live" && (!strings.Contains(rr.Body.String(), "/live/families/"+families[0].Key) || !strings.Contains(rr.Body.String(), "/live/families/"+families[1].Key)) {
 				t.Fatalf("catalog was not rendered: %s", rr.Body.String())
 			}
 			hasPromptAnchor := strings.Contains(rr.Body.String(), "id=\"claude-user-1\"") || strings.Contains(rr.Body.String(), "id=\"codex-user-1\"")
@@ -764,13 +768,38 @@ func TestLiveRoutesUseCatalogAndRenderBothProviders(t *testing.T) {
 			}
 		})
 	}
-	for _, path := range []string{"/live/claude/not-in-catalog", "/live/claude/.."} {
+	for _, path := range []string{"/live/families/f_" + strings.Repeat("0", 64), "/live/claude/not-in-catalog"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		if rr.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d", path, rr.Code)
 		}
 	}
+}
+
+func TestScopedCatalogUsesDistinctFamilyKeysForDuplicateProviderSessionIDs(t *testing.T) {
+	h, families := scopedServerWithDuplicateSessionIDs(t)
+	body := getBody(t, h, "/live")
+	for _, family := range families {
+		if !strings.Contains(body, "/live/families/"+family.Key) {
+			t.Fatalf("missing key %s: %s", family.Key, body)
+		}
+	}
+}
+
+func TestLiveImportUsesExactRediscoveredFamilyKey(t *testing.T) {
+	h, families := scopedServerWithDuplicateSessionIDs(t)
+	rr := postLiveImport(t, h, families[0].Key)
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	assertOnlyFamilyImported(t, h, families[0])
+}
+
+func TestScopedFamilyRouteRejectsStaleAndPathTextKeys(t *testing.T) {
+	h, _ := scopedServerWithDuplicateSessionIDs(t)
+	assertStatus(t, h, "/live/families/f_"+strings.Repeat("0", 64), http.StatusNotFound)
+	assertStatus(t, h, "/live/families/../../etc/passwd", http.StatusNotFound)
 }
 
 func TestNormalLiveRouteRendersDelegatedFamily(t *testing.T) {
@@ -794,13 +823,17 @@ func TestNormalLiveRouteRendersDelegatedFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := New(ServerConfig{Roots: discovery.Roots{Claude: []string{claudeRoot}}})
-	for _, path := range []string{"/live", "/live/claude/family-1"} {
+	families, err := h.(*server).liveFamilies(context.Background())
+	if err != nil || len(families) != 1 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+	for _, path := range []string{"/live", "/live/families/" + families[0].Key} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		if rr.Code != http.StatusOK {
 			t.Fatalf("%s status = %d body=%s", path, rr.Code, rr.Body.String())
 		}
-		if path == "/live" && !strings.Contains(rr.Body.String(), `href="/live/claude/family-1"`) {
+		if path == "/live" && !strings.Contains(rr.Body.String(), `href="/live/families/`+families[0].Key+`"`) {
 			t.Fatalf("catalog did not contain family: %s", rr.Body.String())
 		}
 		if path != "/live" && (!strings.Contains(rr.Body.String(), "Delegated work / child-1") || !strings.Contains(rr.Body.String(), "Child prompt")) {
@@ -879,7 +912,7 @@ func assertStatus(t *testing.T, h http.Handler, path string, want int) {
 
 func TestLiveImportImportsMultipleCatalogSelections(t *testing.T) {
 	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
-	form := "session=claude%3Aclaude-session-1&session=codex%3Acodex-session-1"
+	form := "family=" + liveFamilyKey(t, h, "claude") + "&family=" + liveFamilyKey(t, h, "codex")
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader(form))
 	r.Host = "example.test"
@@ -919,7 +952,7 @@ func TestLiveImportPersistsSelectedFamilyAtomically(t *testing.T) {
 	}
 	st := store.NewFilesystem(t.TempDir())
 	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: discovery.Roots{Claude: []string{claudeRoot}}}).(*server)
-	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Afamily-1"))
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+liveFamilyKey(t, h, "claude")))
 	r.Host = "example.test"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	attachLocalCSRF(t, h, r)
@@ -941,6 +974,7 @@ func TestLiveImportPersistsSelectedFamilyAtomically(t *testing.T) {
 func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 	h := newLiveTestServer(t, "claude-session.jsonl")
 	root := h.roots.Claude[0]
+	key := liveFamilyKey(t, h, "claude")
 	h.discover = func(ctx context.Context, _ discovery.Roots, now time.Time, quiet time.Duration) ([]discovery.Candidate, error) {
 		items, err := discovery.Discover(ctx, discovery.Roots{Claude: []string{root}}, now, quiet)
 		if err != nil {
@@ -952,7 +986,7 @@ func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 		return items, nil
 	}
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Aclaude-session-1"))
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+key))
 	r.Host = "example.test"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	attachLocalCSRF(t, h, r)
@@ -971,6 +1005,8 @@ func TestLiveImportCleansFirstSnapshotWhenSecondSelectionChanges(t *testing.T) {
 	t.Setenv("TMPDIR", snapshotRoot)
 	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
 	claudeRoot, codexRoot := h.roots.Claude[0], h.roots.Codex[0]
+	claudeKey := liveFamilyKey(t, h, "claude")
+	codexKey := liveFamilyKey(t, h, "codex")
 	h.discover = func(ctx context.Context, _ discovery.Roots, now time.Time, quiet time.Duration) ([]discovery.Candidate, error) {
 		items, err := discovery.Discover(ctx, discovery.Roots{Claude: []string{claudeRoot}, Codex: []string{codexRoot}}, now, quiet)
 		if err != nil {
@@ -986,7 +1022,7 @@ func TestLiveImportCleansFirstSnapshotWhenSecondSelectionChanges(t *testing.T) {
 		return items, nil
 	}
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Aclaude-session-1&session=codex%3Acodex-session-1"))
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+claudeKey+"&family="+codexKey))
 	r.Host = "example.test"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	attachLocalCSRF(t, h, r)
@@ -1059,6 +1095,90 @@ func newLiveTestServer(t *testing.T, names ...string) *server {
 	}
 	st := store.NewFilesystem(t.TempDir())
 	return New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: roots}).(*server)
+}
+
+func scopedServerWithDuplicateSessionIDs(t *testing.T) (*server, []discovery.SessionFamilyCandidate) {
+	t.Helper()
+	root := t.TempDir()
+	firstRoot := filepath.Join(root, "claude-one")
+	secondRoot := filepath.Join(root, "claude-two")
+	first := bytes.ReplaceAll(mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl")), []byte("Fix the parser"), []byte("First duplicate source"))
+	second := bytes.ReplaceAll(mustRead(t, filepath.Join("..", "parser", "testdata", "claude-session.jsonl")), []byte("Fix the parser"), []byte("Second duplicate source"))
+	for _, source := range []struct {
+		root string
+		body []byte
+	}{{firstRoot, first}, {secondRoot, second}} {
+		if err := os.MkdirAll(source.root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(source.root, "claude-session.jsonl"), source.body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roots := discovery.Roots{Claude: []string{firstRoot, secondRoot}}
+	families, err := discovery.DiscoverAllFamilies(context.Background(), roots, time.Now(), 5*time.Minute)
+	if err != nil || len(families) != 2 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+	if families[0].ProviderSessionID != families[1].ProviderSessionID || families[0].Key == families[1].Key {
+		t.Fatalf("families do not establish key collision fixture: %#v", families)
+	}
+	scope := session.ProjectScope{Ref: families[0].Project}
+	st := store.NewFilesystem(t.TempDir())
+	h := New(ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: roots, ProjectScope: &scope}).(*server)
+	return h, families
+}
+
+func getBody(t *testing.T, h http.Handler, path string) string {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("%s status=%d body=%s", path, rr.Code, rr.Body.String())
+	}
+	return rr.Body.String()
+}
+
+func postLiveImport(t *testing.T, h *server, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("family="+key))
+	r.Host = "example.test"
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	attachLocalCSRF(t, h, r)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	return rr
+}
+
+func liveFamilyKey(t *testing.T, h *server, provider string) string {
+	t.Helper()
+	families, err := h.liveFamilies(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.Provider == provider {
+			return family.Key
+		}
+	}
+	t.Fatalf("no %s family in %#v", provider, families)
+	return ""
+}
+
+func assertOnlyFamilyImported(t *testing.T, h *server, selected discovery.SessionFamilyCandidate) {
+	t.Helper()
+	items, err := h.store.ListSessions(context.Background(), session.Directory{Kind: "users", Slug: "local"})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items=%#v err=%v", items, err)
+	}
+	pkg, err := h.store.GetSession(context.Background(), items[0].ID)
+	if err != nil || len(pkg.Sources) != 1 {
+		t.Fatalf("package=%#v err=%v", pkg, err)
+	}
+	want := mustRead(t, selected.Main.Path)
+	if !bytes.Equal(pkg.Sources[0].Bytes, want) {
+		t.Fatalf("imported source did not match selected main %q", selected.Main.Path)
+	}
 }
 
 func mustRead(t *testing.T, path string) []byte {
