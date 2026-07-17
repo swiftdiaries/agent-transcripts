@@ -309,6 +309,9 @@ func InspectPath(ctx context.Context, path string, now time.Time, quiet time.Dur
 		if errors.Is(inspectErr, ErrSafeOpenUnsupported) {
 			return Candidate{}, inspectErr
 		}
+		if errors.Is(inspectErr, ErrSourceChanged) {
+			return Candidate{}, inspectErr
+		}
 	}
 	return Candidate{}, ErrNotEligible
 }

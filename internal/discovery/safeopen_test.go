@@ -123,6 +123,20 @@ func TestInspectPathPropagatesUnsupportedSafeOpen(t *testing.T) {
 	}
 }
 
+func TestInspectPathPropagatesSourceChangedSafeOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "done.jsonl")
+	writeSession(t, path, snapshotFixture("changed"), 10*time.Minute)
+	restore := setSafeOpenForTest(func(string, string) (*os.File, fileIdentity, error) {
+		return nil, fileIdentity{}, ErrSourceChanged
+	})
+	t.Cleanup(restore)
+
+	_, err := InspectPath(context.Background(), path, fixedNow, 5*time.Minute)
+	if !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func stableFamily(t *testing.T) SessionFamilyCandidate {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "done.jsonl")
