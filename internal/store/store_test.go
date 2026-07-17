@@ -60,6 +60,44 @@ func TestFilesystemPutFamilyReadsEveryMember(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsNewIncompleteFamilyButReadsExistingV2(t *testing.T) {
+	st := NewFilesystem(t.TempDir())
+	p := familyPackage(t, "main", "child")
+	if _, err := st.PutFamily(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite only the immutable family evidence and manifest hash, mirroring a
+	// package created by the previous v2 writer rather than the strict API.
+	p.Family.Children[0].Session.Completion = session.Completion{}
+	p.Family.Completion = session.FamilyCompletion{Status: "incomplete", Reason: "", LastEventAt: p.Family.Completion.LastEventAt}
+	b, err := json.Marshal(p.Family)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(st.root, p.Metadata.Destination.Kind, p.Metadata.Destination.Slug, p.ID)
+	if err := os.WriteFile(filepath.Join(path, "family.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, m, err := st.find(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files["family.json"] = checksum(b)
+	mb, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "manifest.json"), mb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PutFamily(context.Background(), p); err == nil {
+		t.Fatal("stored a new incomplete family")
+	}
+}
+
 func TestLegacyPackageReadsAsOneSourceFamily(t *testing.T) {
 	st := NewFilesystem(t.TempDir())
 	pkg := testPackage(session.Directory{Kind: "users", Slug: "ada"})

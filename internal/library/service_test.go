@@ -89,10 +89,47 @@ func TestImportFamilyPersistsMainAndChildTogether(t *testing.T) {
 	}
 }
 
+func TestImportCodexFamilyPersistsNestedMembers(t *testing.T) {
+	st := store.NewFilesystem(t.TempDir())
+	attrs := ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "ada"}, UploaderKey: "ada"}
+	md, created, err := New(st, AllowLocalQuietEvidence()).ImportFamilyWithStatus(context.Background(), codexFamilySnapshot(t), attrs)
+	if err != nil || !created {
+		t.Fatalf("md=%#v created=%v err=%v", md, created, err)
+	}
+	got, err := st.GetSession(context.Background(), md.ID)
+	if err != nil || len(got.Family.Children) != 2 {
+		t.Fatalf("pkg=%#v err=%v", got, err)
+	}
+	var guardian *session.ChildSession
+	for i := range got.Family.Children {
+		if got.Family.Children[i].AgentID == "codex-guardian" {
+			guardian = &got.Family.Children[i]
+		}
+	}
+	if guardian == nil || guardian.ParentSessionID != "codex-worker" {
+		t.Fatalf("guardian=%#v", guardian)
+	}
+}
+
+func codexFamilySnapshot(t *testing.T) discovery.FamilySnapshot {
+	t.Helper()
+	main := fixture(t, "codex-family-main.jsonl")
+	worker := fixture(t, "codex-family-worker.jsonl")
+	guardian := fixture(t, "codex-family-guardian.jsonl")
+	return discovery.FamilySnapshot{Candidate: discovery.SessionFamilyCandidate{Provider: "codex", ProviderSessionID: "codex-root", Project: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "demo"}}, Sources: []discovery.SnapshotSource{
+		{Role: "main", Bytes: main, Facts: session.SourceFacts{ObservedSize: int64(len(main)), QuietPeriodVerified: true}},
+		{Role: "child", AgentID: "codex-worker", Bytes: worker, Facts: session.SourceFacts{ObservedSize: int64(len(worker)), QuietPeriodVerified: true}},
+		{Role: "child", AgentID: "codex-guardian", Bytes: guardian, Facts: session.SourceFacts{ObservedSize: int64(len(guardian)), QuietPeriodVerified: true}},
+	}}
+}
+
 func snapshotFamily(t *testing.T) discovery.FamilySnapshot {
 	t.Helper()
-	main := fixture(t, "claude-session.jsonl")
-	child := bytes.Clone(fixture(t, "claude-session.jsonl"))
+	main := []byte(`{"type":"assistant","uuid":"call","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{}}]}}` + "\n" +
+		`{"type":"user","uuid":"result","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"child-1","status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"done"}]}}` + "\n" +
+		`{"type":"system","subtype":"turn_duration","uuid":"terminal","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:02Z"}` + "\n")
+	child := []byte(`{"type":"user","uuid":"child","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:01Z","message":{"role":"user","content":"work"}}` + "\n" +
+		`{"type":"system","subtype":"turn_duration","uuid":"child-terminal","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:02Z"}` + "\n")
 	return discovery.FamilySnapshot{
 		Candidate: discovery.SessionFamilyCandidate{
 			Provider: "claude", ProviderSessionID: "claude-session-1",

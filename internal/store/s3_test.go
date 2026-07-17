@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
@@ -35,6 +36,50 @@ func TestS3PutFamilyReadsEveryMember(t *testing.T) {
 	got, err := s.GetSession(context.Background(), p.ID)
 	if err != nil || len(got.Sources) != 2 || got.Family.Project.Key == "" {
 		t.Fatalf("get = %#v, %v", got, err)
+	}
+}
+
+func TestS3ReadsExistingIncompleteV2ButRejectsNewWrite(t *testing.T) {
+	fake := newFakeS3()
+	s := NewS3(fake, "bucket", "prod").(*S3)
+	p := familyPackage(t, "main", "child")
+	if _, err := s.PutFamily(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	p.Family.Children[0].Session.Completion = session.Completion{}
+	p.Family.Completion = session.FamilyCompletion{Status: "incomplete"}
+	familyBytes, err := json.Marshal(p.Family)
+	if err != nil {
+		t.Fatal(err)
+	}
+	familyKey, err := s.key(p.Metadata.Destination, p.ID, "family.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", familyKey, familyBytes, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := s.readManifest(context.Background(), p.Metadata.Destination, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files["family.json"] = checksum(familyBytes)
+	manifestBytes, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestKey, err := s.key(p.Metadata.Destination, p.ID, "manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", manifestKey, manifestBytes, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutFamily(context.Background(), p); err == nil {
+		t.Fatal("stored a new incomplete family")
 	}
 }
 

@@ -253,6 +253,45 @@ func TestUploadRejectsUntrustedNonterminalChild(t *testing.T) {
 	}
 }
 
+func TestHostedUploadAcceptsAttachedChildOnlyWithTerminalParentResult(t *testing.T) {
+	assertFamilyUploadStatus(t, "completed", http.StatusCreated)
+	assertFamilyUploadStatus(t, "", http.StatusUnprocessableEntity)
+}
+
+func TestHostedUploadNeverStoresIncompleteFamily(t *testing.T) {
+	h, st, token := hostedUploadServer(t)
+	rr := postFamilyMultipart(t, h, token, hostedParent(""), nonterminalAttachedChild())
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	packages, err := st.ListSessions(context.Background(), session.Directory{Kind: "projects", Slug: "platform"})
+	if err != nil || len(packages) != 0 {
+		t.Fatalf("stored=%d err=%v", len(packages), err)
+	}
+}
+
+func assertFamilyUploadStatus(t *testing.T, parentStatus string, want int) {
+	t.Helper()
+	h, _, token := hostedUploadServer(t)
+	if got := postFamilyMultipart(t, h, token, hostedParent(parentStatus), nonterminalAttachedChild()).Code; got != want {
+		t.Fatalf("parent status %q: got=%d want=%d", parentStatus, got, want)
+	}
+}
+
+func hostedParent(resultStatus string) []byte {
+	status := ""
+	if resultStatus != "" {
+		status = `,"status":"` + resultStatus + `"`
+	}
+	return []byte(`{"type":"assistant","uuid":"call","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Task","input":{"description":"delegate","subagent_type":"reviewer"}}]}}` + "\n" +
+		`{"type":"user","uuid":"result","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"child-1"` + status + `},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"done"}]}}` + "\n" +
+		`{"type":"system","subtype":"turn_duration","uuid":"terminal","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:02Z"}` + "\n")
+}
+
+func nonterminalAttachedChild() []byte {
+	return []byte(`{"type":"user","uuid":"child-result","sessionId":"family-terminal","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"child-1"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"nested","content":"done"}]}}` + "\n")
+}
+
 func TestHostedUploadDerivesChildIdentityFromProviderEvidence(t *testing.T) {
 	h, st, token := hostedUploadServer(t)
 	main := []byte("{\"type\":\"assistant\",\"uuid\":\"call\",\"sessionId\":\"family-identity\",\"timestamp\":\"2026-07-17T08:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"agent-call\",\"name\":\"Agent\",\"input\":{}}]}}\n" +
@@ -945,7 +984,7 @@ func packageWithText(t *testing.T, text string) session.Package {
 		Source:      source,
 		Normalized:  []byte(`{"schema_version":1}`),
 		SourceFacts: session.SourceFacts{ObservedSize: int64(len(source))},
-		Session: session.Session{SchemaVersion: 1, Provider: "claude", ID: "session-123", Events: []session.Event{
+		Session: session.Session{SchemaVersion: 1, Provider: "claude", ID: "session-123", Completion: session.Completion{Terminal: true, TerminalReason: "done"}, Events: []session.Event{
 			{ID: "event-1", Kind: session.EventUser, Text: text},
 			{ID: "event-2", Kind: session.EventRaw, RawType: "future_event", Raw: []byte(`{"future":true}`)},
 		}},

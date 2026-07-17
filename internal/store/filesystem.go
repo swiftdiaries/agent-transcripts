@@ -1222,7 +1222,7 @@ func (s *Filesystem) validateRecoveryImmutable(physical session.Directory, physi
 			}
 			sources[i] = session.SourceBlob{Entry: entry, Bytes: b}
 		}
-		return validateFamilyPut(session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sourcesManifest, Sources: sources, SourceFactsSet: facts, Normalized: normalized})
+		return validateFamilyRead(session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sourcesManifest, Sources: sources, SourceFactsSet: facts, Normalized: normalized})
 	}
 	source, err := s.readPackageBytes(physical, physicalID, "source.jsonl")
 	if err != nil {
@@ -1338,7 +1338,7 @@ func (s *Filesystem) readFamilyPackage(m manifest) (session.Package, error) {
 		sources[i] = session.SourceBlob{Entry: entry, Bytes: b}
 	}
 	p := session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sm, Sources: sources, SourceFactsSet: facts, Normalized: normalized}
-	if err := validateFamilyPut(p); err != nil {
+	if err := validateFamilyRead(p); err != nil {
 		return session.Package{}, err
 	}
 	return p, nil

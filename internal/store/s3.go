@@ -968,7 +968,7 @@ func (s *S3) readFamilyPackage(ctx context.Context, m manifest) (session.Package
 		sources[i] = session.SourceBlob{Entry: entry, Bytes: o.Body}
 	}
 	p := session.Package{ID: m.ID, ContentID: m.ContentID, Session: family.Main, Metadata: md, SchemaVersion: 2, Family: family, SourceManifest: sm, Sources: sources, SourceFactsSet: facts, Normalized: norm.Body}
-	if err := validateFamilyPut(p); err != nil {
+	if err := validateFamilyRead(p); err != nil {
 		return session.Package{}, err
 	}
 	return p, nil

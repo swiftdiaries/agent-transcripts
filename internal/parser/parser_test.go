@@ -161,6 +161,19 @@ func TestAttachClaudeChildrenUsesStableToolIdentity(t *testing.T) {
 	}
 }
 
+func TestClaudeParserPreservesParentResultStatus(t *testing.T) {
+	input := `{"type":"user","uuid":"result","sessionId":"claude_status","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"agent_1","status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"done"}]}}`
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range got.Events {
+		if event.ID == "result" && event.ResultStatus != "completed" {
+			t.Fatalf("status=%q", event.ResultStatus)
+		}
+	}
+}
+
 func TestParsersPreserveUnknownRecordWithoutType(t *testing.T) {
 	for _, tt := range []struct {
 		name, input string

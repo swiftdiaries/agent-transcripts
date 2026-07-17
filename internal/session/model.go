@@ -30,17 +30,18 @@ const (
 )
 
 type Event struct {
-	ID       string          `json:"id"`
-	ParentID string          `json:"parent_id,omitempty"`
-	AgentID  string          `json:"agent_id,omitempty"`
-	Kind     EventKind       `json:"kind"`
-	Time     time.Time       `json:"time,omitempty"`
-	Text     string          `json:"text,omitempty"`
-	ToolName string          `json:"tool_name,omitempty"`
-	Input    json.RawMessage `json:"input,omitempty"`
-	Output   json.RawMessage `json:"output,omitempty"`
-	RawType  string          `json:"raw_type,omitempty"`
-	Raw      json.RawMessage `json:"raw,omitempty"`
+	ID           string          `json:"id"`
+	ParentID     string          `json:"parent_id,omitempty"`
+	AgentID      string          `json:"agent_id,omitempty"`
+	Kind         EventKind       `json:"kind"`
+	Time         time.Time       `json:"time,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	ToolName     string          `json:"tool_name,omitempty"`
+	Input        json.RawMessage `json:"input,omitempty"`
+	Output       json.RawMessage `json:"output,omitempty"`
+	ResultStatus string          `json:"result_status,omitempty"`
+	RawType      string          `json:"raw_type,omitempty"`
+	Raw          json.RawMessage `json:"raw,omitempty"`
 }
 
 type Completion struct {
