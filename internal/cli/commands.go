@@ -647,17 +647,23 @@ func pickFamily(input *os.File, stdout io.Writer, families []discovery.SessionFa
 }
 
 func familyForPath(ctx context.Context, path string) (discovery.SessionFamilyCandidate, error) {
+	return familyForPathWithSnapshot(ctx, path, discovery.SnapshotFamily)
+}
+
+func familyForPathWithSnapshot(ctx context.Context, path string, snapshotFamily func(context.Context, discovery.SessionFamilyCandidate) (*discovery.FamilySnapshot, error)) (discovery.SessionFamilyCandidate, error) {
 	candidate, err := discovery.InspectPath(ctx, path, time.Now(), 5*time.Minute)
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
-	root := filepath.Dir(candidate.Path)
-	roots := discovery.Roots{Claude: []string{root}, Codex: []string{root}}
-	candidates, err := discovery.Discover(ctx, roots, time.Now(), 5*time.Minute)
+	snapshot, err := snapshotFamily(ctx, discovery.SessionFamilyCandidate{Main: discovery.SourceCandidate{Candidate: candidate}})
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
-	f, _, err := discovery.OpenEligible(candidate)
+	defer snapshot.Close()
+	if len(snapshot.Sources) != 1 {
+		return discovery.SessionFamilyCandidate{}, errors.New("selected snapshot is invalid")
+	}
+	f, err := snapshot.Sources[0].Open()
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
@@ -673,6 +679,12 @@ func familyForPath(ctx context.Context, path string) (discovery.SessionFamilyCan
 		return discovery.SessionFamilyCandidate{}, errors.New("selected session has no working directory")
 	}
 	scope, err := discovery.ResolveProjectScope(parsed.WorkingDirectory)
+	if err != nil {
+		return discovery.SessionFamilyCandidate{}, err
+	}
+	root := filepath.Dir(candidate.Path)
+	roots := discovery.Roots{Claude: []string{root}, Codex: []string{root}}
+	candidates, err := discovery.Discover(ctx, roots, time.Now(), 5*time.Minute)
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}

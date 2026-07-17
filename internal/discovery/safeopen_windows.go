@@ -17,45 +17,68 @@ func safeOpen(root, relative string) (*os.File, fileIdentity, error) {
 	if err != nil {
 		return nil, fileIdentity{}, err
 	}
-	rootHandle, err := openWindowsComponent(root, true)
+	parent, err := openWindowsComponent(root, true)
 	if err != nil {
 		return nil, fileIdentity{}, err
 	}
-	_ = windows.CloseHandle(rootHandle)
-	path := root
-	for _, part := range parts {
-		path = filepath.Join(path, part)
-		isDir := part != parts[len(parts)-1]
-		h, err := openWindowsComponent(path, isDir)
+	defer windows.CloseHandle(parent)
+	for index, part := range parts {
+		isDir := index != len(parts)-1
+		h, err := openWindowsRelativeComponent(parent, part, isDir)
 		if err != nil {
 			return nil, fileIdentity{}, err
 		}
-		_ = windows.CloseHandle(h)
+		if isDir {
+			_ = windows.CloseHandle(parent)
+			parent = h
+			continue
+		}
+		identity, err := windowsIdentity(h)
+		if err != nil {
+			_ = windows.CloseHandle(h)
+			return nil, fileIdentity{}, err
+		}
+		return os.NewFile(uintptr(h), filepath.Join(root, relative)), identity, nil
 	}
-	h, err := openWindowsComponent(path, false)
-	if err != nil {
-		return nil, fileIdentity{}, err
-	}
-	identity, err := windowsIdentity(h)
-	if err != nil {
-		_ = windows.CloseHandle(h)
-		return nil, fileIdentity{}, err
-	}
-	return os.NewFile(uintptr(h), path), identity, nil
+	return nil, fileIdentity{}, fmt.Errorf("unsafe relative source path")
 }
 
-func safeRelativeParts(relative string) ([]string, error) {
-	if relative == "" || filepath.IsAbs(relative) {
-		return nil, fmt.Errorf("unsafe relative source path")
+// openWindowsRelativeComponent resolves one name against the still-open parent
+// descriptor. It never reopens a derived full path, so replacing an
+// intermediate directory with a reparse point cannot redirect the traversal.
+func openWindowsRelativeComponent(parent windows.Handle, name string, directory bool) (windows.Handle, error) {
+	objectName, err := windows.NewNTUnicodeString(name)
+	if err != nil {
+		return 0, err
 	}
-	relative = strings.ReplaceAll(relative, "/", "\\")
-	parts := strings.Split(relative, "\\")
-	for _, part := range parts {
-		if part == "" || part == "." || part == ".." {
-			return nil, fmt.Errorf("unsafe relative source path")
-		}
+	oa := &windows.OBJECT_ATTRIBUTES{
+		Length:        uint32(unsafe.Sizeof(windows.OBJECT_ATTRIBUTES{})),
+		RootDirectory: parent,
+		ObjectName:    objectName,
+		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
 	}
-	return parts, nil
+	options := uint32(windows.FILE_OPEN_REPARSE_POINT | windows.FILE_SYNCHRONOUS_IO_NONALERT)
+	if directory {
+		options |= windows.FILE_DIRECTORY_FILE
+	} else {
+		options |= windows.FILE_NON_DIRECTORY_FILE
+	}
+	var handle windows.Handle
+	var status windows.IO_STATUS_BLOCK
+	if err := windows.NtCreateFile(&handle, windows.FILE_GENERIC_READ, oa, &status, nil, 0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, windows.FILE_OPEN, options, 0, 0); err != nil {
+		return 0, err
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		_ = windows.CloseHandle(handle)
+		return 0, err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (directory && info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0) || (!directory && info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) {
+		_ = windows.CloseHandle(handle)
+		return 0, fmt.Errorf("unsafe source path component")
+	}
+	return handle, nil
 }
 
 func openWindowsComponent(path string, directory bool) (windows.Handle, error) {
@@ -77,6 +100,20 @@ func openWindowsComponent(path string, directory bool) (windows.Handle, error) {
 		return 0, fmt.Errorf("unsafe source path component")
 	}
 	return h, nil
+}
+
+func safeRelativeParts(relative string) ([]string, error) {
+	if relative == "" || filepath.IsAbs(relative) {
+		return nil, fmt.Errorf("unsafe relative source path")
+	}
+	relative = strings.ReplaceAll(relative, "/", "\\")
+	parts := strings.Split(relative, "\\")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, fmt.Errorf("unsafe relative source path")
+		}
+	}
+	return parts, nil
 }
 
 func windowsIdentity(h windows.Handle) (fileIdentity, error) {

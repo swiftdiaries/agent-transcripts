@@ -92,6 +92,36 @@ func TestBrowseExplicitFamilyIncludesChildrenAndStaysLoopbackWithoutOpening(t *t
 	}
 }
 
+func TestFamilyForPathDerivesScopeFromOwnedSnapshot(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "claude-session.jsonl")
+	original, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "claude-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replaced := bytes.ReplaceAll(original, []byte("/workspace/demo"), []byte("/workspace/replaced"))
+	family, err := familyForPathWithSnapshot(context.Background(), path, func(ctx context.Context, candidate discovery.SessionFamilyCandidate) (*discovery.FamilySnapshot, error) {
+		snapshot, err := discovery.SnapshotFamily(ctx, candidate)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, replaced, 0o600); err != nil {
+			_ = snapshot.Close()
+			return nil, err
+		}
+		return snapshot, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if family.Project.DisplayName != "demo" {
+		t.Fatalf("project=%+v, want snapshot project demo", family.Project)
+	}
+}
+
 func runWithBrowse(t *testing.T, args []string, browse func(context.Context, browseOptions) int) int {
 	t.Helper()
 	return runCommand(DefaultDependencies(), context.Background(), args, nil, &bytes.Buffer{}, &bytes.Buffer{}, browse)

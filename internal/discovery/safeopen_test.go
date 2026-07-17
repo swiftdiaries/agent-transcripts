@@ -62,6 +62,33 @@ func TestSnapshotReadersRejectsTooManySourcesAndCancellation(t *testing.T) {
 	}
 }
 
+func TestDiscoverPropagatesUnsupportedSafeOpen(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "done.jsonl")
+	writeSession(t, path, snapshotFixture("unsupported"), 10*time.Minute)
+	restore := setSafeOpenForTest(func(string, string) (*os.File, fileIdentity, error) {
+		return nil, fileIdentity{}, ErrSafeOpenUnsupported
+	})
+	t.Cleanup(restore)
+	_, err := Discover(context.Background(), Roots{Claude: []string{root}}, fixedNow, 5*time.Minute)
+	if !errors.Is(err, ErrSafeOpenUnsupported) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestInspectPathPropagatesUnsupportedSafeOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "done.jsonl")
+	writeSession(t, path, snapshotFixture("unsupported"), 10*time.Minute)
+	restore := setSafeOpenForTest(func(string, string) (*os.File, fileIdentity, error) {
+		return nil, fileIdentity{}, ErrSafeOpenUnsupported
+	})
+	t.Cleanup(restore)
+	_, err := InspectPath(context.Background(), path, fixedNow, 5*time.Minute)
+	if !errors.Is(err, ErrSafeOpenUnsupported) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func stableFamily(t *testing.T) SessionFamilyCandidate {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "done.jsonl")

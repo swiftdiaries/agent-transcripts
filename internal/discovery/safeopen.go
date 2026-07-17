@@ -7,6 +7,10 @@ import (
 
 var ErrSafeOpenUnsupported = errors.New("safe source open unsupported")
 
+// safeOpenFile is the single descriptor-opening boundary. Keeping this
+// indirection here lets tests exercise callers' unsupported-platform handling.
+var safeOpenFile = safeOpen
+
 type fileIdentity struct {
 	Device, Inode uint64
 	Size          int64
@@ -26,7 +30,7 @@ func safeOpenChanged(err error) error {
 }
 
 func (c Candidate) openVerified() (*os.File, fileIdentity, error) {
-	f, identity, err := safeOpen(c.root, c.relativePath)
+	f, identity, err := safeOpenFile(c.root, c.relativePath)
 	if err != nil {
 		return nil, fileIdentity{}, safeOpenChanged(err)
 	}

@@ -112,7 +112,10 @@ func walk(ctx context.Context, root, provider string, now time.Time, quiet time.
 		if err != nil || !safeRelativePath(relative) {
 			return nil
 		}
-		candidate, ok, _ := inspectAt(ctx, root, relative, absolute, provider, now, quiet)
+		candidate, ok, inspectErr := inspectAt(ctx, root, relative, absolute, provider, now, quiet)
+		if errors.Is(inspectErr, ErrSafeOpenUnsupported) {
+			return inspectErr
+		}
 		if ok {
 			seen[absolute] = struct{}{}
 			*out = append(*out, candidate)
@@ -133,7 +136,7 @@ func inspect(ctx context.Context, path, provider string, now time.Time, quiet ti
 }
 
 func inspectAt(ctx context.Context, root, relativePath, path, provider string, now time.Time, quiet time.Duration) (Candidate, bool, error) {
-	f, identity, err := safeOpen(root, relativePath)
+	f, identity, err := safeOpenFile(root, relativePath)
 	if err != nil {
 		return Candidate{}, false, safeOpenChanged(err)
 	}
@@ -301,6 +304,9 @@ func InspectPath(ctx context.Context, path string, now time.Time, quiet time.Dur
 		}
 		var tooLarge *parser.ErrSourceTooLarge
 		if errors.As(inspectErr, &tooLarge) {
+			return Candidate{}, inspectErr
+		}
+		if errors.Is(inspectErr, ErrSafeOpenUnsupported) {
 			return Candidate{}, inspectErr
 		}
 	}

@@ -901,6 +901,43 @@ func TestLiveImportRejectsChangedCandidate(t *testing.T) {
 	}
 }
 
+func TestLiveImportCleansFirstSnapshotWhenSecondSelectionChanges(t *testing.T) {
+	snapshotRoot := t.TempDir()
+	t.Setenv("TMPDIR", snapshotRoot)
+	h := newLiveTestServer(t, "claude-session.jsonl", "codex-session.jsonl")
+	claudeRoot, codexRoot := h.roots.Claude[0], h.roots.Codex[0]
+	h.discover = func(ctx context.Context, _ discovery.Roots, now time.Time, quiet time.Duration) ([]discovery.Candidate, error) {
+		items, err := discovery.Discover(ctx, discovery.Roots{Claude: []string{claudeRoot}, Codex: []string{codexRoot}}, now, quiet)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			if item.Provider == "codex" {
+				if err := os.WriteFile(item.Path, append(mustRead(t, item.Path), '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return items, nil
+	}
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/live/import", strings.NewReader("session=claude%3Aclaude-session-1&session=codex%3Acodex-session-1"))
+	r.Host = "example.test"
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	attachLocalCSRF(t, h, r)
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	entries, err := os.ReadDir(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("private snapshots remain after second selection failed: %v", entries)
+	}
+}
+
 func attachLocalCSRF(t *testing.T, h *server, r *http.Request) {
 	t.Helper()
 	issue := httptest.NewRequest(http.MethodGet, "/live", nil)
