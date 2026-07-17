@@ -62,7 +62,7 @@ func TestFilesystemPutFamilyReadsEveryMember(t *testing.T) {
 
 func TestStoreRejectsNewIncompleteFamilyButReadsExistingV2(t *testing.T) {
 	st := NewFilesystem(t.TempDir())
-	p := familyPackage(t, "main", "child")
+	p := familyPackage(t, "main", "child-a", "child-b")
 	if _, err := st.PutFamily(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +95,37 @@ func TestStoreRejectsNewIncompleteFamilyButReadsExistingV2(t *testing.T) {
 	}
 	if _, err := st.PutFamily(context.Background(), p); err == nil {
 		t.Fatal("stored a new incomplete family")
+	}
+	// Legacy compatibility applies only to its historical completion state.
+	// Preserve source/fact alignment while reversing the child sequence, which
+	// makes the facts disagree with the family child order.
+	p.SourceManifest.Sources[1], p.SourceManifest.Sources[2] = p.SourceManifest.Sources[2], p.SourceManifest.Sources[1]
+	p.SourceFactsSet[1], p.SourceFactsSet[2] = p.SourceFactsSet[2], p.SourceFactsSet[1]
+	sourceManifest, err := json.Marshal(p.SourceManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceFacts, err := json.Marshal(p.SourceFactsSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "source-manifest.json"), sourceManifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "source-facts.json"), sourceFacts, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.Files["source-manifest.json"] = checksum(sourceManifest)
+	m.Files["source-facts.json"] = checksum(sourceFacts)
+	mb, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "manifest.json"), mb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession(context.Background(), p.ID); err == nil {
+		t.Fatal("read legacy incomplete package with misordered child facts")
 	}
 }
 

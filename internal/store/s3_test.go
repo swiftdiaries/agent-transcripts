@@ -42,7 +42,7 @@ func TestS3PutFamilyReadsEveryMember(t *testing.T) {
 func TestS3ReadsExistingIncompleteV2ButRejectsNewWrite(t *testing.T) {
 	fake := newFakeS3()
 	s := NewS3(fake, "bucket", "prod").(*S3)
-	p := familyPackage(t, "main", "child")
+	p := familyPackage(t, "main", "child-a", "child-b")
 	if _, err := s.PutFamily(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +80,43 @@ func TestS3ReadsExistingIncompleteV2ButRejectsNewWrite(t *testing.T) {
 	}
 	if _, err := s.PutFamily(context.Background(), p); err == nil {
 		t.Fatal("stored a new incomplete family")
+	}
+	// A legacy completion state does not excuse child source/fact order.
+	p.SourceManifest.Sources[1], p.SourceManifest.Sources[2] = p.SourceManifest.Sources[2], p.SourceManifest.Sources[1]
+	p.SourceFactsSet[1], p.SourceFactsSet[2] = p.SourceFactsSet[2], p.SourceFactsSet[1]
+	sourceManifest, err := json.Marshal(p.SourceManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceFacts, err := json.Marshal(p.SourceFactsSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceManifestKey, err := s.key(p.Metadata.Destination, p.ID, "source-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", sourceManifestKey, sourceManifest, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	sourceFactsKey, err := s.key(p.Metadata.Destination, p.ID, "source-facts.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", sourceFactsKey, sourceFacts, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	m.Files["source-manifest.json"] = checksum(sourceManifest)
+	m.Files["source-facts.json"] = checksum(sourceFacts)
+	manifestBytes, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.PutObject(context.Background(), "bucket", manifestKey, manifestBytes, S3Condition{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSession(context.Background(), p.ID); err == nil {
+		t.Fatal("read legacy incomplete package with misordered child facts")
 	}
 }
 

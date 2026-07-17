@@ -164,9 +164,6 @@ func validateStoredCompletion(f session.SessionFamily, facts []session.SourceFac
 	if len(facts) != len(f.Children)+1 || facts[0].Role != "main" || facts[0].AgentID != "" {
 		return errors.New("family source facts order mismatch")
 	}
-	if allowLegacyIncomplete && f.Completion.Status == "incomplete" {
-		return nil
-	}
 	allTerminal := f.Main.Completion.Terminal
 	allProven := f.Main.Completion.Terminal || facts[0].Facts.QuietPeriodVerified
 	for i, child := range f.Children {
@@ -176,6 +173,9 @@ func validateStoredCompletion(f session.SessionFamily, facts []session.SourceFac
 		}
 		allTerminal = allTerminal && child.Session.Completion.Terminal
 		allProven = allProven && (child.Session.Completion.Terminal || fact.Facts.QuietPeriodVerified)
+	}
+	if allowLegacyIncomplete && f.Completion.Status == "incomplete" {
+		return nil
 	}
 	if !allProven || f.Completion.Status == "incomplete" {
 		return errors.New("family completion is unproven")
