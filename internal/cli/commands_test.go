@@ -315,12 +315,17 @@ func uploadTestLibrary(t *testing.T) (store.Store, string) {
 func uploadFamilyTestLibrary(t *testing.T) (store.Store, string) {
 	t.Helper()
 	st := store.NewFilesystem(t.TempDir())
-	main := mustReadUploadFixture(t, "claude-session.jsonl")
-	child := bytes.Clone(main)
-	md, _, err := library.New(st, library.AllowLocalQuietEvidence()).ImportFamilyWithStatus(context.Background(), discovery.FamilySnapshot{
-		Candidate: discovery.SessionFamilyCandidate{Provider: "claude", ProviderSessionID: "claude-session-1"},
-		Sources:   []discovery.SnapshotSource{{Role: "main", Bytes: main}, {Role: "child", AgentID: "agent-real", Bytes: child}},
-	}, library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local"})
+	main := []byte(`{"type":"assistant","uuid":"call","sessionId":"upload-family","timestamp":"2026-07-17T08:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Task","input":{}}]}}
+{"type":"user","uuid":"result","sessionId":"upload-family","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"agent-real","status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"done"}]}}
+{"type":"system","subtype":"turn_duration","uuid":"terminal","sessionId":"upload-family","timestamp":"2026-07-17T08:00:02Z"}`)
+	child := []byte(`{"type":"user","uuid":"child","sessionId":"upload-family","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"agent-real"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"nested","content":"done"}]}}
+{"type":"system","subtype":"turn_duration","uuid":"child-terminal","sessionId":"upload-family","timestamp":"2026-07-17T08:00:02Z"}`)
+	snapshot, err := discovery.SnapshotReaders(context.Background(), discovery.SessionFamilyCandidate{Provider: "claude", ProviderSessionID: "upload-family"}, []discovery.SnapshotInput{{Role: "main", Reader: bytes.NewReader(main)}, {Role: "child", AgentID: "agent-real", Reader: bytes.NewReader(child)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = snapshot.Close() })
+	md, _, err := library.New(st, library.AllowLocalQuietEvidence()).ImportFamilyWithStatus(context.Background(), snapshot, library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local"})
 	if err != nil {
 		t.Fatal(err)
 	}

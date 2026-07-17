@@ -111,33 +111,41 @@ func TestImportCodexFamilyPersistsNestedMembers(t *testing.T) {
 	}
 }
 
-func codexFamilySnapshot(t *testing.T) discovery.FamilySnapshot {
+func codexFamilySnapshot(t *testing.T) *discovery.FamilySnapshot {
 	t.Helper()
 	main := fixture(t, "codex-family-main.jsonl")
 	worker := fixture(t, "codex-family-worker.jsonl")
 	guardian := fixture(t, "codex-family-guardian.jsonl")
-	return discovery.FamilySnapshot{Candidate: discovery.SessionFamilyCandidate{Provider: "codex", ProviderSessionID: "codex-root", Project: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "demo"}}, Sources: []discovery.SnapshotSource{
-		{Role: "main", Bytes: main, Facts: session.SourceFacts{ObservedSize: int64(len(main)), QuietPeriodVerified: true}},
-		{Role: "child", AgentID: "codex-worker", Bytes: worker, Facts: session.SourceFacts{ObservedSize: int64(len(worker)), QuietPeriodVerified: true}},
-		{Role: "child", AgentID: "codex-guardian", Bytes: guardian, Facts: session.SourceFacts{ObservedSize: int64(len(guardian)), QuietPeriodVerified: true}},
-	}}
+	return testSnapshot(t, discovery.SessionFamilyCandidate{Provider: "codex", ProviderSessionID: "codex-root", Project: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "demo"}}, []discovery.SnapshotInput{
+		{Role: "main", Reader: bytes.NewReader(main), Facts: session.SourceFacts{ObservedSize: int64(len(main)), QuietPeriodVerified: true}},
+		{Role: "child", AgentID: "codex-worker", Reader: bytes.NewReader(worker), Facts: session.SourceFacts{ObservedSize: int64(len(worker)), QuietPeriodVerified: true}},
+		{Role: "child", AgentID: "codex-guardian", Reader: bytes.NewReader(guardian), Facts: session.SourceFacts{ObservedSize: int64(len(guardian)), QuietPeriodVerified: true}},
+	})
 }
 
-func snapshotFamily(t *testing.T) discovery.FamilySnapshot {
+func snapshotFamily(t *testing.T) *discovery.FamilySnapshot {
 	t.Helper()
 	main := []byte(`{"type":"assistant","uuid":"call","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{}}]}}` + "\n" +
 		`{"type":"user","uuid":"result","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"child-1","status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"done"}]}}` + "\n" +
 		`{"type":"system","subtype":"turn_duration","uuid":"terminal","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:02Z"}` + "\n")
 	child := []byte(`{"type":"user","uuid":"child","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:01Z","message":{"role":"user","content":"work"}}` + "\n" +
 		`{"type":"system","subtype":"turn_duration","uuid":"child-terminal","sessionId":"claude-session-1","timestamp":"2026-07-17T08:00:02Z"}` + "\n")
-	return discovery.FamilySnapshot{
-		Candidate: discovery.SessionFamilyCandidate{
-			Provider: "claude", ProviderSessionID: "claude-session-1",
-			Project: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("a", 64), DisplayName: "demo"},
-		},
-		Sources: []discovery.SnapshotSource{
-			{Role: "main", Bytes: main, Facts: session.SourceFacts{ObservedSize: int64(len(main)), QuietPeriodVerified: true}},
-			{Role: "child", AgentID: "child-1", Bytes: child, Facts: session.SourceFacts{ObservedSize: int64(len(child)), QuietPeriodVerified: true}},
-		},
+	return testSnapshot(t, discovery.SessionFamilyCandidate{
+		Provider: "claude", ProviderSessionID: "claude-session-1",
+		Project: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("a", 64), DisplayName: "demo"},
+	},
+		[]discovery.SnapshotInput{
+			{Role: "main", Reader: bytes.NewReader(main), Facts: session.SourceFacts{ObservedSize: int64(len(main)), QuietPeriodVerified: true}},
+			{Role: "child", AgentID: "child-1", Reader: bytes.NewReader(child), Facts: session.SourceFacts{ObservedSize: int64(len(child)), QuietPeriodVerified: true}},
+		})
+}
+
+func testSnapshot(t *testing.T, candidate discovery.SessionFamilyCandidate, inputs []discovery.SnapshotInput) *discovery.FamilySnapshot {
+	t.Helper()
+	snapshot, err := discovery.SnapshotReaders(context.Background(), candidate, inputs)
+	if err != nil {
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = snapshot.Close() })
+	return snapshot
 }

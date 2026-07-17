@@ -213,11 +213,12 @@ func (s *server) uploadSession(w http.ResponseWriter, r *http.Request, who auth.
 			return
 		}
 	}
-	snapshot, err := uploadSnapshot(r.MultipartForm)
+	snapshot, err := uploadSnapshot(r.Context(), r.MultipartForm)
 	if err != nil {
 		http.Error(w, "invalid upload", http.StatusBadRequest)
 		return
 	}
+	defer snapshot.Close()
 	// A hosted service deliberately does not trust client source facts: terminal
 	// evidence must be parser-derived, never inferred from a quiet local file.
 	svc := library.New(s.store)
@@ -262,38 +263,34 @@ func validUploadForm(form *multipart.Form) bool {
 	return true
 }
 
-func uploadSnapshot(form *multipart.Form) (discovery.FamilySnapshot, error) {
+func uploadSnapshot(ctx context.Context, form *multipart.Form) (*discovery.FamilySnapshot, error) {
 	if form == nil {
-		return discovery.FamilySnapshot{}, errors.New("missing multipart form")
+		return nil, errors.New("missing multipart form")
 	}
 	files := append([]*multipart.FileHeader{}, form.File["source"]...)
 	files = append(files, form.File["child"]...)
-	snapshot := discovery.FamilySnapshot{Sources: make([]discovery.SnapshotSource, 0, len(files))}
-	var total int64
+	inputs := make([]discovery.SnapshotInput, 0, len(files))
+	readers := make([]io.Closer, 0, len(files))
+	defer func() {
+		for _, reader := range readers {
+			_ = reader.Close()
+		}
+	}()
 	for i, header := range files {
 		file, err := header.Open()
 		if err != nil {
-			return discovery.FamilySnapshot{}, err
+			return nil, err
 		}
-		data, readErr := io.ReadAll(io.LimitReader(file, session.MaxSourceBytes-total+1))
-		closeErr := file.Close()
-		if readErr != nil {
-			return discovery.FamilySnapshot{}, readErr
-		}
-		if closeErr != nil {
-			return discovery.FamilySnapshot{}, closeErr
-		}
-		total += int64(len(data))
-		if total > session.MaxSourceBytes {
-			return discovery.FamilySnapshot{}, errors.New("upload too large")
-		}
+		readers = append(readers, file)
 		role := "child"
+		agentID := fmt.Sprintf("upload-child-%d", i)
 		if i == 0 {
 			role = "main"
+			agentID = ""
 		}
-		snapshot.Sources = append(snapshot.Sources, discovery.SnapshotSource{Role: role, Bytes: data, Facts: session.SourceFacts{ObservedSize: int64(len(data))}})
+		inputs = append(inputs, discovery.SnapshotInput{Role: role, AgentID: agentID, Reader: file})
 	}
-	return snapshot, nil
+	return discovery.SnapshotReaders(ctx, discovery.SessionFamilyCandidate{}, inputs)
 }
 
 func jsonRequest(r *http.Request) bool {
@@ -569,22 +566,27 @@ func (s *server) renderLiveFamily(w http.ResponseWriter, r *http.Request, family
 }
 
 func parseLiveFamily(ctx context.Context, candidate discovery.SessionFamilyCandidate) (session.SessionFamily, error) {
-	parse := func(source discovery.Candidate) (session.Session, error) {
-		reader, _, err := discovery.OpenEligible(source)
+	snapshot, err := discovery.SnapshotFamily(ctx, candidate)
+	if err != nil {
+		return session.SessionFamily{}, err
+	}
+	defer snapshot.Close()
+	parse := func(source discovery.SnapshotSource) (session.Session, error) {
+		reader, err := source.Open()
 		if err != nil {
 			return session.Session{}, err
 		}
 		defer reader.Close()
 		return parser.DefaultRegistry().DetectAndParse(ctx, reader)
 	}
-	main, err := parse(candidate.Main.Candidate)
+	main, err := parse(snapshot.Sources[0])
 	if err != nil {
 		return session.SessionFamily{}, err
 	}
 	family := session.SessionFamily{Main: main}
 	children := make([]parser.ClaudeChild, 0, len(candidate.Children))
-	for _, child := range candidate.Children {
-		parsed, err := parse(child.Candidate)
+	for index, child := range candidate.Children {
+		parsed, err := parse(snapshot.Sources[index+1])
 		if err != nil {
 			return session.SessionFamily{}, err
 		}
@@ -675,10 +677,17 @@ func (s *server) importLive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "select at least one session", http.StatusBadRequest)
 		return
 	}
-	snapshots := make([]discovery.FamilySnapshot, 0, len(selected))
+	snapshots := make([]*discovery.FamilySnapshot, 0, len(selected))
+	closeSnapshots := func() {
+		for _, snapshot := range snapshots {
+			_ = snapshot.Close()
+		}
+	}
+	defer closeSnapshots()
 	for _, family := range selected {
-		snapshot, err := discovery.SnapshotFamily(family)
+		snapshot, err := discovery.SnapshotFamily(r.Context(), family)
 		if err != nil {
+			closeSnapshots()
 			http.Error(w, "selected session is no longer eligible", http.StatusBadRequest)
 			return
 		}

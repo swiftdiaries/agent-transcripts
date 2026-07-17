@@ -657,7 +657,7 @@ func familyForPath(ctx context.Context, path string) (discovery.SessionFamilyCan
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
-	f, err := os.Open(candidate.Path)
+	f, _, err := discovery.OpenEligible(candidate)
 	if err != nil {
 		return discovery.SessionFamilyCandidate{}, err
 	}
@@ -856,11 +856,12 @@ func emitEligibleWithLibrary(ctx context.Context, candidate discovery.Candidate,
 }
 
 func emitFamilyWithLibrary(ctx context.Context, family discovery.SessionFamilyCandidate, stdout, stderr io.Writer, libraryStore store.Store) int {
-	snapshot, err := discovery.SnapshotFamily(family)
+	snapshot, err := discovery.SnapshotFamily(ctx, family)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
+	defer snapshot.Close()
 	svc := library.New(libraryStore, library.AllowLocalQuietEvidence())
 	metadata, _, err := svc.ImportFamilyWithStatus(ctx, snapshot, library.ImportAttrs{
 		Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local", Title: family.Title, Project: family.Project.DisplayName,

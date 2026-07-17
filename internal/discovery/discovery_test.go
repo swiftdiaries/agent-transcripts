@@ -271,11 +271,21 @@ func TestSnapshotFamilyCopiesMainAndChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := SnapshotFamily(SessionFamilyCandidate{Main: SourceCandidate{Candidate: main}, Children: []ChildSourceCandidate{{Candidate: child, AgentID: "1"}}})
+	got, err := SnapshotFamily(context.Background(), SessionFamilyCandidate{Main: SourceCandidate{Candidate: main}, Children: []ChildSourceCandidate{{Candidate: child, AgentID: "1"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Sources) != 2 || string(got.Sources[0].Bytes) != data {
+	defer got.Close()
+	reader, err := got.Sources[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bytes, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sources) != 2 || string(bytes) != data {
 		t.Fatalf("snapshot = %#v", got)
 	}
 }
@@ -497,8 +507,7 @@ func TestOpenEligibleRejectsOversizeBeforeReparse(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = OpenEligible(got[0])
-	var tooLarge *parser.ErrSourceTooLarge
-	if !errors.As(err, &tooLarge) {
+	if !errors.Is(err, ErrSourceChanged) {
 		t.Fatalf("error = %T %v", err, err)
 	}
 }
