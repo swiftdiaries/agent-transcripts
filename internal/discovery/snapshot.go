@@ -36,7 +36,7 @@ func (s *FamilySnapshot) Close() error {
 	if s == nil {
 		return nil
 	}
-	s.closeOnce.Do(func() { s.closeErr = os.RemoveAll(s.dir) })
+	s.closeOnce.Do(func() { s.closeErr = snapshotRemoveAll(s.dir) })
 	return s.closeErr
 }
 
@@ -47,6 +47,13 @@ type SnapshotInput struct {
 }
 
 var snapshotTestHook func()
+
+// These indirections let tests enforce Windows-style cleanup ordering on
+// filesystems that permit removing an open file.
+var (
+	snapshotOpenFile  = snapshotFile
+	snapshotRemoveAll = os.RemoveAll
+)
 
 // SnapshotFamily captures verified local descriptors in private files. It
 // copies each descriptor once, then hashes the same open descriptor again to
@@ -62,7 +69,7 @@ func SnapshotFamily(ctx context.Context, candidate SessionFamilyCandidate) (*Fam
 	}
 	fail := func(err error) (*FamilySnapshot, error) { _ = snapshot.Close(); return nil, err }
 	remaining := int64(session.MaxSourceBytes)
-	copyCandidate := func(role, agentID string, source Candidate) error {
+	copyCandidate := func(role, agentID string, source Candidate) (err error) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -70,12 +77,22 @@ func SnapshotFamily(ctx context.Context, candidate SessionFamilyCandidate) (*Fam
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		dst, err := snapshotFile(snapshot.dir, len(snapshot.Sources))
+		defer func() {
+			if closeErr := f.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}()
+		dst, err := snapshotOpenFile(snapshot.dir, len(snapshot.Sources))
 		if err != nil {
 			return err
 		}
-		defer dst.Close()
+		defer func() {
+			if dst != nil {
+				if closeErr := dst.Close(); err == nil && closeErr != nil {
+					err = closeErr
+				}
+			}
+		}()
 		copyHash, _, err := copySnapshotSource(ctx, dst, f, &remaining)
 		if err != nil {
 			return err
@@ -101,7 +118,12 @@ func SnapshotFamily(ctx context.Context, candidate SessionFamilyCandidate) (*Fam
 		if copyHash != verifyHash || !sameIdentity(before, afterCopy) || !sameIdentity(before, afterHash) {
 			return ErrSourceChanged
 		}
-		snapshot.Sources = append(snapshot.Sources, SnapshotSource{Role: role, AgentID: agentID, Facts: sourceFacts(before, source.quietVerified), path: dst.Name()})
+		path := dst.Name()
+		if err := dst.Close(); err != nil {
+			return err
+		}
+		dst = nil
+		snapshot.Sources = append(snapshot.Sources, SnapshotSource{Role: role, AgentID: agentID, Facts: sourceFacts(before, source.quietVerified), path: path})
 		return nil
 	}
 	if err := copyCandidate("main", "", candidate.Main.Candidate); err != nil {

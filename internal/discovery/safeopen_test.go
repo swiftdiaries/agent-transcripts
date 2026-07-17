@@ -30,6 +30,40 @@ func TestSnapshotFamilyRejectsSameSizeInPlaceMutation(t *testing.T) {
 	}
 }
 
+func TestSnapshotFamilyFailureClosesDestinationBeforeCleanup(t *testing.T) {
+	family, mutateBetweenPasses := mutatingFamily(t)
+	var destination *os.File
+	oldOpen := snapshotOpenFile
+	snapshotOpenFile = func(dir string, index int) (*os.File, error) {
+		file, err := snapshotFile(dir, index)
+		destination = file
+		return file, err
+	}
+	t.Cleanup(func() { snapshotOpenFile = oldOpen })
+	oldRemoveAll := snapshotRemoveAll
+	snapshotRemoveAll = func(dir string) error {
+		if destination != nil {
+			if _, err := destination.Stat(); err == nil {
+				return errors.New("destination snapshot file is still open")
+			}
+		}
+		return os.RemoveAll(dir)
+	}
+	t.Cleanup(func() { snapshotRemoveAll = oldRemoveAll })
+	snapshotTestHook = mutateBetweenPasses
+	t.Cleanup(func() { snapshotTestHook = nil })
+
+	if _, err := SnapshotFamily(context.Background(), family); !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("err=%v", err)
+	}
+	if destination == nil {
+		t.Fatal("snapshot destination was not created")
+	}
+	if _, err := os.Stat(filepath.Dir(destination.Name())); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("private snapshot directory remains after failure: %v", err)
+	}
+}
+
 func TestFamilySnapshotCloseRemovesPrivateFiles(t *testing.T) {
 	snapshot, err := SnapshotFamily(context.Background(), stableFamily(t))
 	if err != nil {
