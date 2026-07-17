@@ -44,6 +44,7 @@ h1 { font-family: var(--serif); font-size: clamp(2.3rem, 6vw, 4.9rem); letter-sp
 .child-prompt-index { border-top: 1px solid var(--rule); font-size: .85rem; padding-top: .65rem; }
 .child-prompt-index ol { margin-bottom: 0; padding-left: 1.1rem; }
 .child-event-stream { display: grid; gap: .7rem; }
+.delegated-children { display: grid; gap: .7rem; }
 .child-turn { background: var(--surface); }
 .event-card > header { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
 .copy-anchor { background: transparent; border-color: var(--rule); color: var(--ink); font-size: .68rem; padding: .38rem .5rem; }

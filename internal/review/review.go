@@ -18,7 +18,8 @@ type Transcript struct {
 	Diagnostics []session.Event
 }
 
-type ChildTranscript struct {
+type TranscriptNode struct {
+	SessionID        string
 	AgentID          string
 	ParentToolCallID string
 	AgentType        string
@@ -26,31 +27,72 @@ type ChildTranscript struct {
 	StartedAt        time.Time
 	Completion       session.Completion
 	Transcript       Transcript
+	Attached         map[string][]*TranscriptNode
+	Children         []*TranscriptNode
 }
 
-type FamilyTranscript struct {
-	Main       Transcript
-	Attached   map[string][]ChildTranscript
-	Unattached []ChildTranscript
-}
+type FamilyTranscript struct{ Root *TranscriptNode }
 
 func ProjectFamily(family session.SessionFamily) FamilyTranscript {
-	out := FamilyTranscript{Main: Project(family.Main), Attached: make(map[string][]ChildTranscript)}
+	root := transcriptNode(family.Main, "", "", "")
+	byParentSessionID := map[string]*TranscriptNode{family.Main.ID: root}
+	byAgentID := make(map[string]*TranscriptNode, len(family.Children))
 	for _, child := range family.Children {
-		projected := ChildTranscript{AgentID: child.AgentID, ParentToolCallID: child.ParentToolCallID, AgentType: child.AgentType, Description: child.Description, StartedAt: child.Session.StartedAt, Completion: child.Session.Completion, Transcript: Project(child.Session)}
-		if child.Attached {
-			out.Attached[child.ParentToolCallID] = append(out.Attached[child.ParentToolCallID], projected)
-		} else {
-			out.Unattached = append(out.Unattached, projected)
+		node := transcriptNode(child.Session, child.AgentID, child.AgentType, child.Description)
+		node.ParentToolCallID = child.ParentToolCallID
+		byAgentID[child.AgentID] = node
+		if family.Provider == "codex" {
+			byParentSessionID[child.Session.ID] = node
 		}
 	}
-	sort.Slice(out.Unattached, func(i, j int) bool {
-		if out.Unattached[i].StartedAt.Equal(out.Unattached[j].StartedAt) {
-			return out.Unattached[i].AgentID < out.Unattached[j].AgentID
+	for _, child := range family.Children {
+		parentSessionID := child.ParentSessionID
+		if parentSessionID == "" {
+			parentSessionID = family.Main.ID
 		}
-		return out.Unattached[i].StartedAt.Before(out.Unattached[j].StartedAt)
-	})
-	return out
+		parent := byParentSessionID[parentSessionID]
+		node := byAgentID[child.AgentID]
+		if child.Attached {
+			parent.Attached[child.ParentToolCallID] = append(parent.Attached[child.ParentToolCallID], node)
+			continue
+		}
+		parent.Children = append(parent.Children, node)
+	}
+	sortTranscriptNode(root)
+	return FamilyTranscript{Root: root}
+}
+
+func transcriptNode(value session.Session, agentID, agentType, description string) *TranscriptNode {
+	return &TranscriptNode{
+		SessionID:   value.ID,
+		AgentID:     agentID,
+		AgentType:   agentType,
+		Description: description,
+		StartedAt:   value.StartedAt,
+		Completion:  value.Completion,
+		Transcript:  Project(value),
+		Attached:    make(map[string][]*TranscriptNode),
+	}
+}
+
+func sortTranscriptNode(node *TranscriptNode) {
+	sort.Slice(node.Children, func(i, j int) bool { return before(node.Children[i], node.Children[j]) })
+	for _, children := range node.Attached {
+		sort.Slice(children, func(i, j int) bool { return before(children[i], children[j]) })
+		for _, child := range children {
+			sortTranscriptNode(child)
+		}
+	}
+	for _, child := range node.Children {
+		sortTranscriptNode(child)
+	}
+}
+
+func before(left, right *TranscriptNode) bool {
+	if left.StartedAt.Equal(right.StartedAt) {
+		return left.AgentID < right.AgentID
+	}
+	return left.StartedAt.Before(right.StartedAt)
 }
 
 func Project(s session.Session) Transcript {

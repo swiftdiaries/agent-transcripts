@@ -767,7 +767,7 @@ type transcript struct {
 	Turns       []turnView
 	Diagnostics []eventView
 	Attached    map[string][]childTranscriptView
-	Unattached  []childTranscriptView
+	Children    []childTranscriptView
 }
 type turnView struct {
 	Prompt      eventView
@@ -787,12 +787,15 @@ type eventView struct {
 
 type childTranscriptView struct {
 	Anchor      string
+	SessionID   string
 	AgentID     string
 	AgentType   string
 	Description string
 	Completion  session.Completion
 	Turns       []turnView
 	Diagnostics []eventView
+	Attached    map[string][]childTranscriptView
+	Children    []childTranscriptView
 }
 
 func transcriptPage(value session.Session, title string) page {
@@ -805,30 +808,38 @@ func transcriptFamilyPage(value session.SessionFamily, title string) page {
 	}
 	p := page{Title: title, Section: "transcript", Transcript: transcript{Title: title}}
 	projected := review.ProjectFamily(value)
-	p.Transcript.Attached = make(map[string][]childTranscriptView, len(projected.Attached))
-	for _, turn := range projected.Main.Turns {
+	p.Transcript.Attached = make(map[string][]childTranscriptView, len(projected.Root.Attached))
+	for _, turn := range projected.Root.Transcript.Turns {
 		p.Transcript.Turns = append(p.Transcript.Turns, turnView{Prompt: eventViewFor(turn.Prompt), Events: eventViews(turn.Events), Diagnostics: eventViews(turn.Diagnostics)})
 	}
-	p.Transcript.Diagnostics = eventViews(projected.Main.Diagnostics)
-	for parentID, children := range projected.Attached {
-		p.Transcript.Attached[parentID] = childTranscriptViews(children)
+	p.Transcript.Diagnostics = eventViews(projected.Root.Transcript.Diagnostics)
+	for parentID, children := range projected.Root.Attached {
+		p.Transcript.Attached[parentID] = childNodesView(children)
 	}
-	p.Transcript.Unattached = childTranscriptViews(projected.Unattached)
+	p.Transcript.Children = childNodesView(projected.Root.Children)
 	return p
 }
 
-func childTranscriptViews(children []review.ChildTranscript) []childTranscriptView {
+func childNodesView(children []*review.TranscriptNode) []childTranscriptView {
 	views := make([]childTranscriptView, 0, len(children))
 	for _, child := range children {
-		view := childTranscriptView{Anchor: "child-" + child.AgentID, AgentID: child.AgentID, AgentType: child.AgentType, Description: child.Description, Completion: child.Completion, Diagnostics: eventViews(child.Transcript.Diagnostics)}
-		for _, turn := range child.Transcript.Turns {
-			turnView := turnView{Prompt: eventViewFor(turn.Prompt), Events: eventViews(turn.Events), Diagnostics: eventViews(turn.Diagnostics)}
-			turnView.Prompt.ID = view.Anchor + "-" + turnView.Prompt.ID
-			view.Turns = append(view.Turns, turnView)
-		}
-		views = append(views, view)
+		views = append(views, childNodeView(child))
 	}
 	return views
+}
+
+func childNodeView(node *review.TranscriptNode) childTranscriptView {
+	view := childTranscriptView{Anchor: "child-" + node.AgentID, SessionID: node.SessionID, AgentID: node.AgentID, AgentType: node.AgentType, Description: node.Description, Completion: node.Completion, Diagnostics: eventViews(node.Transcript.Diagnostics), Attached: make(map[string][]childTranscriptView, len(node.Attached))}
+	for _, turn := range node.Transcript.Turns {
+		turnView := turnView{Prompt: eventViewFor(turn.Prompt), Events: eventViews(turn.Events), Diagnostics: eventViews(turn.Diagnostics)}
+		turnView.Prompt.ID = view.Anchor + "-" + turnView.Prompt.ID
+		view.Turns = append(view.Turns, turnView)
+	}
+	for parentID, children := range node.Attached {
+		view.Attached[parentID] = childNodesView(children)
+	}
+	view.Children = childNodesView(node.Children)
+	return view
 }
 
 func eventViews(events []session.Event) []eventView {

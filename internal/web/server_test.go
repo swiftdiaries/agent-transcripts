@@ -93,6 +93,71 @@ func TestTranscriptRendersDelegatedWorkInDetails(t *testing.T) {
 	}
 }
 
+func TestTranscriptRendersCodexGuardianOnceUnderWorker(t *testing.T) {
+	body := renderFamily(t, codexRootWorkerGuardianFamily(t))
+	if strings.Count(body, "Delegated work / codex-guardian") != 1 {
+		t.Fatalf("body=%s", body)
+	}
+	if strings.Index(body, "Delegated work / codex-guardian") < strings.Index(body, "Delegated work / codex-worker") {
+		t.Fatalf("guardian preceded worker: %s", body)
+	}
+}
+
+func renderFamily(t *testing.T, family session.SessionFamily) string {
+	t.Helper()
+	var body bytes.Buffer
+	s := New(ServerConfig{}).(*server)
+	if err := s.templates["transcript"].ExecuteTemplate(&body, "transcript", transcriptFamilyPage(family, "Family")); err != nil {
+		t.Fatal(err)
+	}
+	return body.String()
+}
+
+func codexRootWorkerGuardianFamily(t *testing.T) session.SessionFamily {
+	t.Helper()
+	at := func(seconds int64) time.Time { return time.Unix(seconds, 0).UTC() }
+	terminal := func(id string, started, ended time.Time) session.Session {
+		return session.Session{
+			SchemaVersion:     1,
+			ID:                id,
+			Provider:          "codex",
+			ProviderSessionID: id,
+			StartedAt:         started,
+			EndedAt:           ended,
+			Completion:        session.Completion{Terminal: true, TerminalReason: "done", LastEventAt: ended},
+			Events:            []session.Event{{ID: "prompt-" + id, Kind: session.EventUser, Text: id}},
+		}
+	}
+	root := terminal("codex-root", at(10), at(20))
+	worker := terminal("codex-worker", at(5), at(25))
+	worker.Origin = session.SessionOrigin{Kind: "thread_spawn", ParentSessionID: root.ID, AgentPath: "root/worker", AgentName: "worker", AgentRole: "implementer"}
+	guardian := terminal("codex-guardian", at(15), at(30))
+	guardian.Origin = session.SessionOrigin{Kind: "guardian", ParentSessionID: worker.ID, AgentPath: "root/worker/guardian", AgentName: "guardian", AgentRole: "reviewer"}
+	family := session.SessionFamily{
+		SchemaVersion:     2,
+		ID:                root.ID,
+		Provider:          "codex",
+		ProviderSessionID: root.ID,
+		Project:           session.ProjectRef{Kind: "git_worktree", Key: "p_" + strings.Repeat("a", 64), DisplayName: "repo"},
+		Main:              root,
+		Children: []session.ChildSession{
+			{AgentID: worker.ID, ParentSessionID: root.ID, AgentType: worker.Origin.Kind, Session: worker},
+			{AgentID: guardian.ID, ParentSessionID: worker.ID, AgentType: guardian.Origin.Kind, Session: guardian},
+		},
+		StartedAt: at(5),
+		EndedAt:   at(30),
+		Completion: session.FamilyCompletion{
+			Status:      "provider_terminal",
+			Reason:      "all_members_terminal",
+			LastEventAt: at(30),
+		},
+	}
+	if err := session.ValidateFamily(family); err != nil {
+		t.Fatalf("fixture must be valid: %v", err)
+	}
+	return family
+}
+
 func TestDifferentUserCannotDelete(t *testing.T) {
 	pkg := fixturePackage(t)
 	st := store.NewFilesystem(t.TempDir())
