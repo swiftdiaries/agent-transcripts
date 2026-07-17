@@ -78,6 +78,10 @@ to the current worktree by default; use `serve --all-projects` to opt into a
 cross-project catalog. `import` follows the same rule, and `import --all-projects`
 selects a project before its session families.
 
+Codex parent sessions and their worker, reviewer, and guardian rollouts are
+shown as one nested family when Codex records explicit parent-thread
+provenance. Orphaned subagent rollouts are not promoted into the catalog.
+
 Import creates an immutable library package only after completion is revalidated:
 
 ```sh

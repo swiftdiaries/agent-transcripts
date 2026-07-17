@@ -17,6 +17,8 @@ import (
 
 	"github.com/swiftdiaries/agent-transcripts/internal/auth"
 	"github.com/swiftdiaries/agent-transcripts/internal/cli"
+	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
+	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/publish"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
@@ -81,6 +83,78 @@ func TestUploadBrowseRendersAttachedDelegatedFamily(t *testing.T) {
 	if bytes.Contains(body, []byte(`href="#child-child-1-child-prompt"`)) {
 		t.Fatalf("child prompt leaked into main prompt index: %s", body)
 	}
+}
+
+func TestCodexFamilyDiscoveryImportStoreAndRenderRoundTrip(t *testing.T) {
+	roots, scope := installCodexRootWorkerGuardian(t)
+	families, err := discovery.DiscoverFamilies(context.Background(), roots, scope, time.Now(), 5*time.Minute)
+	if err != nil || len(families) != 1 || len(families[0].Children) != 2 {
+		t.Fatalf("families=%#v err=%v", families, err)
+	}
+
+	snapshot, err := discovery.SnapshotFamily(context.Background(), families[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	st := store.NewFilesystem(t.TempDir())
+	attrs := library.ImportAttrs{Destination: session.Directory{Kind: "users", Slug: "local"}, UploaderKey: "local"}
+	md, created, err := library.New(st, library.AllowLocalQuietEvidence()).ImportFamilyWithStatus(context.Background(), snapshot, attrs)
+	if err != nil || !created {
+		t.Fatalf("md=%#v created=%v err=%v", md, created, err)
+	}
+	pkg, err := st.GetSession(context.Background(), md.ID)
+	if err != nil || len(pkg.Family.Children) != 2 {
+		t.Fatalf("pkg=%#v err=%v", pkg, err)
+	}
+	var guardian *session.ChildSession
+	for i := range pkg.Family.Children {
+		if pkg.Family.Children[i].AgentID == "codex-guardian" {
+			guardian = &pkg.Family.Children[i]
+		}
+	}
+	if guardian == nil || guardian.ParentSessionID != "codex-worker" {
+		t.Fatalf("guardian=%#v", guardian)
+	}
+	handler := web.New(web.ServerConfig{Store: st})
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+md.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("render status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	for _, text := range []string{"Root prompt", "Worker prompt", "Guardian review"} {
+		if strings.Count(body, "<pre>"+text+"</pre>") != 1 {
+			t.Fatalf("%q count mismatch: %s", text, body)
+		}
+	}
+}
+
+func installCodexRootWorkerGuardian(t *testing.T) (discovery.Roots, session.ProjectScope) {
+	t.Helper()
+	project := t.TempDir()
+	logs := t.TempDir()
+	for _, name := range []string{"codex-family-main.jsonl", "codex-family-worker.jsonl", "codex-family-guardian.jsonl"} {
+		raw, err := os.ReadFile(filepath.Join("..", "parser", "testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw = bytes.ReplaceAll(raw, []byte("/repo"), []byte(project))
+		target := filepath.Join(logs, "rollout-"+name)
+		if err := os.WriteFile(target, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-10 * time.Minute)
+		if err := os.Chtimes(target, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scope, err := discovery.ResolveProjectScope(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return discovery.Roots{Codex: []string{logs}}, scope
 }
 
 type hostedServer struct {
