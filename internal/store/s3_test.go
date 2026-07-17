@@ -465,7 +465,9 @@ func TestS3ReclaimClaimResponseLossRetryConverges(t *testing.T) {
 	if _, err := s.PutSession(context.Background(), reput); err == nil {
 		t.Fatal("wanted response loss")
 	}
-	if created, err := s.PutSession(context.Background(), reput); err != nil || !created {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if created, err := s.PutSession(ctx, reput); err != nil || !created {
 		t.Fatalf("retry = %v,%v", created, err)
 	}
 }
