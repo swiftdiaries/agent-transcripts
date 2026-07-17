@@ -87,6 +87,11 @@ func formCodexFamilies(candidates []Candidate, scope session.ProjectScope) ([]Se
 			invalid[id] = true
 		}
 	}
+	for _, candidate := range candidates {
+		if candidate.invalid {
+			invalid[candidate.SessionID] = true
+		}
+	}
 	for id, candidate := range byID {
 		if parent := candidate.Origin.ParentSessionID; parent != "" && (counts[parent] != 1 || invalid[parent]) {
 			invalid[id] = true

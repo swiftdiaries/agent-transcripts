@@ -1,7 +1,9 @@
 package discovery
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -39,6 +41,7 @@ type Candidate struct {
 	size          int64
 	quietVerified bool
 	sourceInfo    os.FileInfo
+	invalid       bool
 }
 
 // Discover merges eligible transcripts from all configured provider roots.
@@ -141,6 +144,11 @@ func inspect(ctx context.Context, path, provider string, now time.Time, quiet ti
 	}
 	parsed, err := parser.DefaultRegistry().DetectAndParse(ctx, f)
 	if err != nil {
+		if provider == "codex" {
+			if candidate, ok := malformedCodexCandidate(f, path, info); ok {
+				return candidate, true, nil
+			}
+		}
 		return Candidate{}, false, err
 	}
 	if parsed.Provider != provider || !matches(parsed.Provider, filepath.Base(path)) || !hasConversation(parsed) {
@@ -159,6 +167,38 @@ func inspect(ctx context.Context, path, provider string, now time.Time, quiet ti
 		Project: project(parsed), Title: title(parsed), StartedAt: parsed.StartedAt, Status: status,
 		Origin: parsed.Origin, Scope: scope,
 		modTime: info.ModTime(), size: info.Size(), quietVerified: !parsed.Completion.Terminal && quietOK, sourceInfo: info}, true, nil
+}
+
+// malformedCodexCandidate preserves only an explicit Codex subagent edge when
+// strict parsing rejects the record. The candidate is an invalid graph seed,
+// never a renderable family; retaining its parent evidence prevents discovery
+// from rendering the otherwise-valid ancestor as a partial family.
+func malformedCodexCandidate(f *os.File, path string, info os.FileInfo) (Candidate, bool) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return Candidate{}, false
+	}
+	var entry struct {
+		Type      string `json:"type"`
+		Timestamp string `json:"timestamp"`
+		Payload   struct {
+			ID             string `json:"id"`
+			ParentThreadID string `json:"parent_thread_id"`
+			WorkingDir     string `json:"cwd"`
+			ThreadSource   string `json:"thread_source"`
+		} `json:"payload"`
+	}
+	scanner := bufio.NewScanner(f)
+	if !scanner.Scan() || json.Unmarshal(scanner.Bytes(), &entry) != nil || entry.Type != "session_meta" || entry.Payload.ThreadSource != "subagent" || entry.Payload.ID == "" || entry.Payload.ParentThreadID == "" {
+		return Candidate{}, false
+	}
+	scope, _ := ResolveProjectScope(entry.Payload.WorkingDir)
+	startedAt, _ := time.Parse(time.RFC3339, entry.Timestamp)
+	return Candidate{
+		Path: path, Provider: "codex", SessionID: entry.Payload.ID,
+		Project: filepath.Base(filepath.Clean(entry.Payload.WorkingDir)), StartedAt: startedAt,
+		Origin: session.SessionOrigin{ParentSessionID: entry.Payload.ParentThreadID}, Scope: scope,
+		modTime: info.ModTime(), size: info.Size(), sourceInfo: info, invalid: true,
+	}, true
 }
 
 func hasConversation(s session.Session) bool {

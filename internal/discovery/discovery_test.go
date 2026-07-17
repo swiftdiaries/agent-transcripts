@@ -121,6 +121,24 @@ func TestDiscoverAllFamiliesExcludesCodexComponentWithCrossProjectParentEdge(t *
 	}
 }
 
+func TestDiscoverAllFamiliesExcludesCodexComponentWithMalformedDirectChild(t *testing.T) {
+	logs := t.TempDir()
+	project := t.TempDir()
+	writeSession(t, filepath.Join(logs, "rollout-valid.jsonl"), codexRootJSONL("valid-root", project), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-root.jsonl"), codexRootJSONL("malformed-root", project), 10*time.Minute)
+	writeSession(t, filepath.Join(logs, "rollout-malformed-child.jsonl"), `{"type":"session_meta","timestamp":"2026-07-12T10:00:00Z","payload":{"id":"malformed-child","parent_thread_id":"malformed-root","cwd":"`+project+`","thread_source":"subagent","source":{"subagent":{"other":"future"}}}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:01Z","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","timestamp":"2026-07-12T10:00:02Z","payload":{"type":"task_complete"}}`, 10*time.Minute)
+
+	got, err := DiscoverAllFamilies(context.Background(), Roots{Codex: []string{logs}}, fixedNow, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ProviderSessionID != "valid-root" {
+		t.Fatalf("families = %#v", got)
+	}
+}
+
 func TestFormFamiliesExcludesCodexComponentWithCrossProjectParentEdge(t *testing.T) {
 	inside := testScope()
 	outside := session.ProjectScope{Ref: session.ProjectRef{Kind: "directory", Key: "p_" + strings.Repeat("b", 64), DisplayName: "other"}}
