@@ -1,5 +1,5 @@
 .worktrees/
 .superpowers/
+.tokensave/
 bin/
 .go-cache
-.superpowers/sdd

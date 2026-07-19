@@ -120,10 +120,7 @@ type envelope struct {
 	Message       json.RawMessage `json:"message"`
 	Payload       json.RawMessage `json:"payload"`
 	AgentID       string          `json:"agentId"`
-	ToolUseResult struct {
-		AgentID string `json:"agentId"`
-		Status  string `json:"status"`
-	} `json:"toolUseResult"`
+	ToolUseResult json.RawMessage `json:"toolUseResult"`
 }
 
 type ClaudeChild struct {
@@ -144,6 +141,7 @@ func AttachClaudeChildren(main session.Session, children []ClaudeChild) ([]sessi
 			return nil, fmt.Errorf("duplicate Claude child agent ID %q", child.AgentID)
 		}
 		seen[child.AgentID] = struct{}{}
+		entry := session.ChildSession{AgentID: child.AgentID, ParentSessionID: main.ID, Session: child.Session}
 		var matchedResult *session.Event
 		for _, event := range main.Events {
 			if event.Kind == session.EventToolResult && event.AgentID == child.AgentID {
@@ -155,7 +153,8 @@ func AttachClaudeChildren(main session.Session, children []ClaudeChild) ([]sessi
 			}
 		}
 		if matchedResult == nil {
-			return nil, fmt.Errorf("Claude child has no parent result for agent %q", child.AgentID)
+			result = append(result, entry)
+			continue
 		}
 		var call *session.Event
 		for _, event := range main.Events {
@@ -168,7 +167,8 @@ func AttachClaudeChildren(main session.Session, children []ClaudeChild) ([]sessi
 			}
 		}
 		if call == nil {
-			return nil, fmt.Errorf("Claude child has no Agent or Task call for agent %q", child.AgentID)
+			result = append(result, entry)
+			continue
 		}
 		var input struct {
 			Description  string `json:"description"`
@@ -179,7 +179,10 @@ func AttachClaudeChildren(main session.Session, children []ClaudeChild) ([]sessi
 		if input.SubagentType != "" {
 			agentType = input.SubagentType
 		}
-		entry := session.ChildSession{AgentID: child.AgentID, ParentSessionID: main.ID, ParentToolCallID: call.ID, AgentType: agentType, Description: input.Description, Attached: true, Session: child.Session}
+		entry.ParentToolCallID = call.ID
+		entry.AgentType = agentType
+		entry.Description = input.Description
+		entry.Attached = true
 		switch matchedResult.ResultStatus {
 		case "completed", "failed", "cancelled", "interrupted":
 			entry.Session.Completion.Terminal = true

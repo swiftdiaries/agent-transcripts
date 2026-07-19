@@ -161,6 +161,24 @@ func TestAttachClaudeChildrenUsesStableToolIdentity(t *testing.T) {
 	}
 }
 
+func TestAttachClaudeChildrenKeepsMissingChainUnattached(t *testing.T) {
+	main := session.Session{ID: "main"}
+	children, err := AttachClaudeChildren(main, []ClaudeChild{{AgentID: "agent_1", Session: session.Session{SchemaVersion: 1, ID: "child", Provider: "claude"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].Attached || children[0].ParentToolCallID != "" || children[0].ParentSessionID != main.ID {
+		t.Fatalf("children = %+v", children)
+	}
+}
+
+func TestAttachClaudeChildrenRejectsAmbiguousParentResults(t *testing.T) {
+	main := session.Session{Events: []session.Event{{ID: "result_1", AgentID: "agent_1", Kind: session.EventToolResult}, {ID: "result_2", AgentID: "agent_1", Kind: session.EventToolResult}}}
+	if _, err := AttachClaudeChildren(main, []ClaudeChild{{AgentID: "agent_1", Session: session.Session{SchemaVersion: 1, ID: "child", Provider: "claude"}}}); err == nil {
+		t.Fatal("accepted ambiguous Claude parent results")
+	}
+}
+
 func TestClaudeParserPreservesParentResultStatus(t *testing.T) {
 	input := `{"type":"user","uuid":"result","sessionId":"claude_status","timestamp":"2026-07-17T08:00:01Z","toolUseResult":{"agentId":"agent_1","status":"completed"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"done"}]}}`
 	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
@@ -171,6 +189,17 @@ func TestClaudeParserPreservesParentResultStatus(t *testing.T) {
 		if event.ID == "result" && event.ResultStatus != "completed" {
 			t.Fatalf("status=%q", event.ResultStatus)
 		}
+	}
+}
+
+func TestClaudeParserAcceptsStringToolUseResult(t *testing.T) {
+	input := `{"type":"user","uuid":"result","sessionId":"claude_string_result","timestamp":"2026-07-17T08:00:01Z","toolUseResult":"command output","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"done"}]}}`
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 1 || got.Events[0].Kind != session.EventToolResult || got.Events[0].AgentID != "" || got.Events[0].ResultStatus != "" {
+		t.Fatalf("events = %+v", got.Events)
 	}
 }
 

@@ -35,6 +35,11 @@ type claudeBlock struct {
 	Thinking  string          `json:"thinking"`
 }
 
+type claudeToolUseResult struct {
+	AgentID string `json:"agentId"`
+	Status  string `json:"status"`
+}
+
 func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session.Session, error) {
 	got := session.Session{SchemaVersion: 1, Provider: "claude"}
 	for i, line := range lines {
@@ -104,6 +109,8 @@ func mapClaudeMessage(e envelope, line int, when time.Time) ([]session.Event, bo
 		return nil, false, fmt.Errorf("decode Claude content at line %d: %w", line, err)
 	}
 	var events []session.Event
+	var toolUseResult claudeToolUseResult
+	_ = json.Unmarshal(e.ToolUseResult, &toolUseResult)
 	for blockIndex, rawBlock := range rawBlocks {
 		var block claudeBlock
 		if err := json.Unmarshal(rawBlock, &block); err != nil {
@@ -125,7 +132,7 @@ func mapClaudeMessage(e envelope, line int, when time.Time) ([]session.Event, bo
 		case "tool_use":
 			events = append(events, session.Event{ID: blockID, ParentID: e.UUID, Kind: session.EventToolCall, Time: when, ToolName: block.Name, Input: block.Input})
 		case "tool_result":
-			events = append(events, session.Event{ID: blockID, ParentID: block.ToolUseID, AgentID: e.ToolUseResult.AgentID, Kind: session.EventToolResult, Time: when, Output: jsonValue(block.Content), ResultStatus: e.ToolUseResult.Status})
+			events = append(events, session.Event{ID: blockID, ParentID: block.ToolUseID, AgentID: toolUseResult.AgentID, Kind: session.EventToolResult, Time: when, Output: jsonValue(block.Content), ResultStatus: toolUseResult.Status})
 		default:
 			return nil, false, nil
 		}
