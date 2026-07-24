@@ -247,7 +247,7 @@ func (s *Service) ImportFamilyWithStatus(ctx context.Context, snapshot *discover
 	if err != nil {
 		return session.Metadata{}, false, err
 	}
-	md := session.Metadata{ID: id, ContentID: contentID, Provider: family.Provider, ProviderSessionID: family.ProviderSessionID, Title: attrs.Title, Description: attrs.Description, Tags: tags, StartedAt: family.StartedAt, EndedAt: family.EndedAt, UploaderKey: uploader, Destination: attrs.Destination, SourceChecksum: sources[0].Entry.Checksum, ParserVersion: 1, NormalizedSchemaVersion: 2}
+	md := session.Metadata{ID: id, ContentID: contentID, Provider: family.Provider, ProviderSessionID: family.ProviderSessionID, Title: attrs.Title, Description: attrs.Description, Tags: tags, StartedAt: family.StartedAt, EndedAt: family.EndedAt, UploaderKey: uploader, Destination: attrs.Destination, SourceChecksum: sources[0].Entry.Checksum, ParserVersion: parser.NormalizationVersion, NormalizedSchemaVersion: 2}
 	pkg := session.Package{ID: id, ContentID: contentID, Session: family.Main, Metadata: md, Normalized: normalized, SchemaVersion: 2, Family: family, SourceManifest: manifest, Sources: sources, SourceFactsSet: facts}
 	if err := session.ValidateFamily(family); err != nil {
 		return session.Metadata{}, false, fmt.Errorf("validate imported family: %w", err)

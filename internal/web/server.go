@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/auth"
+	"github.com/swiftdiaries/agent-transcripts/internal/catalog"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
+	"github.com/swiftdiaries/agent-transcripts/internal/pricing"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
 )
@@ -39,6 +41,8 @@ type ServerConfig struct {
 	FocusedFamily discovery.SessionFamilyCandidate
 	ProjectScope  *session.ProjectScope
 	AllProjects   bool
+	Catalog       *catalog.Loader
+	Pricing       pricing.Catalog
 }
 
 type server struct {
@@ -55,6 +59,8 @@ type server struct {
 	focused        *discovery.SessionFamilyCandidate
 	projectScope   *session.ProjectScope
 	allProjects    bool
+	catalog        *catalog.Loader
+	pricing        pricing.Catalog
 }
 
 func New(cfg ServerConfig) http.Handler {
@@ -67,14 +73,18 @@ func New(cfg ServerConfig) http.Handler {
 		quiet = 5 * time.Minute
 	}
 	templates := make(map[string]*template.Template)
-	for _, name := range []string{"home", "directory", "transcript", "upload"} {
-		templates[name] = template.Must(template.ParseFS(assets, "templates/layout.html", "templates/"+name+".html"))
+	for _, name := range []string{"home", "directory", "transcript", "upload", "dashboard"} {
+		templates[name] = template.Must(template.ParseFS(assets, "templates/layout.html", "templates/components.html", "templates/"+name+".html"))
 	}
 	mode := cfg.Mode
 	if mode == "" {
 		mode = "local"
 	}
-	s := &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates, mode: mode, csrf: cfg.CSRF, tokens: cfg.Tokens, discover: discovery.Discover}
+	loader := cfg.Catalog
+	if loader == nil {
+		loader = catalog.NewLoader(catalog.NewCache("", catalog.DefaultLimits))
+	}
+	s := &server{store: cfg.Store, libraryService: cfg.Library, roots: cfg.Roots, quietPeriod: quiet, now: now, templates: templates, mode: mode, csrf: cfg.CSRF, tokens: cfg.Tokens, discover: discovery.Discover, catalog: loader, pricing: cfg.Pricing}
 	if cfg.FocusedFamily.Provider != "" {
 		focused := cfg.FocusedFamily
 		s.focused = &focused

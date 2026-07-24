@@ -13,6 +13,10 @@ import (
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
 
+// NormalizationVersion identifies the parser rules used to produce normalized
+// session evidence persisted in imported packages.
+const NormalizationVersion = 2
+
 type ErrSourceTooLarge struct{}
 
 func (*ErrSourceTooLarge) Error() string {

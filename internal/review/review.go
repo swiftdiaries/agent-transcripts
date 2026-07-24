@@ -1,6 +1,7 @@
 package review
 
 import (
+	"fmt"
 	"sort"
 	"time"
 
@@ -32,6 +33,133 @@ type TranscriptNode struct {
 }
 
 type FamilyTranscript struct{ Root *TranscriptNode }
+
+// Author is the stable, filterable producer identity of a workspace event.
+// Agent IDs stay provider evidence on the underlying event; this projection
+// supplies the presentation/filter key without changing that source data.
+type Author struct {
+	Key     string
+	Label   string
+	AgentID string
+}
+
+type AgentStream struct {
+	Key              string
+	Label            string
+	AgentID          string
+	ParentKey        string
+	ParentToolCallID string
+	Depth            int
+	Node             *TranscriptNode
+}
+
+type ActivityItem struct {
+	Event      session.Event
+	Author     Author
+	StreamKey  string
+	SessionID  string
+	Depth      int
+	EventIndex int
+}
+
+type Workspace struct {
+	Family   FamilyTranscript
+	Agents   []AgentStream
+	Authors  []Author
+	Activity []ActivityItem
+}
+
+func ProjectWorkspace(family session.SessionFamily) Workspace {
+	projected := ProjectFamily(family)
+	sessions := map[string]session.Session{family.Main.ID: family.Main}
+	for _, child := range family.Children {
+		sessions[child.Session.ID] = child.Session
+	}
+	workspace := Workspace{Family: projected}
+	workspace.Authors = append(workspace.Authors,
+		Author{Key: "user", Label: "User"},
+		Author{Key: "main", Label: "Main agent"},
+	)
+	var visit func(*TranscriptNode, string, int)
+	visit = func(node *TranscriptNode, parentKey string, depth int) {
+		key := "main"
+		label := "Main agent"
+		if node != projected.Root {
+			key = "agent:" + node.AgentID
+			label = "Agent " + node.AgentID
+			workspace.Authors = append(workspace.Authors, Author{Key: key, Label: label, AgentID: node.AgentID})
+		}
+		workspace.Agents = append(workspace.Agents, AgentStream{
+			Key: key, Label: label, AgentID: node.AgentID, ParentKey: parentKey,
+			ParentToolCallID: node.ParentToolCallID, Depth: depth, Node: node,
+		})
+		for index, event := range sessions[node.SessionID].Events {
+			author := Author{Key: key, Label: label, AgentID: node.AgentID}
+			if event.Kind == session.EventUser {
+				author = workspace.Authors[0]
+			}
+			workspace.Activity = append(workspace.Activity, ActivityItem{
+				Event: event, Author: author, StreamKey: key, SessionID: node.SessionID,
+				Depth: depth, EventIndex: index,
+			})
+		}
+		attachedIDs := make([]string, 0, len(node.Attached))
+		for id := range node.Attached {
+			attachedIDs = append(attachedIDs, id)
+		}
+		sort.Strings(attachedIDs)
+		for _, id := range attachedIDs {
+			for _, child := range node.Attached[id] {
+				visit(child, key, depth+1)
+			}
+		}
+		for _, child := range node.Children {
+			visit(child, key, depth+1)
+		}
+	}
+	visit(projected.Root, "", 0)
+	sort.SliceStable(workspace.Activity, func(i, j int) bool {
+		left, right := workspace.Activity[i], workspace.Activity[j]
+		if left.Event.Time.IsZero() || right.Event.Time.IsZero() {
+			return !left.Event.Time.IsZero() && right.Event.Time.IsZero()
+		}
+		if !left.Event.Time.Equal(right.Event.Time) {
+			return left.Event.Time.Before(right.Event.Time)
+		}
+		if left.Depth != right.Depth {
+			return left.Depth < right.Depth
+		}
+		if left.StreamKey != right.StreamKey {
+			return left.StreamKey < right.StreamKey
+		}
+		return left.EventIndex < right.EventIndex
+	})
+	return workspace
+}
+
+func (w Workspace) Stream(key string) (AgentStream, bool) {
+	for _, stream := range w.Agents {
+		if stream.Key == key {
+			return stream, true
+		}
+	}
+	return AgentStream{}, false
+}
+
+func (w Workspace) FilterActivity(authorKey string) ([]ActivityItem, error) {
+	for _, author := range w.Authors {
+		if author.Key == authorKey {
+			filtered := make([]ActivityItem, 0)
+			for _, item := range w.Activity {
+				if item.Author.Key == authorKey {
+					filtered = append(filtered, item)
+				}
+			}
+			return filtered, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown workspace author %q", authorKey)
+}
 
 func ProjectFamily(family session.SessionFamily) FamilyTranscript {
 	root := transcriptNode(family.Main, "", "", "")

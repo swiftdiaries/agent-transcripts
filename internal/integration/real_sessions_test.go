@@ -74,8 +74,20 @@ func TestRealClaudeSessionResolves(t *testing.T) {
 	for index, child := range family.Children {
 		children = append(children, parser.ClaudeChild{AgentID: child.AgentID, Session: parseRealSource(t, snapshot.Sources[index+1])})
 	}
-	if _, err := parser.AttachClaudeChildren(main, children); err != nil {
+	attached, err := parser.AttachClaudeChildren(main, children)
+	if err != nil {
 		t.Fatalf("attach real Claude children: %v", err)
+	}
+	sessions := []session.Session{main}
+	for _, child := range attached {
+		sessions = append(sessions, child.Session)
+	}
+	for _, parsed := range sessions {
+		for _, sample := range parsed.Usage {
+			if sample.Tokens.Input < 0 || sample.Tokens.Output < 0 {
+				t.Fatalf("negative usage: %#v", sample)
+			}
+		}
 	}
 
 	handler := web.New(web.ServerConfig{FocusedFamily: family})

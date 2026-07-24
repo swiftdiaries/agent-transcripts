@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
@@ -21,8 +22,18 @@ func (claudeParser) Detect(first json.RawMessage) bool {
 }
 
 type claudeMessage struct {
+	ID      string          `json:"id"`
 	Role    string          `json:"role"`
+	Model   string          `json:"model"`
 	Content json.RawMessage `json:"content"`
+	Usage   claudeUsage     `json:"usage"`
+}
+
+type claudeUsage struct {
+	Input      int64 `json:"input_tokens"`
+	Output     int64 `json:"output_tokens"`
+	CacheRead  int64 `json:"cache_read_input_tokens"`
+	CacheWrite int64 `json:"cache_creation_input_tokens"`
 }
 type claudeBlock struct {
 	Type      string          `json:"type"`
@@ -42,6 +53,7 @@ type claudeToolUseResult struct {
 
 func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session.Session, error) {
 	got := session.Session{SchemaVersion: 1, Provider: "claude"}
+	usageIndex := map[string]int{}
 	for i, line := range lines {
 		if line == nil {
 			continue
@@ -72,12 +84,43 @@ func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session
 			got.Completion.Terminal, got.Completion.TerminalReason = true, e.Subtype
 			continue
 		}
-		events, mapped, err := mapClaudeMessage(e, lineNumber, when)
+		var message claudeMessage
+		if e.Type == "user" || e.Type == "assistant" {
+			if err := json.Unmarshal(e.Message, &message); err != nil {
+				return session.Session{}, fmt.Errorf("decode Claude message at line %d: %w", lineNumber, err)
+			}
+		}
+		if e.Type == "user" && isClaudeInjectedInstructions(message) {
+			got.Events = append(got.Events, rawEvent(eventID(e.UUID, lineNumber), e.ParentUUID, "claude_injected_instructions", when, line))
+			continue
+		}
+		events, mapped, err := mapClaudeMessage(e, message, lineNumber, when)
 		if err != nil {
 			return session.Session{}, err
 		}
 		if mapped {
 			got.Events = append(got.Events, events...)
+			if e.Type == "assistant" {
+				sampleID := message.ID
+				if sampleID == "" {
+					sampleID = eventID(e.UUID, lineNumber)
+				}
+				sample := session.UsageSample{
+					ID: sampleID, Time: when, Model: message.Model,
+					Tokens: session.TokenUsage{Input: message.Usage.Input, Output: message.Usage.Output, CacheRead: message.Usage.CacheRead, CacheWrite: message.Usage.CacheWrite},
+				}
+				if sample.Tokens.Total() > 0 {
+					if index, ok := usageIndex[sampleID]; ok {
+						if got.Usage[index].Model != "" && sample.Model != "" && got.Usage[index].Model != sample.Model {
+							return session.Session{}, fmt.Errorf("Claude line %d usage model conflicts message %q", lineNumber, sampleID)
+						}
+						got.Usage[index] = sample
+					} else {
+						usageIndex[sampleID] = len(got.Usage)
+						got.Usage = append(got.Usage, sample)
+					}
+				}
+			}
 			continue
 		}
 		got.Events = append(got.Events, rawEvent(eventID(e.UUID, lineNumber), e.ParentUUID, e.Type, when, line))
@@ -88,13 +131,20 @@ func (claudeParser) Parse(ctx context.Context, lines []json.RawMessage) (session
 	return got, nil
 }
 
-func mapClaudeMessage(e envelope, line int, when time.Time) ([]session.Event, bool, error) {
+func isClaudeInjectedInstructions(message claudeMessage) bool {
+	var text string
+	if json.Unmarshal(message.Content, &text) != nil {
+		return false
+	}
+	text = strings.TrimSpace(text)
+	return strings.HasPrefix(text, "# AGENTS.md instructions") &&
+		strings.Contains(text, "<!-- headroom:rtk-instructions -->") &&
+		strings.Contains(text, "# RTK (Rust Token Killer) - Token-Optimized Commands")
+}
+
+func mapClaudeMessage(e envelope, message claudeMessage, line int, when time.Time) ([]session.Event, bool, error) {
 	if e.Type != "user" && e.Type != "assistant" {
 		return nil, false, nil
-	}
-	var message claudeMessage
-	if err := json.Unmarshal(e.Message, &message); err != nil {
-		return nil, false, fmt.Errorf("decode Claude message at line %d: %w", line, err)
 	}
 	var text string
 	if err := json.Unmarshal(message.Content, &text); err == nil {

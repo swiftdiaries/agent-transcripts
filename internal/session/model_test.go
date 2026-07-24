@@ -9,6 +9,53 @@ import (
 	"unicode/utf8"
 )
 
+func TestTokenUsageTotalDoesNotDoubleCountReasoningOrCachedInput(t *testing.T) {
+	got := (TokenUsage{
+		Input:           10,
+		Output:          4,
+		CacheRead:       20,
+		CacheWrite:      3,
+		ReasoningOutput: 2,
+	}).Total()
+	if got != 37 {
+		t.Fatalf("Total() = %d, want 37", got)
+	}
+}
+
+func TestValidateAcceptsUsageAndRejectsInvalidSamples(t *testing.T) {
+	valid := Session{
+		SchemaVersion: 1,
+		ID:            "session-1",
+		Provider:      "claude",
+		Events:        []Event{{ID: "prompt", Kind: EventUser}},
+		Usage: []UsageSample{{
+			ID:    "message-1",
+			Time:  time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC),
+			Model: "claude-opus-4-7",
+			Tokens: TokenUsage{
+				Input: 5, Output: 3, CacheRead: 7,
+			},
+		}},
+	}
+	if err := Validate(valid); err != nil {
+		t.Fatalf("Validate(valid) = %v", err)
+	}
+
+	for _, mutate := range []func(*Session){
+		func(s *Session) { s.Usage[0].ID = "" },
+		func(s *Session) { s.Usage[0].Time = time.Time{} },
+		func(s *Session) { s.Usage[0].Tokens.Output = -1 },
+		func(s *Session) { s.Usage = append(s.Usage, s.Usage[0]) },
+	} {
+		got := valid
+		got.Usage = append([]UsageSample(nil), valid.Usage...)
+		mutate(&got)
+		if err := Validate(got); err == nil {
+			t.Fatal("Validate accepted invalid usage")
+		}
+	}
+}
+
 func TestNormalizeTags(t *testing.T) {
 	got, err := NormalizeTags([]string{" Rust ", "frontend", "rust", "project-1123"})
 	if err != nil {

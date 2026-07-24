@@ -14,12 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/swiftdiaries/agent-transcripts/internal/catalog"
 	"github.com/swiftdiaries/agent-transcripts/internal/config"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
+	"github.com/swiftdiaries/agent-transcripts/internal/pricing"
 	"github.com/swiftdiaries/agent-transcripts/internal/publish"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
+	"github.com/swiftdiaries/agent-transcripts/internal/web"
 )
 
 func TestRunRejectsUnknownCommand(t *testing.T) {
@@ -32,11 +35,119 @@ func TestRunRejectsUnknownCommand(t *testing.T) {
 	}
 }
 
-func TestRunWithoutSubcommandBrowses(t *testing.T) {
-	calls := 0
-	code := runWithBrowse(t, nil, func(context.Context, browseOptions) int { calls++; return 0 })
-	if code != 0 || calls != 1 {
-		t.Fatalf("code=%d calls=%d", code, calls)
+func TestRunCommandDispatchesDashboardByDefaultAndGlobalExplicitly(t *testing.T) {
+	var got []dashboardOptions
+	dashboard := func(_ context.Context, opts dashboardOptions) int {
+		got = append(got, opts)
+		return 0
+	}
+	browse := func(context.Context, browseOptions) int { return 0 }
+
+	if code := runCommand(DefaultDependencies(), context.Background(), nil, nil, io.Discard, io.Discard, dashboard, browse); code != 0 {
+		t.Fatalf("default code = %d", code)
+	}
+	if code := runCommand(DefaultDependencies(), context.Background(), []string{"--global"}, nil, io.Discard, io.Discard, dashboard, browse); code != 0 {
+		t.Fatalf("global code = %d", code)
+	}
+	if len(got) != 2 || got[0].Global || !got[1].Global {
+		t.Fatalf("dashboard options = %#v", got)
+	}
+}
+
+func TestRootRejectsUnknownFlagsAndGlobalOperands(t *testing.T) {
+	for _, args := range [][]string{{"--other"}, {"--global", "extra"}} {
+		if code := runWithDashboard(t, args); code != 2 {
+			t.Fatalf("%v code = %d, want 2", args, code)
+		}
+	}
+}
+
+func TestRunDashboardConfiguresScopedAndGlobalURLs(t *testing.T) {
+	deps := Dependencies{
+		Catalog:          catalog.NewLoader(catalog.NewCache("", catalog.DefaultLimits)),
+		PricingCacheFile: filepath.Join(t.TempDir(), "pricing.json"),
+	}
+	root := t.TempDir()
+	wantScope, err := discovery.ResolveProjectScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		opts      dashboardOptions
+		wantURL   string
+		wantScope bool
+	}{
+		{name: "scoped", wantURL: "http://127.0.0.1:12345/live", wantScope: true},
+		{name: "global", opts: dashboardOptions{Global: true}, wantURL: "http://127.0.0.1:12345/live/projects"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			var got web.ServerConfig
+			var opened string
+			code := runDashboardWithServer(ctx, test.opts, deps, &bytes.Buffer{}, &bytes.Buffer{}, func(url string, _ io.Writer) {
+				opened = url
+			}, func(string, string) (net.Listener, error) {
+				return newTestListener(), nil
+			}, func() (string, error) {
+				if test.opts.Global {
+					t.Fatal("global dashboard resolved a project scope")
+				}
+				return root, nil
+			}, func(cfg web.ServerConfig) http.Handler {
+				got = cfg
+				return http.NotFoundHandler()
+			})
+			if code != 0 || opened != test.wantURL {
+				t.Fatalf("code=%d opened=%q, want %q", code, opened, test.wantURL)
+			}
+			if got.Catalog != deps.Catalog || (got.ProjectScope != nil) != test.wantScope || got.AllProjects != test.opts.Global {
+				t.Fatalf("server config = %#v", got)
+			}
+			if test.wantScope && got.ProjectScope.Ref != wantScope.Ref {
+				t.Fatalf("scope = %#v, want %#v", got.ProjectScope, wantScope)
+			}
+		})
+	}
+}
+
+func TestRunPricingValidatesRefreshAndReportsModelCount(t *testing.T) {
+	deps := Dependencies{PricingCacheFile: filepath.Join(t.TempDir(), "pricing.json")}
+	called := false
+	refresh := func(_ context.Context, client *http.Client, sourceURL, destination string, now time.Time) (pricing.Catalog, error) {
+		called = true
+		if client.Timeout != 10*time.Second || sourceURL != pricing.LiteLLMURL || destination != deps.PricingCacheFile || now.IsZero() {
+			t.Fatalf("refresh args: timeout=%s source=%q destination=%q now=%s", client.Timeout, sourceURL, destination, now)
+		}
+		return pricing.Catalog{Models: map[string]pricing.Rate{"one": {}, "two": {}}}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runPricingWithRefresh(context.Background(), []string{"refresh"}, deps, &stdout, &stderr, refresh); code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	if !called || stdout.String() != "updated pricing for 2 models from LiteLLM\n" {
+		t.Fatalf("called=%v stdout=%q", called, stdout.String())
+	}
+	called = false
+	for _, args := range [][]string{nil, {"refresh", "extra"}, {"other"}} {
+		if code := runPricingWithRefresh(context.Background(), args, deps, &bytes.Buffer{}, &bytes.Buffer{}, refresh); code != 2 || called {
+			t.Fatalf("args=%v code=%d called=%v", args, code, called)
+		}
+	}
+}
+
+func TestFocusedServerConfigUsesInjectedCatalog(t *testing.T) {
+	provided := catalog.NewLoader(catalog.NewCache("", catalog.DefaultLimits))
+	cfg, err := focusedServerConfig(discovery.SessionFamilyCandidate{}, Dependencies{
+		Catalog:          provided,
+		PricingCacheFile: filepath.Join(t.TempDir(), "pricing.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Catalog != provided || len(cfg.Pricing.Models) == 0 {
+		t.Fatalf("server config = %#v", cfg)
 	}
 }
 
@@ -52,7 +163,10 @@ func TestTopLevelFlagsShowHelpOrVersionWithoutBrowsing(t *testing.T) {
 		t.Run(strings.Join(test.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			browseCalls := 0
-			code := runCommand(DefaultDependencies(), context.Background(), test.args, nil, &stdout, &stderr, func(context.Context, browseOptions) int {
+			code := runCommand(DefaultDependencies(), context.Background(), test.args, nil, &stdout, &stderr, func(context.Context, dashboardOptions) int {
+				t.Fatal("dashboard should not run")
+				return 0
+			}, func(context.Context, browseOptions) int {
 				browseCalls++
 				return 0
 			})
@@ -74,7 +188,10 @@ func TestCommandHelpShowsCommandUsageAndFlagsWithoutRunningCommand(t *testing.T)
 			for _, helpFlag := range []string{"-h", "--help"} {
 				var stdout, stderr bytes.Buffer
 				browseCalls := 0
-				code := runCommand(DefaultDependencies(), context.Background(), []string{command, helpFlag}, nil, &stdout, &stderr, func(context.Context, browseOptions) int {
+				code := runCommand(DefaultDependencies(), context.Background(), []string{command, helpFlag}, nil, &stdout, &stderr, func(context.Context, dashboardOptions) int {
+					t.Fatal("dashboard should not run")
+					return 0
+				}, func(context.Context, browseOptions) int {
 					browseCalls++
 					return 0
 				})
@@ -177,9 +294,18 @@ func TestFamilyForPathDerivesScopeFromOwnedSnapshot(t *testing.T) {
 	}
 }
 
-func runWithBrowse(t *testing.T, args []string, browse func(context.Context, browseOptions) int) int {
+func runWithDashboard(t *testing.T, args []string) int {
 	t.Helper()
-	return runCommand(DefaultDependencies(), context.Background(), args, nil, &bytes.Buffer{}, &bytes.Buffer{}, browse)
+	return runCommand(
+		Dependencies{Library: store.NewFilesystem(t.TempDir())},
+		context.Background(),
+		args,
+		nil,
+		&bytes.Buffer{},
+		&bytes.Buffer{},
+		func(context.Context, dashboardOptions) int { return 0 },
+		func(context.Context, browseOptions) int { return 0 },
+	)
 }
 
 func TestImportExplicitPathUsesEligibilityGate(t *testing.T) {

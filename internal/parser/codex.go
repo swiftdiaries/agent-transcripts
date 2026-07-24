@@ -50,8 +50,27 @@ type codexContent struct {
 	Text string `json:"text"`
 }
 
+type codexTurnContext struct {
+	TurnID string `json:"turn_id"`
+	Model  string `json:"model"`
+}
+
+type codexTokenCount struct {
+	Type string `json:"type"`
+	Info struct {
+		Last *struct {
+			Input           int64 `json:"input_tokens"`
+			CachedInput     int64 `json:"cached_input_tokens"`
+			CacheWriteInput int64 `json:"cache_write_input_tokens"`
+			Output          int64 `json:"output_tokens"`
+			ReasoningOutput int64 `json:"reasoning_output_tokens"`
+		} `json:"last_token_usage"`
+	} `json:"info"`
+}
+
 func (codexParser) Parse(ctx context.Context, lines []json.RawMessage) (session.Session, error) {
 	got := session.Session{SchemaVersion: 1, Provider: "codex"}
+	var currentTurnID, currentModel string
 	for i, line := range lines {
 		if line == nil {
 			continue
@@ -73,6 +92,30 @@ func (codexParser) Parse(ctx context.Context, lines []json.RawMessage) (session.
 		if len(e.Payload) != 0 {
 			if err := json.Unmarshal(e.Payload, &p); err != nil {
 				return session.Session{}, fmt.Errorf("decode Codex payload at line %d: %w", lineNumber, err)
+			}
+		}
+		if e.Type == "turn_context" {
+			var turn codexTurnContext
+			if err := json.Unmarshal(e.Payload, &turn); err != nil {
+				return session.Session{}, fmt.Errorf("decode Codex turn context at line %d: %w", lineNumber, err)
+			}
+			currentTurnID, currentModel = turn.TurnID, turn.Model
+		}
+		if e.Type == "event_msg" {
+			var count codexTokenCount
+			if err := json.Unmarshal(e.Payload, &count); err != nil {
+				return session.Session{}, fmt.Errorf("decode Codex token count at line %d: %w", lineNumber, err)
+			}
+			if count.Type == "token_count" && count.Info.Last != nil {
+				usage := count.Info.Last
+				uncached := usage.Input - usage.CachedInput - usage.CacheWriteInput
+				if uncached < 0 {
+					return session.Session{}, fmt.Errorf("Codex line %d cached input exceeds input tokens", lineNumber)
+				}
+				got.Usage = append(got.Usage, session.UsageSample{
+					ID: fmt.Sprintf("%s-token-%d", currentTurnID, lineNumber), Time: when, Model: currentModel,
+					Tokens: session.TokenUsage{Input: uncached, Output: usage.Output, CacheRead: usage.CachedInput, CacheWrite: usage.CacheWriteInput, ReasoningOutput: usage.ReasoningOutput},
+				})
 			}
 		}
 		if e.Type == "session_meta" {

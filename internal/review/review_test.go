@@ -2,12 +2,70 @@ package review
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 )
+
+func TestProjectWorkspaceBuildsAgentTreeAndChronologicalAuthors(t *testing.T) {
+	got := ProjectWorkspace(workspaceFixture())
+	if len(got.Agents) != 3 {
+		t.Fatalf("agents = %#v", got.Agents)
+	}
+	if got.Agents[0].Key != "main" || got.Agents[1].Key != "agent:worker" || got.Agents[2].Key != "agent:guardian" {
+		t.Fatalf("agent order = %#v", got.Agents)
+	}
+	if got.Agents[2].ParentKey != "agent:worker" || got.Agents[2].Depth != 2 {
+		t.Fatalf("nested agent = %#v", got.Agents[2])
+	}
+	var keys []string
+	for _, item := range got.Activity {
+		keys = append(keys, item.StreamKey+":"+item.Event.ID+":"+item.Author.Key)
+	}
+	want := []string{
+		"main:main-user:user",
+		"agent:worker:worker-user:user",
+		"main:main-answer:main",
+		"agent:worker:worker-answer:agent:worker",
+		"agent:guardian:guardian-answer:agent:guardian",
+	}
+	if !reflect.DeepEqual(keys, want) {
+		t.Fatalf("activity = %v, want %v", keys, want)
+	}
+}
+
+func TestFilterActivityRejectsUnknownAuthor(t *testing.T) {
+	workspace := ProjectWorkspace(workspaceFixture())
+	if _, err := workspace.FilterActivity("agent:missing"); err == nil {
+		t.Fatal("unknown author was accepted")
+	}
+	items, err := workspace.FilterActivity("user")
+	if err != nil || len(items) != 2 {
+		t.Fatalf("user activity = %#v, %v", items, err)
+	}
+}
+
+func workspaceFixture() session.SessionFamily {
+	start := time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC)
+	main := session.Session{ID: "main", Provider: "codex", Events: []session.Event{
+		{ID: "main-user", Kind: session.EventUser, Time: start, Text: "Plan work"},
+		{ID: "main-answer", Kind: session.EventAssistant, Time: start.Add(time.Minute), Text: "Delegating"},
+	}}
+	worker := session.Session{ID: "worker-session", Events: []session.Event{
+		{ID: "worker-user", Kind: session.EventUser, Time: start, Text: "Implement"},
+		{ID: "worker-answer", Kind: session.EventAssistant, Time: start.Add(time.Minute), Text: "Done"},
+	}}
+	guardian := session.Session{ID: "guardian-session", Events: []session.Event{
+		{ID: "guardian-answer", Kind: session.EventAssistant, Time: start.Add(time.Minute), Text: "Reviewed"},
+	}}
+	return session.SessionFamily{Provider: "codex", Main: main, Children: []session.ChildSession{
+		{AgentID: "worker", Session: worker},
+		{AgentID: "guardian", ParentSessionID: worker.ID, Session: guardian},
+	}}
+}
 
 func TestProjectStartsTurnsOnlyAtVisiblePrompts(t *testing.T) {
 	s := session.Session{Provider: "codex", Events: []session.Event{

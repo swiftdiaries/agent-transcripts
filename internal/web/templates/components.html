@@ -1,0 +1,14 @@
+{{define "usage-ledger"}}
+<dl class="usage-ledger" aria-label="Usage summary">
+  <div><dt>Tokens</dt><dd>{{.TokenLabel}}</dd></div>
+  <div><dt>Estimated cost</dt><dd>{{.CostLabel}}</dd></div>
+  <div><dt>Sessions</dt><dd>{{.Raw.Sessions}}</dd></div>
+  <div><dt>Models</dt><dd>{{.ModelLabel}}</dd></div>
+  <div><dt>Agent streams</dt><dd>{{.Raw.AgentStreams}}</dd></div>
+  <div><dt>Input</dt><dd>{{.InputLabel}}</dd></div>
+  <div><dt>Output</dt><dd>{{.OutputLabel}}</dd></div>
+  <div><dt>Cache read</dt><dd>{{.CacheReadLabel}}</dd></div>
+  <div><dt>Cache write</dt><dd>{{.CacheWriteLabel}}</dd></div>
+</dl>
+<p class="pricing-note">{{.PricingSourceLabel}}. {{.CoverageLabel}}</p>
+{{end}}

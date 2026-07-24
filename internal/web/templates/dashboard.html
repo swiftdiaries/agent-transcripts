@@ -1,0 +1,38 @@
+{{define "dashboard"}}{{template "layout" .}}{{end}}
+{{define "content"}}
+<section class="page-intro dashboard-intro">
+  <p class="eyebrow">{{.Dashboard.Scope}} / USAGE LEDGER</p>
+  <h1>{{.Dashboard.Heading}}</h1>
+  <p>{{.Dashboard.QuotaNote}}</p>
+</section>
+<form class="range-picker" method="get">
+  <label>Time range
+    <select name="range">
+      <option value="7d" {{if eq .Dashboard.Range.Key "7d"}}selected{{end}}>7 days</option>
+      <option value="30d" {{if eq .Dashboard.Range.Key "30d"}}selected{{end}}>30 days</option>
+      <option value="90d" {{if eq .Dashboard.Range.Key "90d"}}selected{{end}}>90 days</option>
+      <option value="all" {{if eq .Dashboard.Range.Key "all"}}selected{{end}}>All time</option>
+      <option value="custom" {{if eq .Dashboard.Range.Key "custom"}}selected{{end}}>Custom</option>
+    </select>
+  </label>
+  <label>From <input type="date" name="from" value="{{.From}}"></label>
+  <label>To <input type="date" name="to" value="{{.To}}"></label>
+  <button type="submit">Apply range</button>
+</form>
+{{range .Dashboard.Warnings}}<p class="notice notice-warning">{{.}}</p>{{end}}
+{{template "usage-ledger" .Dashboard.Summary}}
+<section class="activity-strip" aria-labelledby="activity-heading">
+  <h2 id="activity-heading">Daily activity</h2>
+<ol>{{range .Dashboard.Summary.Daily}}<li><meter min="0" max="1" value="{{.RelativeActivity}}" aria-label="{{.DateLabel}}: {{.TokenLabel}}"></meter><time>{{.DateLabel}}</time><strong>{{.TokenLabel}}</strong></li>{{end}}</ol>
+</section>
+{{if .Dashboard.Projects}}
+<section aria-labelledby="projects-heading">
+  <h2 id="projects-heading">Projects</h2>
+  <ol class="ledger-list">{{range .Dashboard.Projects}}<li><a href="{{.URL}}"><strong>{{.Project.DisplayName}}</strong><span>{{.Summary.TokenLabel}} · {{.Summary.CostLabel}}</span></a></li>{{end}}</ol>
+</section>
+{{end}}
+<section aria-labelledby="sessions-heading">
+  <h2 id="sessions-heading">Sessions</h2>
+  <ol class="ledger-list session-ledger-list">{{range .Dashboard.Families}}<li><a href="{{.URL}}"><span class="receipt-strip session-metadata">{{.Provider}} {{.Status}}</span><strong class="session-title">{{.Title}}</strong><span class="ledger-summary">{{.Summary.TokenLabel}} · {{.Summary.CostLabel}}</span></a></li>{{else}}<li class="empty-state">No sessions in this range.</li>{{end}}</ol>
+</section>
+{{end}}

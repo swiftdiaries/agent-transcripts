@@ -44,6 +44,30 @@ type Event struct {
 	Raw          json.RawMessage `json:"raw,omitempty"`
 }
 
+// TokenUsage is provider-normalized token evidence for one completed usage
+// snapshot. ReasoningOutput is a subset of provider output and is therefore
+// intentionally excluded from Total.
+type TokenUsage struct {
+	Input           int64 `json:"input"`
+	Output          int64 `json:"output"`
+	CacheRead       int64 `json:"cache_read,omitempty"`
+	CacheWrite      int64 `json:"cache_write,omitempty"`
+	ReasoningOutput int64 `json:"reasoning_output,omitempty"`
+}
+
+func (u TokenUsage) Total() int64 {
+	return u.Input + u.Output + u.CacheRead + u.CacheWrite
+}
+
+// UsageSample identifies one provider usage snapshot independently of the
+// visible event stream, whose records may be repeated or partial.
+type UsageSample struct {
+	ID     string     `json:"id"`
+	Time   time.Time  `json:"time"`
+	Model  string     `json:"model,omitempty"`
+	Tokens TokenUsage `json:"tokens"`
+}
+
 type Completion struct {
 	Terminal       bool      `json:"terminal"`
 	TerminalReason string    `json:"terminal_reason,omitempty"`
@@ -102,6 +126,7 @@ type Session struct {
 	StartedAt         time.Time     `json:"started_at,omitempty"`
 	EndedAt           time.Time     `json:"ended_at,omitempty"`
 	Events            []Event       `json:"events"`
+	Usage             []UsageSample `json:"usage,omitempty"`
 	Completion        Completion    `json:"completion"`
 	Origin            SessionOrigin `json:"origin,omitempty"`
 }

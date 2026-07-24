@@ -10,14 +10,17 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/auth"
+	"github.com/swiftdiaries/agent-transcripts/internal/catalog"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/parser"
+	"github.com/swiftdiaries/agent-transcripts/internal/pricing"
 	"github.com/swiftdiaries/agent-transcripts/internal/review"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
@@ -40,14 +43,14 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/live/projects", http.StatusFound)
 			return
 		}
-		s.liveList(w, r)
+		s.liveDashboard(w, r)
 		return
 	case "/live/projects":
 		if !s.allProjects {
 			http.NotFound(w, r)
 			return
 		}
-		s.liveProjectIndex(w, r)
+		s.globalDashboard(w, r)
 		return
 	case "/library":
 		s.library(w, r)
@@ -69,7 +72,7 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 	switch {
 	case len(parts) == 3 && parts[0] == "live" && parts[1] == "projects" && s.allProjects:
-		s.liveProjectFamilies(w, r, parts[2])
+		s.projectDashboard(w, r, parts[2])
 	case len(parts) == 5 && parts[0] == "live" && parts[1] == "projects" && parts[3] == "families" && s.allProjects:
 		s.liveProjectFamily(w, r, parts[2], parts[4])
 	case len(parts) == 3 && parts[0] == "live" && parts[1] == "families" && !s.allProjects:
@@ -571,12 +574,17 @@ func (s *server) liveFamily(w http.ResponseWriter, r *http.Request, key string) 
 }
 
 func (s *server) renderLiveFamily(w http.ResponseWriter, r *http.Request, family discovery.SessionFamilyCandidate) {
-	parsed, err := parseLiveFamily(r.Context(), family)
+	parsed, err := s.parseFamily(r.Context(), family)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "transcript", transcriptFamilyPage(parsed, family.Title))
+	p, err := buildWorkspacePage(parsed, family.Title, r.URL.Query(), s.pricing)
+	if err != nil {
+		http.Error(w, "invalid workspace view", http.StatusBadRequest)
+		return
+	}
+	s.render(w, "transcript", p)
 }
 
 func parseLiveFamily(ctx context.Context, candidate discovery.SessionFamilyCandidate) (session.SessionFamily, error) {
@@ -644,12 +652,24 @@ func (s *server) liveFamilies(ctx context.Context) ([]discovery.SessionFamilyCan
 }
 
 func (s *server) focusedSession(w http.ResponseWriter, r *http.Request) {
-	parsed, err := parseLiveFamily(r.Context(), *s.focused)
+	parsed, err := s.parseFamily(r.Context(), *s.focused)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "transcript", transcriptFamilyPage(parsed, s.focused.Title))
+	p, err := buildWorkspacePage(parsed, s.focused.Title, r.URL.Query(), s.pricing)
+	if err != nil {
+		http.Error(w, "invalid workspace view", http.StatusBadRequest)
+		return
+	}
+	s.render(w, "transcript", p)
+}
+
+func (s *server) parseFamily(ctx context.Context, candidate discovery.SessionFamilyCandidate) (session.SessionFamily, error) {
+	if candidate.Project.Kind == "" {
+		return catalog.ParseFamily(ctx, candidate)
+	}
+	return s.catalog.Load(ctx, candidate)
 }
 
 func (s *server) importLive(w http.ResponseWriter, r *http.Request) {
@@ -758,9 +778,14 @@ func (s *server) transcript(w http.ResponseWriter, r *http.Request, id string) {
 		s.internalError(w, err)
 		return
 	}
-	p := transcriptPage(pkg.Session, pkg.Metadata.Title)
+	family := session.SessionFamily{Main: pkg.Session}
 	if pkg.SchemaVersion == 2 {
-		p = transcriptFamilyPage(pkg.Family, pkg.Metadata.Title)
+		family = pkg.Family
+	}
+	p, err := buildWorkspacePage(family, pkg.Metadata.Title, r.URL.Query(), s.pricing)
+	if err != nil {
+		http.Error(w, "invalid workspace view", http.StatusBadRequest)
+		return
 	}
 	if s.csrf != nil {
 		p.CSRFToken = s.csrf.Token(w, r)
@@ -777,6 +802,10 @@ type page struct {
 	IsLive     bool
 	Transcript transcript
 	CSRFToken  string
+	Dashboard  dashboardView
+	Workspace  workspaceView
+	From       string
+	To         string
 }
 type transcript struct {
 	Title       string
@@ -819,6 +848,14 @@ func transcriptPage(value session.Session, title string) page {
 }
 
 func transcriptFamilyPage(value session.SessionFamily, title string) page {
+	p, err := buildWorkspacePage(value, title, url.Values{}, pricing.Catalog{})
+	if err != nil {
+		return legacyTranscriptFamilyPage(value, title)
+	}
+	return p
+}
+
+func legacyTranscriptFamilyPage(value session.SessionFamily, title string) page {
 	if title == "" {
 		title = "Transcript"
 	}

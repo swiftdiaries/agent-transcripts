@@ -89,8 +89,40 @@ func Validate(s Session) error {
 			return fmt.Errorf("event %d: %w", i, err)
 		}
 	}
+	if err := validateUsage(s.Usage); err != nil {
+		return err
+	}
 	if err := validateSessionOrigin(s.Origin); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateUsage(samples []UsageSample) error {
+	seen := make(map[string]struct{}, len(samples))
+	for i, sample := range samples {
+		if err := validateID("usage sample ID", sample.ID); err != nil {
+			return fmt.Errorf("usage sample %d: %w", i, err)
+		}
+		if sample.Time.IsZero() {
+			return fmt.Errorf("usage sample %d: timestamp required", i)
+		}
+		if !utf8.ValidString(sample.Model) || len(sample.Model) > MaxDescriptionBytes {
+			return fmt.Errorf("usage sample %d: invalid model", i)
+		}
+		for label, value := range map[string]int64{
+			"input": sample.Tokens.Input, "output": sample.Tokens.Output,
+			"cache read": sample.Tokens.CacheRead, "cache write": sample.Tokens.CacheWrite,
+			"reasoning output": sample.Tokens.ReasoningOutput,
+		} {
+			if value < 0 {
+				return fmt.Errorf("usage sample %d: negative %s tokens", i, label)
+			}
+		}
+		if _, ok := seen[sample.ID]; ok {
+			return fmt.Errorf("duplicate usage sample ID %q", sample.ID)
+		}
+		seen[sample.ID] = struct{}{}
 	}
 	return nil
 }

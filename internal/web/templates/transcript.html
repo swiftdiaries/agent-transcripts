@@ -1,9 +1,66 @@
 {{define "transcript"}}{{template "layout" .}}{{end}}
-{{define "child-transcript"}}
-{{$node := .}}
-<details id="{{.Anchor}}" class="delegated-work"><summary>Delegated work / {{.AgentID}}</summary><div class="delegated-work-body"><header><p class="receipt-strip">AGENT / {{.AgentID}}</p>{{if .AgentType}}<p>Type: {{.AgentType}}</p>{{end}}{{if .Description}}<p>{{.Description}}</p>{{end}}<p>Completion: {{if .Completion.Terminal}}terminal{{else}}in progress{{end}}{{if .Completion.TerminalReason}} / {{.Completion.TerminalReason}}{{end}}</p></header><nav class="child-prompt-index" aria-label="Delegated prompts"><p class="receipt-strip">PROMPT INDEX</p><ol>{{range .Turns}}<li><a href="#{{.Prompt.ID}}">{{.Prompt.Text}}</a></li>{{end}}</ol></nav><section class="child-event-stream" aria-label="Delegated event stream">{{range .Turns}}<article id="{{.Prompt.ID}}" class="turn child-turn"><header class="event-card event-user"><p class="receipt-strip">{{.Prompt.Kind}} / {{.Prompt.ID}}</p><button type="button" class="copy-anchor" data-anchor="{{.Prompt.ID}}">Copy link</button><pre>{{.Prompt.Text}}</pre></header>{{range .Events}}<article class="event-card event-{{.Kind}}"><header><p class="receipt-strip">{{.Kind}} / {{.ID}}</p></header>{{if .Text}}<pre>{{.Text}}</pre>{{end}}{{if .ToolName}}<details><summary>{{.ToolName}}</summary><pre>{{.Input}}</pre><pre>{{.Output}}</pre></details>{{else if .Output}}<details><summary>Tool result</summary><pre>{{.Output}}</pre></details>{{end}}{{with index $node.Attached .ID}}{{range .}}{{template "child-transcript" .}}{{end}}{{end}}</article>{{end}}{{if .Diagnostics}}<details class="turn-diagnostics"><summary>Technical details</summary>{{range .Diagnostics}}<article class="event-card event-{{.Kind}}"><header><p class="receipt-strip">{{.Kind}} / {{.ID}}</p></header>{{if .Text}}<pre>{{.Text}}</pre>{{end}}{{if .RawType}}<details><summary>{{.RawType}}</summary><pre>{{.Raw}}</pre></details>{{end}}</article>{{end}}</details>{{end}}</article>{{end}}{{if .Diagnostics}}<details class="turn-diagnostics"><summary>Technical details</summary>{{range .Diagnostics}}<article class="event-card event-{{.Kind}}"><header><p class="receipt-strip">{{.Kind}} / {{.ID}}</p></header>{{if .Text}}<pre>{{.Text}}</pre>{{end}}{{if .RawType}}<details><summary>{{.RawType}}</summary><pre>{{.Raw}}</pre></details>{{end}}</article>{{end}}</details>{{end}}</section>{{if .Children}}<section class="delegated-children" aria-label="Nested delegated work">{{range .Children}}{{template "child-transcript" .}}{{end}}</section>{{end}}</div></details>
+
+{{define "event-card"}}
+<article id="{{.ID}}" class="event-card event-{{.Kind}}">
+  <header><p class="receipt-strip">{{.Kind}} / {{.ID}}</p><button type="button" class="copy-anchor" data-anchor="{{.ID}}">Copy link</button></header>
+  {{if .Text}}<pre>{{.Text}}</pre>{{end}}
+  {{if .ToolName}}<details><summary>{{.ToolName}}</summary><pre>{{.Input}}</pre>{{if .Output}}<pre>{{.Output}}</pre>{{end}}</details>{{else if .Output}}<details><summary>Tool result</summary><pre>{{.Output}}</pre></details>{{end}}
+  {{if .RawType}}<details><summary>{{.RawType}}</summary><pre>{{.Raw}}</pre></details>{{end}}
+</article>
 {{end}}
+
 {{define "content"}}
-<section class="page-intro transcript-intro"><p class="eyebrow">TRANSCRIPT / {{len .Transcript.Turns}} TURNS</p><h1>{{.Transcript.Title}}</h1></section>
-<div class="transcript-layout"><nav class="prompt-index" aria-label="Prompts"><p class="receipt-strip">PROMPT INDEX</p><ol>{{range .Transcript.Turns}}<li><a href="#{{.Prompt.ID}}">{{.Prompt.Text}}</a></li>{{end}}</ol></nav><section class="event-stream" aria-label="Transcript events">{{if .Transcript.Diagnostics}}<details class="turn-diagnostics"><summary>Technical details</summary>{{range .Transcript.Diagnostics}}<article class="event-card event-{{.Kind}}"><header><p class="receipt-strip">{{.Kind}} / {{.ID}}</p></header>{{if .Text}}<pre>{{.Text}}</pre>{{end}}{{if .RawType}}<details><summary>{{.RawType}}</summary><pre>{{.Raw}}</pre></details>{{end}}</article>{{end}}</details>{{end}}{{range .Transcript.Turns}}<article id="{{.Prompt.ID}}" class="turn"><header class="event-card event-user"><p class="receipt-strip">{{.Prompt.Kind}} / {{.Prompt.ID}}</p><button type="button" class="copy-anchor" data-anchor="{{.Prompt.ID}}">Copy link</button><pre>{{.Prompt.Text}}</pre></header>{{range .Events}}<article class="event-card event-{{.Kind}}"><header><p class="receipt-strip">{{.Kind}} / {{.ID}}</p></header>{{if .Text}}<pre>{{.Text}}</pre>{{end}}{{if .ToolName}}<details><summary>{{.ToolName}}</summary><pre>{{.Input}}</pre><pre>{{.Output}}</pre></details>{{else if .Output}}<details><summary>Tool result</summary><pre>{{.Output}}</pre></details>{{end}}{{with index $.Transcript.Attached .ID}}{{range .}}{{template "child-transcript" .}}{{end}}{{end}}</article>{{end}}{{if .Diagnostics}}<details class="turn-diagnostics"><summary>Technical details</summary>{{range .Diagnostics}}<article class="event-card event-{{.Kind}}"><header><p class="receipt-strip">{{.Kind}} / {{.ID}}</p></header>{{if .Text}}<pre>{{.Text}}</pre>{{end}}{{if .RawType}}<details><summary>{{.RawType}}</summary><pre>{{.Raw}}</pre></details>{{end}}</article>{{end}}</details>{{end}}</article>{{end}}{{if .Transcript.Children}}<details class="unattached-delegated-work"><summary>Unattached delegated work</summary>{{range .Transcript.Children}}{{template "child-transcript" .}}{{end}}</details>{{end}}</section></div>
+<section class="page-intro transcript-intro">
+  <p class="eyebrow">SESSION WORKSPACE</p><h1>{{.Workspace.Title}}</h1><p>Review handoffs, evidence, and model usage behind this session.</p>
+</section>
+{{template "usage-ledger" .Workspace.Summary}}
+<nav class="workspace-tabs" aria-label="Session views">
+  <a href="{{.Workspace.OverviewURL}}" {{if eq .Workspace.SelectedView "overview"}}aria-current="page"{{end}}>Overview</a>
+  <a href="{{.Workspace.ActivityURL}}" {{if eq .Workspace.SelectedView "activity"}}aria-current="page"{{end}}>All activity</a>
+  <a href="{{.Workspace.MainURL}}" {{if eq .Workspace.SelectedView "main"}}aria-current="page"{{end}}>Main agent</a>
+</nav>
+<div class="workspace-layout">
+  <aside class="agent-rail" aria-label="Agent context">
+    <p class="receipt-strip">AGENT CONTEXT</p>
+    <ol class="agent-list">{{range .Workspace.Agents}}
+      <li data-depth="{{.Depth}}" {{if .Selected}}data-selected="true"{{end}}>
+        <a href="{{.URL}}" {{if .Selected}}aria-current="page"{{end}}>{{.Label}}</a>
+        {{if .AgentID}}<span>{{.AgentID}}</span>{{end}}
+        {{if .ParentSpawnURL}}<a class="spawn-link" href="{{.ParentSpawnURL}}">View spawn</a>{{end}}
+      </li>{{end}}
+    </ol>
+  </aside>
+  <section class="workspace-content">
+    {{if .Workspace.Overview}}
+      <section aria-labelledby="delegation-heading"><h2 id="delegation-heading">Delegation map</h2>
+        <ol class="agent-overview">{{range .Workspace.Agents}}<li data-depth="{{.Depth}}"><a href="{{.URL}}">{{.Label}}</a>{{if .AgentID}}<span>{{.AgentID}}</span>{{end}}{{if .AgentType}}<small>{{.AgentType}}</small>{{end}}<small>{{if .Completion.Terminal}}terminal{{else}}in progress{{end}} / {{.TokenLabel}}</small>{{if .ParentSpawnURL}}<a class="spawn-link" href="{{.ParentSpawnURL}}">View spawn</a>{{end}}</li>{{end}}</ol>
+      </section>
+      <section class="agent-usage" aria-labelledby="agent-usage-heading">
+        <h2 id="agent-usage-heading">Agent usage</h2>
+        <table>
+          <colgroup>
+            <col class="agent-usage-agent">
+            <col class="agent-usage-models">
+            <col class="agent-usage-tokens">
+            <col class="agent-usage-cost">
+            <col class="agent-usage-coverage">
+          </colgroup>
+          <thead><tr><th scope="col">Agent</th><th scope="col">Models</th><th scope="col">Tokens</th><th scope="col">Estimated cost</th><th scope="col">Pricing coverage</th></tr></thead>
+          <tbody>{{range .Workspace.AgentUsage}}<tr><th scope="row">{{.Label}}</th><td>{{.ModelLabel}}</td><td>{{.TokenLabel}}</td><td>{{.CostLabel}}</td><td>{{.CoverageLabel}}</td></tr>{{end}}</tbody>
+        </table>
+      </section>
+    {{else if eq .Workspace.SelectedView "activity"}}
+      <form class="author-filter" method="get"><input type="hidden" name="view" value="activity"><label>Author<select name="author">{{range .Workspace.Authors}}<option value="{{.Key}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}</select></label><button type="submit">Filter activity</button></form>
+      <section class="event-stream" aria-label="All activity">{{range .Workspace.Activity}}
+        <p class="receipt-strip">{{.Author}}</p>{{template "event-card" .Event}}
+      {{else}}<p class="empty-state">No activity for this author.</p>{{end}}</section>
+    {{else if .Workspace.Stream}}
+      <section class="event-stream" aria-label="{{.Workspace.Stream.Label}} transcript">
+        {{range .Workspace.Stream.Diagnostics}}{{template "event-card" .}}{{end}}
+        {{range .Workspace.Stream.Turns}}<section class="turn">{{template "event-card" .Prompt}}{{range .Events}}{{template "event-card" .}}{{end}}{{range .Diagnostics}}{{template "event-card" .}}{{end}}</section>{{end}}
+      </section>
+    {{end}}
+  </section>
+  {{with .Workspace.Stream}}<nav class="prompt-index" aria-label="{{.Label}} prompts"><p class="receipt-strip">PROMPT INDEX</p><ol>{{range .Turns}}<li><a href="#{{.Prompt.ID}}">{{.Prompt.Text}}</a></li>{{end}}</ol></nav>{{end}}
+</div>
 {{end}}

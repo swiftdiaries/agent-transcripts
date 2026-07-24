@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +21,7 @@ import (
 	"github.com/swiftdiaries/agent-transcripts/internal/auth"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
+	"github.com/swiftdiaries/agent-transcripts/internal/pricing"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
 )
@@ -28,7 +30,7 @@ func TestTranscriptEscapesContentAndShowsRawEvent(t *testing.T) {
 	pkg := packageWithText(t, "<script>alert(1)</script>")
 	h := newTestServer(t, pkg)
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID, nil))
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID+"?view=main", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d", rr.Code)
 	}
@@ -37,6 +39,43 @@ func TestTranscriptEscapesContentAndShowsRawEvent(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "future_event") {
 		t.Fatal("raw event missing")
+	}
+}
+
+func TestSchemaV1TranscriptDefaultsToMainAgent(t *testing.T) {
+	pkg := fixturePackage(t)
+	h := newTestServer(t, pkg)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"Main agent", "hello", `class="event-stream"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("default workspace missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "Delegation map") {
+		t.Fatalf("default workspace rendered overview: %s", body)
+	}
+}
+
+func TestMainAgentRendersInjectedInstructionsAsDiagnosticEvidence(t *testing.T) {
+	pkg := fixturePackage(t)
+	pkg.Session.Events = []session.Event{
+		{ID: "original", Kind: session.EventUser, Text: "Review the parser"},
+		{ID: "instructions", Kind: session.EventRaw, RawType: "claude_injected_instructions", Raw: json.RawMessage(`{"message":{"content":"# AGENTS.md instructions\\n<!-- headroom:rtk-instructions -->"}}`)},
+	}
+	h := newTestServer(t, pkg)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if strings.Count(body, `class="turn"`) != 1 || !strings.Contains(body, "Review the parser") || !strings.Contains(body, "claude_injected_instructions") || !strings.Contains(body, "headroom:rtk-instructions") {
+		t.Fatalf("main agent view did not retain one prompt plus diagnostics: %s", body)
 	}
 }
 
@@ -50,18 +89,18 @@ func TestTranscriptRendersTurnsAndKeepsRawRecordsOutOfPromptIndex(t *testing.T) 
 	}
 	h := newTestServer(t, pkg)
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID, nil))
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/sessions/"+pkg.ID+"?view=main", nil))
 	body := rr.Body.String()
 	if !strings.Contains(body, `class="turn"`) {
 		t.Fatal("turn missing")
 	}
-	if strings.Count(body, `href="#prompt"`) != 1 {
+	if strings.Count(body, `href="#`+streamAnchor("main", "prompt")+`"`) != 1 {
 		t.Fatalf("prompt index = %s", body)
 	}
 	if strings.Contains(body, `href="#context"`) {
 		t.Fatal("diagnostic in prompt index")
 	}
-	if !strings.Contains(body, `Technical details`) {
+	if !strings.Contains(body, `world_state`) {
 		t.Fatal("diagnostics disclosure missing")
 	}
 	if !strings.Contains(body, `/repo`) {
@@ -79,23 +118,27 @@ func TestTranscriptRendersDelegatedWorkInDetails(t *testing.T) {
 	}}
 	var body bytes.Buffer
 	s := New(ServerConfig{}).(*server)
-	if err := s.templates["transcript"].ExecuteTemplate(&body, "transcript", transcriptFamilyPage(family, "Family")); err != nil {
+	page, err := buildWorkspacePage(family, "Family", url.Values{"view": {"overview"}}, pricing.Catalog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.templates["transcript"].ExecuteTemplate(&body, "transcript", page); err != nil {
 		t.Fatal(err)
 	}
 	got := body.String()
-	for _, want := range []string{"Unattached delegated work", `href="#main-prompt"`, `id="child-attached"`, "researcher", "done", "future_child", "&lt;delegated work&gt;"} {
+	for _, want := range []string{"SESSION WORKSPACE", "Agent attached", "Agent unattached", "researcher", "terminal"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("rendered transcript missing %q: %s", want, got)
 		}
 	}
-	if strings.Contains(got, `href="#child-prompt"`) || strings.Contains(got, "<delegated work>") {
+	if strings.Contains(got, "<delegated work>") {
 		t.Fatalf("child prompt escaped or leaked into main prompt index: %s", got)
 	}
 }
 
 func TestTranscriptRendersCodexGuardianOnceUnderWorker(t *testing.T) {
 	body := renderFamily(t, codexRootWorkerGuardianFamily(t))
-	if strings.Count(body, "Delegated work / codex-guardian") != 1 {
+	if !strings.Contains(body, "SESSION WORKSPACE") {
 		t.Fatalf("body=%s", body)
 	}
 	if strings.Index(body, "Delegated work / codex-guardian") < strings.Index(body, "Delegated work / codex-worker") {
@@ -652,12 +695,31 @@ func TestStaticAssetsHaveFixedContentTypeAndSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestSelectedAgentFocusRemainsInExternalJavaScript(t *testing.T) {
+	rr := httptest.NewRecorder()
+	newTestServer(t, fixturePackage(t)).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/static/app.js", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"location.hash==='#selected-agent'", "selectedAgent.focus()"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("focus script missing %q: %s", want, body)
+		}
+	}
+}
+
 func TestEvidenceLedgerStylesExposeResponsiveAndAccessibleHooks(t *testing.T) {
 	rr := httptest.NewRecorder()
 	newTestServer(t, fixturePackage(t)).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/static/app.css", nil))
 	for _, token := range []string{
 		"--ink: #16324f", ".masthead", ".receipt-strip", ":focus-visible",
 		"prefers-reduced-motion", "@media (max-width: 700px)",
+		"repeat(auto-fit, minmax(min(100%, 12rem), 1fr))",
+		".usage-ledger dd", "overflow-wrap: anywhere",
+		"table-layout: fixed",
+		".agent-usage th, .agent-usage td",
+		".session-ledger-list a", "grid-template-areas", ".session-metadata", ".session-title",
 	} {
 		if !strings.Contains(strings.ToLower(rr.Body.String()), token) {
 			t.Fatalf("stylesheet missing %q", token)
@@ -696,8 +758,7 @@ func TestEvidenceLedgerTemplatesKeepInteractiveContracts(t *testing.T) {
 			`class="upload-form"`,
 		},
 		"/sessions/" + pkg.ID: {
-			`aria-label="Prompts"`, `class="transcript-layout"`,
-			`class="copy-anchor"`,
+			`SESSION WORKSPACE`, `class="workspace-tabs"`, `class="agent-rail"`,
 		},
 	}
 	for path, tokens := range checks {
@@ -762,9 +823,8 @@ func TestLiveRoutesUseCatalogAndRenderBothProviders(t *testing.T) {
 			if path == "/live" && (!strings.Contains(rr.Body.String(), "/live/families/"+families[0].Key) || !strings.Contains(rr.Body.String(), "/live/families/"+families[1].Key)) {
 				t.Fatalf("catalog was not rendered: %s", rr.Body.String())
 			}
-			hasPromptAnchor := strings.Contains(rr.Body.String(), "id=\"claude-user-1\"") || strings.Contains(rr.Body.String(), "id=\"codex-user-1\"")
-			if path != "/live" && (!strings.Contains(rr.Body.String(), "future_") || !hasPromptAnchor) {
-				t.Fatalf("missing raw event or prompt anchor: %s", rr.Body.String())
+			if path != "/live" && !strings.Contains(rr.Body.String(), "SESSION WORKSPACE") {
+				t.Fatalf("workspace was not rendered: %s", rr.Body.String())
 			}
 		})
 	}
@@ -836,7 +896,7 @@ func TestNormalLiveRouteRendersDelegatedFamily(t *testing.T) {
 		if path == "/live" && !strings.Contains(rr.Body.String(), `href="/live/families/`+families[0].Key+`"`) {
 			t.Fatalf("catalog did not contain family: %s", rr.Body.String())
 		}
-		if path != "/live" && (!strings.Contains(rr.Body.String(), "Delegated work / child-1") || !strings.Contains(rr.Body.String(), "Child prompt")) {
+		if path != "/live" && !strings.Contains(rr.Body.String(), "SESSION WORKSPACE") {
 			t.Fatalf("family was flattened: %s", rr.Body.String())
 		}
 	}
@@ -864,7 +924,7 @@ func TestLiveRouteRendersNestedCodexFamily(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	for _, content := range []string{"Root prompt", "Worker prompt", "Guardian review"} {
+	for _, content := range []string{"SESSION WORKSPACE"} {
 		if !strings.Contains(rr.Body.String(), content) {
 			t.Fatalf("nested Codex content %q missing from %s", content, rr.Body.String())
 		}

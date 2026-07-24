@@ -1,0 +1,10 @@
+{
+  "source": "litellm snapshot",
+  "retrieved_at": "2026-07-23T00:00:00Z",
+  "models": {
+    "claude-opus-4-7": {"input": 0.000005, "output": 0.000025, "cache_read": 0.0000005, "cache_write": 0.00000625},
+    "claude-sonnet-4-6": {"input": 0.000003, "output": 0.000015, "cache_read": 0.0000003, "cache_write": 0.00000375},
+    "gpt-5.6-sol": {"input": 0.000005, "output": 0.00003, "cache_read": 0.0000005, "cache_write": 0.00000625},
+    "gpt-5.6-terra": {"input": 0.0000025, "output": 0.000015, "cache_read": 0.00000025, "cache_write": 0.000003125}
+  }
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -23,6 +24,61 @@ func parseFixture(t *testing.T, name string) session.Session {
 		t.Fatal(err)
 	}
 	return got
+}
+
+func TestClaudeKeepsLatestUsageSnapshotPerProviderMessage(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"user","uuid":"u1","sessionId":"claude-usage","timestamp":"2026-07-23T08:00:00Z","message":{"role":"user","content":"hello"}}`,
+		`{"type":"assistant","uuid":"a1","sessionId":"claude-usage","timestamp":"2026-07-23T08:00:01Z","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":5,"cache_creation_input_tokens":7},"content":[{"type":"text","text":"partial"}]}}`,
+		`{"type":"assistant","uuid":"a2","sessionId":"claude-usage","timestamp":"2026-07-23T08:00:02Z","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":5,"cache_creation_input_tokens":7},"content":[{"type":"text","text":"complete"}]}}`,
+	}, "\n")
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Usage) != 1 {
+		t.Fatalf("usage samples = %#v", got.Usage)
+	}
+	want := session.TokenUsage{Input: 3, Output: 4, CacheRead: 5, CacheWrite: 7}
+	if got.Usage[0].ID != "msg-1" || got.Usage[0].Model != "claude-opus-4-7" || got.Usage[0].Tokens != want {
+		t.Fatalf("usage = %#v, want %#v", got.Usage[0], want)
+	}
+}
+
+func TestClaudeNormalizesInjectedRTKInstructionsToRawEvidence(t *testing.T) {
+	instructions := "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n<!-- headroom:rtk-instructions -->\n# RTK (Rust Token Killer) - Token-Optimized Commands\n</INSTRUCTIONS>"
+	input := strings.Join([]string{
+		`{"type":"user","uuid":"original","sessionId":"claude-instructions","timestamp":"2026-07-24T08:00:00Z","message":{"role":"user","content":"Review the parser"}}`,
+		`{"type":"user","uuid":"instructions","sessionId":"claude-instructions","timestamp":"2026-07-24T08:00:01Z","message":{"role":"user","content":` + strconv.Quote(instructions) + `}}`,
+		`{"type":"user","uuid":"follow-up","sessionId":"claude-instructions","timestamp":"2026-07-24T08:00:02Z","message":{"role":"user","content":"Also keep the source evidence."}}`,
+	}, "\n")
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Events[0].Kind != session.EventUser || got.Events[0].Text != "Review the parser" || got.Events[1].Kind != session.EventRaw || got.Events[1].RawType != "claude_injected_instructions" || !strings.Contains(string(got.Events[1].Raw), "headroom:rtk-instructions") || got.Events[2].Kind != session.EventUser || got.Events[2].Text != "Also keep the source evidence." {
+		t.Fatalf("events = %#v", got.Events)
+	}
+}
+
+func TestCodexNormalizesCachedInputAndTracksTurnModel(t *testing.T) {
+	input := strings.Join([]string{
+		`{"timestamp":"2026-07-23T08:00:00Z","type":"session_meta","payload":{"id":"codex-usage","cwd":"/repo"}}`,
+		`{"timestamp":"2026-07-23T08:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6-sol"}}`,
+		`{"timestamp":"2026-07-23T08:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}`,
+		`{"timestamp":"2026-07-23T08:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":5,"output_tokens":9,"reasoning_output_tokens":4,"total_tokens":109}},"rate_limits":{"primary":{"used_percent":50}}}}`,
+	}, "\n")
+	got, err := DefaultRegistry().DetectAndParse(context.Background(), strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Usage) != 1 {
+		t.Fatalf("usage samples = %#v", got.Usage)
+	}
+	want := session.TokenUsage{Input: 15, Output: 9, CacheRead: 80, CacheWrite: 5, ReasoningOutput: 4}
+	if got.Usage[0].ID != "turn-1-token-4" || got.Usage[0].Model != "gpt-5.6-sol" || got.Usage[0].Tokens != want {
+		t.Fatalf("usage = %#v, want %#v", got.Usage[0], want)
+	}
 }
 
 func TestCodexPreservesThreadSpawnOrigin(t *testing.T) {

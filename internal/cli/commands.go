@@ -20,10 +20,12 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/agent-transcripts/internal/auth"
+	"github.com/swiftdiaries/agent-transcripts/internal/catalog"
 	"github.com/swiftdiaries/agent-transcripts/internal/config"
 	"github.com/swiftdiaries/agent-transcripts/internal/discovery"
 	"github.com/swiftdiaries/agent-transcripts/internal/library"
 	"github.com/swiftdiaries/agent-transcripts/internal/parser"
+	"github.com/swiftdiaries/agent-transcripts/internal/pricing"
 	"github.com/swiftdiaries/agent-transcripts/internal/publish"
 	"github.com/swiftdiaries/agent-transcripts/internal/session"
 	"github.com/swiftdiaries/agent-transcripts/internal/store"
@@ -39,13 +41,23 @@ const productName = "agent-transcripts"
 // commands. It permits an embedding application to compose the CLI with its
 // own store without replacing the application services it calls.
 type Dependencies struct {
-	Library store.Store
+	Library          store.Store
+	Catalog          *catalog.Loader
+	PricingCacheFile string
 }
 
 // DefaultDependencies provides the filesystem-backed composition used by the
 // standalone binary.
 func DefaultDependencies() Dependencies {
-	return Dependencies{Library: store.NewFilesystem("agent-transcripts-library")}
+	deps := Dependencies{Library: store.NewFilesystem("agent-transcripts-library")}
+	if root, err := os.UserCacheDir(); err == nil {
+		base := filepath.Join(root, "agent-transcripts")
+		deps.Catalog = catalog.NewLoader(catalog.NewCache(filepath.Join(base, "families-v1"), catalog.DefaultLimits))
+		deps.PricingCacheFile = filepath.Join(base, "pricing.json")
+	} else {
+		deps.Catalog = catalog.NewLoader(catalog.NewCache("", catalog.DefaultLimits))
+	}
+	return deps
 }
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -57,18 +69,26 @@ func (deps Dependencies) Run(ctx context.Context, args []string, input *os.File,
 	if deps.Library == nil {
 		deps.Library = DefaultDependencies().Library
 	}
-	return runCommand(deps, ctx, args, input, stdout, stderr, func(ctx context.Context, _ browseOptions) int {
+	if deps.Catalog == nil {
+		deps.Catalog = DefaultDependencies().Catalog
+	}
+	return runCommand(deps, ctx, args, input, stdout, stderr, func(ctx context.Context, opts dashboardOptions) int {
+		return runDashboardWithDeps(ctx, opts, deps, stdout, stderr, openBrowser, net.Listen, os.Getwd)
+	}, func(ctx context.Context, _ browseOptions) int {
 		browseArgs := []string(nil)
 		if len(args) > 0 {
 			browseArgs = args[1:]
 		}
-		return runBrowse(ctx, browseArgs, input, stdout, stderr)
+		return runBrowseWithDepsAndDependencies(ctx, browseArgs, input, stdout, stderr, openBrowser, net.Listen, os.Getwd, deps)
 	})
 }
 
-func runCommand(deps Dependencies, ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer, browse func(context.Context, browseOptions) int) int {
+func runCommand(deps Dependencies, ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer, dashboard func(context.Context, dashboardOptions) int, browse func(context.Context, browseOptions) int) int {
 	if len(args) == 0 {
-		return browse(ctx, browseOptions{})
+		return dashboard(ctx, dashboardOptions{})
+	}
+	if len(args) == 1 && args[0] == "--global" {
+		return dashboard(ctx, dashboardOptions{Global: true})
 	}
 	if args[0] == "-h" || args[0] == "--help" {
 		return usage(stdout)
@@ -93,6 +113,8 @@ func runCommand(deps Dependencies, ctx context.Context, args []string, input *os
 			return 2
 		}
 		return browse(ctx, opts)
+	case "pricing":
+		return runPricing(ctx, args[1:], deps, stdout, stderr)
 	case "serve":
 		return runServe(ctx, args[1:], stdout, stderr)
 	case "upload":
@@ -133,6 +155,79 @@ func hasCommandUsage(command string) bool {
 
 func version(w io.Writer) int {
 	_, _ = fmt.Fprintf(w, "%s %s\n", productName, Version)
+	return 0
+}
+
+type dashboardOptions struct {
+	Global bool
+}
+
+func runPricing(ctx context.Context, args []string, deps Dependencies, stdout, stderr io.Writer) int {
+	return runPricingWithRefresh(ctx, args, deps, stdout, stderr, pricing.Refresh)
+}
+
+func runPricingWithRefresh(ctx context.Context, args []string, deps Dependencies, stdout, stderr io.Writer, refresh func(context.Context, *http.Client, string, string, time.Time) (pricing.Catalog, error)) int {
+	if len(args) != 1 || args[0] != "refresh" {
+		_, _ = fmt.Fprintln(stderr, "pricing requires refresh")
+		return 2
+	}
+	catalog, err := refresh(ctx, &http.Client{Timeout: 10 * time.Second}, pricing.LiteLLMURL, deps.PricingCacheFile, time.Now())
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "pricing refresh failed")
+		return 1
+	}
+	_, _ = fmt.Fprintf(stdout, "updated pricing for %d models from LiteLLM\n", len(catalog.Models))
+	return 0
+}
+
+func loadPricing(cacheFile string) (pricing.Catalog, error) {
+	return pricing.Load(cacheFile, time.Now())
+}
+
+func runDashboardWithDeps(ctx context.Context, opts dashboardOptions, deps Dependencies, stdout, stderr io.Writer, opener func(string, io.Writer), listen func(string, string) (net.Listener, error), getwd func() (string, error)) int {
+	return runDashboardWithServer(ctx, opts, deps, stdout, stderr, opener, listen, getwd, web.New)
+}
+
+func runDashboardWithServer(ctx context.Context, opts dashboardOptions, deps Dependencies, stdout, stderr io.Writer, opener func(string, io.Writer), listen func(string, string) (net.Listener, error), getwd func() (string, error), newServer func(web.ServerConfig) http.Handler) int {
+	prices, err := loadPricing(deps.PricingCacheFile)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "pricing catalog unavailable")
+		return 1
+	}
+	cfg := web.ServerConfig{Roots: defaultRoots(), Catalog: deps.Catalog, Pricing: prices}
+	path := "/live"
+	if opts.Global {
+		cfg.AllProjects = true
+		path = "/live/projects"
+	} else {
+		cwd, err := getwd()
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		scope, err := discovery.ResolveProjectScope(cwd)
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		cfg.ProjectScope = &scope
+	}
+	listener, err := listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer listener.Close()
+	opener(localURL(listener.Addr().String())+path, stderr)
+	_, _ = fmt.Fprintf(stdout, "serving agent transcripts on %s\n", listener.Addr())
+	srv := &http.Server{Handler: newServer(cfg)}
+	go func() { <-ctx.Done(); _ = srv.Close() }()
+	if err := srv.Serve(listener); errors.Is(err, http.ErrServerClosed) {
+		return 0
+	} else if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
 	return 0
 }
 
@@ -378,7 +473,12 @@ func serveHandlerWithStoreFactoryForProjects(ctx context.Context, cfg config.Con
 	if err != nil {
 		return nil, err
 	}
-	base := web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: rootsForConfig(cfg), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode, AllProjects: allProjects}
+	deps := DefaultDependencies()
+	prices, err := loadPricing(deps.PricingCacheFile)
+	if err != nil {
+		return nil, err
+	}
+	base := web.ServerConfig{Store: st, Library: library.New(st, library.AllowLocalQuietEvidence()), Roots: rootsForConfig(cfg), QuietPeriod: cfg.QuietPeriod, Mode: cfg.Mode, AllProjects: allProjects, Catalog: deps.Catalog, Pricing: prices}
 	if cfg.Mode == "local" {
 		if !allProjects {
 			cwd, err := os.Getwd()
@@ -536,10 +636,14 @@ func parseBrowseArgs(args []string) (browseOptions, error) {
 }
 
 func runBrowse(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer) int {
-	return runBrowseWithDeps(ctx, args, input, stdout, stderr, openBrowser, net.Listen, os.Getwd)
+	return runBrowseWithDepsAndDependencies(ctx, args, input, stdout, stderr, openBrowser, net.Listen, os.Getwd, DefaultDependencies())
 }
 
 func runBrowseWithDeps(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer, opener func(string, io.Writer), listen func(string, string) (net.Listener, error), getwd func() (string, error)) int {
+	return runBrowseWithDepsAndDependencies(ctx, args, input, stdout, stderr, opener, listen, getwd, DefaultDependencies())
+}
+
+func runBrowseWithDepsAndDependencies(ctx context.Context, args []string, input *os.File, stdout, stderr io.Writer, opener func(string, io.Writer), listen func(string, string) (net.Listener, error), getwd func() (string, error), deps Dependencies) int {
 	opts, err := parseBrowseArgs(args)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -589,7 +693,12 @@ func runBrowseWithDeps(ctx context.Context, args []string, input *os.File, stdou
 		return 1
 	}
 	defer listener.Close()
-	h := web.New(web.ServerConfig{FocusedFamily: selected})
+	cfg, err := focusedServerConfig(selected, deps)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "pricing catalog unavailable")
+		return 1
+	}
+	h := web.New(cfg)
 	url := localURL(listener.Addr().String()) + "/live/" + selected.Provider + "/" + selected.ProviderSessionID
 	if !opts.noOpen {
 		opener(url, stderr)
@@ -606,6 +715,14 @@ func runBrowseWithDeps(ctx context.Context, args []string, input *os.File, stdou
 		return 1
 	}
 	return 0
+}
+
+func focusedServerConfig(selected discovery.SessionFamilyCandidate, deps Dependencies) (web.ServerConfig, error) {
+	prices, err := loadPricing(deps.PricingCacheFile)
+	if err != nil {
+		return web.ServerConfig{}, err
+	}
+	return web.ServerConfig{FocusedFamily: selected, Catalog: deps.Catalog, Pricing: prices}, nil
 }
 
 func discoverCommandFamilies(ctx context.Context, allProjects bool, getwd func() (string, error)) ([]discovery.SessionFamilyCandidate, error) {

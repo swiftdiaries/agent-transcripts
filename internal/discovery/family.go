@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +32,28 @@ type SessionFamilyCandidate struct {
 	Status            string
 	Main              SourceCandidate
 	Children          []ChildSourceCandidate
+}
+
+// RevisionKey is an opaque digest of every source identity and the parser
+// normalization rules. It deliberately excludes source paths.
+func (family SessionFamilyCandidate) RevisionKey(normalizationVersion int) string {
+	h := sha256.New()
+	write := func(values ...string) {
+		for _, value := range values {
+			_, _ = io.WriteString(h, strconv.Itoa(len(value))+":"+value+";")
+		}
+	}
+	write(strconv.Itoa(normalizationVersion), family.Provider, family.Key, family.Project.Key)
+	add := func(candidate Candidate) {
+		identity := candidate.identity
+		write(candidate.Provider, candidate.SessionID, strconv.FormatUint(identity.Device, 10), strconv.FormatUint(identity.Inode, 10), strconv.FormatInt(identity.Size, 10), strconv.FormatInt(identity.ModTimeNS, 10), strconv.FormatInt(identity.ChangeTimeNS, 10))
+	}
+	add(family.Main.Candidate)
+	for _, child := range family.Children {
+		write(child.AgentID, child.ParentSessionID)
+		add(child.Candidate)
+	}
+	return "r_" + hex.EncodeToString(h.Sum(nil))
 }
 
 var familyKeyPattern = regexp.MustCompile(`^f_[a-f0-9]{64}$`)
