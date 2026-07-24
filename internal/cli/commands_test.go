@@ -40,6 +40,57 @@ func TestRunWithoutSubcommandBrowses(t *testing.T) {
 	}
 }
 
+func TestTopLevelFlagsShowHelpOrVersionWithoutBrowsing(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want []string
+	}{
+		{args: []string{"-h"}, want: []string{"Usage:", "Available Commands:", "browse", "Open a completed transcript", "Flags:", "-h, --help", "--version", "agent-transcripts <command> --help"}},
+		{args: []string{"--help"}, want: []string{"Usage:", "Available Commands:", "import", "Import completed transcript families", "serve", "Serve the transcript catalog", "upload", "Publish a library package"}},
+		{args: []string{"--version"}, want: []string{"agent-transcripts dev\n"}},
+	} {
+		t.Run(strings.Join(test.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			browseCalls := 0
+			code := runCommand(DefaultDependencies(), context.Background(), test.args, nil, &stdout, &stderr, func(context.Context, browseOptions) int {
+				browseCalls++
+				return 0
+			})
+			if code != 0 || browseCalls != 0 || stderr.Len() != 0 {
+				t.Fatalf("code=%d browseCalls=%d stdout=%q stderr=%q", code, browseCalls, stdout.String(), stderr.String())
+			}
+			for _, want := range test.want {
+				if !strings.Contains(stdout.String(), want) {
+					t.Errorf("stdout = %q, missing %q", stdout.String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestCommandHelpShowsCommandUsageAndFlagsWithoutRunningCommand(t *testing.T) {
+	for _, command := range []string{"browse", "import", "serve", "upload"} {
+		t.Run(command, func(t *testing.T) {
+			for _, helpFlag := range []string{"-h", "--help"} {
+				var stdout, stderr bytes.Buffer
+				browseCalls := 0
+				code := runCommand(DefaultDependencies(), context.Background(), []string{command, helpFlag}, nil, &stdout, &stderr, func(context.Context, browseOptions) int {
+					browseCalls++
+					return 0
+				})
+				if code != 0 || browseCalls != 0 || stderr.Len() != 0 {
+					t.Fatalf("flag=%s code=%d browseCalls=%d stdout=%q stderr=%q", helpFlag, code, browseCalls, stdout.String(), stderr.String())
+				}
+				for _, want := range []string{"Usage:", "agent-transcripts " + command, "Flags:", "-h, --help"} {
+					if !strings.Contains(stdout.String(), want) {
+						t.Errorf("flag=%s stdout = %q, missing %q", helpFlag, stdout.String(), want)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestFamilySelectorsRejectDuplicateAndStaleKeysAndChooseLatest(t *testing.T) {
 	duplicate := "f_" + strings.Repeat("a", 64)
 	if _, _, err := selectFamily([]discovery.SessionFamilyCandidate{{Key: duplicate}, {Key: duplicate}}, duplicate, false); err == nil {

@@ -70,12 +70,20 @@ func runCommand(deps Dependencies, ctx context.Context, args []string, input *os
 	if len(args) == 0 {
 		return browse(ctx, browseOptions{})
 	}
+	if args[0] == "-h" || args[0] == "--help" {
+		return usage(stdout)
+	}
+	if args[0] == "--version" {
+		return version(stdout)
+	}
+	if hasHelpFlag(args[1:]) && hasCommandUsage(args[0]) {
+		return commandUsage(args[0], stdout)
+	}
 	switch args[0] {
 	case "help":
 		return usage(stdout)
 	case "version":
-		_, _ = fmt.Fprintf(stdout, "%s %s\n", productName, Version)
-		return 0
+		return version(stdout)
 	case "import":
 		return runImportWithLibrary(ctx, args[1:], input, stdout, stderr, deps.Library)
 	case "browse":
@@ -103,6 +111,29 @@ func runCommand(deps Dependencies, ctx context.Context, args []string, input *os
 		_, _ = fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		return 2
 	}
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCommandUsage(command string) bool {
+	switch command {
+	case "browse", "import", "serve", "upload":
+		return true
+	default:
+		return false
+	}
+}
+
+func version(w io.Writer) int {
+	_, _ = fmt.Fprintf(w, "%s %s\n", productName, Version)
+	return 0
 }
 
 type uploadOptions struct {
@@ -889,6 +920,78 @@ func emitFamilyWithLibrary(ctx context.Context, family discovery.SessionFamilyCa
 }
 
 func usage(w io.Writer) int {
-	_, _ = fmt.Fprintln(w, "usage: agent-transcripts [browse [--family key|--latest|--no-open|path] [--all-projects]] | <serve|import|upload|version|help>")
+	_, _ = fmt.Fprintln(w, `Usage:
+  agent-transcripts [command]
+
+Available Commands:
+  browse      Open a completed transcript in a focused local viewer
+  import      Import completed transcript families into the local library
+  serve       Serve the transcript catalog
+  upload      Publish a library package to a hosted catalog
+  version     Print the version
+  help        Help about any command
+
+Flags:
+  -h, --help   help for agent-transcripts
+      --version version for agent-transcripts
+
+Use "agent-transcripts <command> --help" for more information about a command.`)
+	return 0
+}
+
+func commandUsage(command string, w io.Writer) int {
+	var text string
+	switch command {
+	case "browse":
+		text = `Usage:
+  agent-transcripts browse [--family <key> | --latest | <path>] [flags]
+
+Open a completed transcript in a focused local viewer.
+
+Flags:
+      --all-projects   include sessions from all projects
+      --family string  select an eligible family by key
+  -h, --help           help for browse
+      --latest         select the newest eligible family
+      --no-open        do not open a browser`
+	case "import":
+		text = `Usage:
+  agent-transcripts import [<path> | --latest] [flags]
+
+Import completed transcript families into the local library.
+
+Flags:
+      --all-projects     include sessions from all projects
+  -h, --help             help for import
+      --latest           import the newest eligible family
+      --limit int         limit discovered families (default 20)
+      --provider string   filter by provider: claude or codex`
+	case "serve":
+		text = `Usage:
+  agent-transcripts serve [flags]
+
+Serve the transcript catalog.
+
+Flags:
+      --all-projects   include sessions from all projects
+      --config string  configuration file
+  -h, --help           help for serve
+      --open           open the local catalog in a browser`
+	case "upload":
+		text = `Usage:
+  agent-transcripts upload --server <url> --destination <directory> <package-id> [flags]
+
+Publish a library package to a hosted catalog.
+
+Flags:
+      --description string   optional description
+      --destination string   users or projects destination
+  -h, --help                 help for upload
+      --server string        hosted server URL
+      --tags string          comma-separated tags
+      --title string         optional title
+      --yes                  confirm publishing without a prompt`
+	}
+	_, _ = fmt.Fprintln(w, text)
 	return 0
 }
